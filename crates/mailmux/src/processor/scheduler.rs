@@ -156,16 +156,20 @@ impl JobScheduler {
             Ok(Ok(output)) if output.success => {
                 debug!(job_id, processor = processor_name, event_id = event.id, "processor completed");
                 let _ = jobs::update_job_status(&self.pool, job_id, "completed", None, None).await;
+                crate::metrics::inc_processor_runs(processor_name, "success");
             }
             Ok(Ok(output)) => {
                 let msg = output.message.unwrap_or_default();
                 self.handle_failure(job_id, processor_name, &msg).await;
+                crate::metrics::inc_processor_runs(processor_name, "failure");
             }
             Ok(Err(e)) => {
                 self.handle_failure(job_id, processor_name, &e.to_string()).await;
+                crate::metrics::inc_processor_runs(processor_name, "error");
             }
             Err(_) => {
                 self.handle_failure(job_id, processor_name, "execution timed out").await;
+                crate::metrics::inc_processor_runs(processor_name, "timeout");
             }
         }
     }

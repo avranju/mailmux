@@ -341,6 +341,8 @@ impl MailboxWatcher {
                         event_id,
                         "ingested message"
                     );
+                    crate::metrics::inc_messages_ingested(&self.account.id, &self.mailbox);
+                    crate::metrics::inc_events_created("email_arrived");
                     ingested += 1;
                 }
                 Err(e) => {

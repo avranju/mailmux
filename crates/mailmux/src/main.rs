@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Parser;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -14,6 +14,7 @@ mod health;
 mod housekeeping;
 mod imap;
 mod logging;
+mod metrics;
 mod processor;
 mod shutdown;
 mod store;
@@ -29,9 +30,23 @@ async fn main() -> Result<()> {
     let log_level = cli.log_level.as_deref().unwrap_or(&config.general.log_level);
     logging::init(log_level, &config.general.log_format)?;
 
+    match cli.command {
+        Some(cli::Command::Replay {
+            event_id,
+            processor: processor_filter,
+        }) => cmd_replay(config, event_id, processor_filter).await,
+        Some(cli::Command::DryRun {
+            event_id,
+            processor: processor_name,
+        }) => cmd_dry_run(config, event_id, processor_name).await,
+        None => cmd_run(config).await,
+    }
+}
+
+/// Main daemon run loop.
+async fn cmd_run(config: config::Config) -> Result<()> {
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        config_path = %cli.config.display(),
         accounts = config.accounts.len(),
         processors = config.processors.len(),
         "mailmux starting"
@@ -44,6 +59,12 @@ async fn main() -> Result<()> {
     // Run migrations
     db::run_migrations(&pool).await?;
     info!("database migrations complete");
+
+    // Initialize metrics
+    let metrics_handle = metrics::init();
+    if metrics_handle.is_some() {
+        info!("prometheus metrics initialized");
+    }
 
     // Setup shutdown handling
     let token = CancellationToken::new();
@@ -64,7 +85,7 @@ async fn main() -> Result<()> {
     let mut system_tasks = JoinSet::new();
 
     // Health check server
-    let health_state = health::HealthState::new(pool.clone());
+    let health_state = health::HealthState::new(pool.clone(), metrics_handle);
     if let Some(port) = config.general.health_port {
         let hs = health_state.clone();
         let t = token.clone();
@@ -131,10 +152,15 @@ async fn main() -> Result<()> {
 
     // Mark as ready after initial setup
     health_state.set_ready();
+
+    // Notify systemd that we're ready (no-op if not running under systemd)
+    let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
+
     info!("mailmux is running, press Ctrl+C to stop");
 
     // Wait for shutdown signal
     token.cancelled().await;
+    let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Stopping]);
     info!("shutting down");
 
     // Grace period for in-flight work
@@ -166,5 +192,187 @@ async fn main() -> Result<()> {
     info!("database connections closed");
 
     info!("mailmux stopped");
+    Ok(())
+}
+
+/// Replay command: re-run processors for a specific event.
+async fn cmd_replay(
+    config: config::Config,
+    event_id: i64,
+    processor_filter: Option<String>,
+) -> Result<()> {
+    info!(event_id, "replaying event");
+
+    let pool = db::connect(&config.database).await?;
+    db::run_migrations(&pool).await?;
+
+    let event = db::events::get_event_by_id(&pool, event_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("event {} not found", event_id))?;
+
+    let email = if let Some(email_id) = event.email_id {
+        db::emails::get_email_by_id(&pool, email_id).await?
+    } else {
+        None
+    };
+
+    let registry = processor::registry::ProcessorRegistry::from_config(&config.processors);
+    let processors = registry.processors_for_event(&event.event_type);
+
+    if processors.is_empty() {
+        bail!("no processors configured for event type '{}'", event.event_type);
+    }
+
+    for proc in processors {
+        if let Some(ref filter) = processor_filter {
+            if proc.name() != filter {
+                continue;
+            }
+        }
+
+        let proc_name = proc.name().to_string();
+        info!(processor = proc_name, event_id, "running processor");
+
+        // Create a new job for the replay
+        let job_id = db::jobs::create_job(&pool, event_id, &proc_name).await?;
+
+        let timeout_secs = config
+            .processors
+            .iter()
+            .find(|c| c.name == proc_name)
+            .map(|c| c.timeout_secs)
+            .unwrap_or(30);
+
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+
+        if let Err(e) =
+            db::jobs::update_job_status(&pool, job_id, "in_progress", None, None).await
+        {
+            error!(job_id, error = %e, "failed to update job status");
+            continue;
+        }
+
+        match tokio::time::timeout(timeout, proc.process(&event, email.as_ref())).await {
+            Ok(Ok(output)) if output.success => {
+                info!(processor = proc_name, "replay completed successfully");
+                let msg = output.message.as_deref();
+                let _ = db::jobs::update_job_status(
+                    &pool,
+                    job_id,
+                    "completed",
+                    msg,
+                    None,
+                )
+                .await;
+            }
+            Ok(Ok(output)) => {
+                let msg = output.message.unwrap_or_default();
+                warn!(processor = proc_name, message = msg, "replay completed with failure");
+                let _ =
+                    db::jobs::update_job_status(&pool, job_id, "failed", Some(&msg), None).await;
+            }
+            Ok(Err(e)) => {
+                error!(processor = proc_name, error = %e, "replay failed with error");
+                let _ = db::jobs::update_job_status(
+                    &pool,
+                    job_id,
+                    "failed",
+                    Some(&e.to_string()),
+                    None,
+                )
+                .await;
+            }
+            Err(_) => {
+                error!(processor = proc_name, "replay timed out");
+                let _ = db::jobs::update_job_status(
+                    &pool,
+                    job_id,
+                    "failed",
+                    Some("timed out"),
+                    None,
+                )
+                .await;
+            }
+        }
+    }
+
+    pool.close().await;
+    info!("replay complete");
+    Ok(())
+}
+
+/// Dry-run command: run a processor without persisting results.
+async fn cmd_dry_run(
+    config: config::Config,
+    event_id: i64,
+    processor_name: String,
+) -> Result<()> {
+    info!(event_id, processor = processor_name, "dry-run starting");
+
+    let pool = db::connect(&config.database).await?;
+    db::run_migrations(&pool).await?;
+
+    let event = db::events::get_event_by_id(&pool, event_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("event {} not found", event_id))?;
+
+    let email = if let Some(email_id) = event.email_id {
+        db::emails::get_email_by_id(&pool, email_id).await?
+    } else {
+        None
+    };
+
+    let registry = processor::registry::ProcessorRegistry::from_config(&config.processors);
+    let processor = registry
+        .processors_for_event(&event.event_type)
+        .into_iter()
+        .find(|p| p.name() == processor_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "processor '{}' not found or not subscribed to event type '{}'",
+                processor_name,
+                event.event_type
+            )
+        })?;
+
+    let timeout_secs = config
+        .processors
+        .iter()
+        .find(|c| c.name == processor_name)
+        .map(|c| c.timeout_secs)
+        .unwrap_or(30);
+
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+
+    info!("executing processor (results will NOT be persisted)");
+    match tokio::time::timeout(timeout, processor.process(&event, email.as_ref())).await {
+        Ok(Ok(output)) => {
+            if output.success {
+                info!(
+                    processor = processor_name,
+                    message = output.message.as_deref().unwrap_or("(none)"),
+                    "dry-run: processor succeeded"
+                );
+            } else {
+                warn!(
+                    processor = processor_name,
+                    message = output.message.as_deref().unwrap_or("(none)"),
+                    "dry-run: processor reported failure"
+                );
+            }
+            if let Some(metadata) = output.metadata {
+                info!(metadata = %metadata, "dry-run: processor metadata");
+            }
+        }
+        Ok(Err(e)) => {
+            error!(processor = processor_name, error = %e, "dry-run: processor error");
+        }
+        Err(_) => {
+            error!(processor = processor_name, "dry-run: processor timed out");
+        }
+    }
+
+    pool.close().await;
+    info!("dry-run complete");
     Ok(())
 }

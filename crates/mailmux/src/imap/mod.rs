@@ -50,6 +50,12 @@ impl AccountManager {
         let mut join_set = JoinSet::new();
         let mut failure_times: VecDeque<Instant> = VecDeque::new();
 
+        // Report monitored mailboxes
+        crate::metrics::set_mailboxes_monitored(
+            account_id,
+            self.account.mailboxes.len() as f64,
+        );
+
         // Spawn initial watchers
         for mailbox in &self.account.mailboxes {
             self.spawn_watcher(&mut join_set, mailbox.clone());

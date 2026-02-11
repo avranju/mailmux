@@ -7,6 +7,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
+use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -16,13 +17,15 @@ use tracing::{error, info};
 pub struct HealthState {
     pool: PgPool,
     ready: Arc<AtomicBool>,
+    metrics_handle: Option<PrometheusHandle>,
 }
 
 impl HealthState {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: PgPool, metrics_handle: Option<PrometheusHandle>) -> Self {
         Self {
             pool,
             ready: Arc::new(AtomicBool::new(false)),
+            metrics_handle,
         }
     }
 
@@ -33,10 +36,15 @@ impl HealthState {
 
 /// Start the health check HTTP server.
 pub async fn serve(port: u16, state: HealthState, token: CancellationToken) {
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(health_handler))
-        .route("/ready", get(ready_handler))
-        .with_state(state);
+        .route("/ready", get(ready_handler));
+
+    if state.metrics_handle.is_some() {
+        app = app.route("/metrics", get(metrics_handler));
+    }
+
+    let app = app.with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!(port, "health check server starting");
@@ -72,5 +80,15 @@ async fn ready_handler(State(state): State<HealthState>) -> impl IntoResponse {
         (StatusCode::OK, "ready")
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "not ready")
+    }
+}
+
+async fn metrics_handler(State(state): State<HealthState>) -> impl IntoResponse {
+    match &state.metrics_handle {
+        Some(handle) => (StatusCode::OK, handle.render()),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "metrics not available".to_string(),
+        ),
     }
 }

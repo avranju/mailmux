@@ -25,3 +25,6 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 webpki-roots = "1.0"
 axum = "0.8"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"
+sd-notify = "0.4"
