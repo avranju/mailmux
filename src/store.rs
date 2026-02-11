@@ -39,6 +39,7 @@ impl MessageStore {
     }
 
     /// Load a raw email message from disk.
+    #[allow(dead_code)]
     pub async fn load(&self, path: &Path) -> Result<Vec<u8>> {
         tokio::fs::read(path)
             .await
@@ -46,6 +47,7 @@ impl MessageStore {
     }
 
     /// Delete a raw email message from disk.
+    #[allow(dead_code)]
     pub async fn delete(&self, path: &Path) -> Result<()> {
         tokio::fs::remove_file(path)
             .await
@@ -56,10 +58,7 @@ impl MessageStore {
 /// Sanitize a mailbox name for use as a directory name.
 /// Replaces `/` and other problematic characters with `_`.
 fn sanitize_path(mailbox: &str) -> String {
-    mailbox
-        .replace('/', "_")
-        .replace('\\', "_")
-        .replace('\0', "_")
+    mailbox.replace(['/', '\\', '\0'], "_")
 }
 
 #[cfg(test)]

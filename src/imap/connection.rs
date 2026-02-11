@@ -142,11 +142,9 @@ impl ImapConnection {
                 }
                 Event::StatusReceived { status } => {
                     // Check for UIDVALIDITY in the status code
-                    if let Some(code) = status.code() {
-                        if let Code::UidValidity(uv) = code {
-                            uid_validity = Some(uv.get());
-                            debug!(mailbox, uid_validity = uv.get(), "UIDVALIDITY");
-                        }
+                    if let Some(Code::UidValidity(uv)) = status.code() {
+                        uid_validity = Some(uv.get());
+                        debug!(mailbox, uid_validity = uv.get(), "UIDVALIDITY");
                     }
                     check_status(&status, "SELECT")?;
                     break;

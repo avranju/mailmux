@@ -224,10 +224,10 @@ async fn cmd_replay(
     }
 
     for proc in processors {
-        if let Some(ref filter) = processor_filter {
-            if proc.name() != filter {
-                continue;
-            }
+        if let Some(ref filter) = processor_filter
+            && proc.name() != filter
+        {
+            continue;
         }
 
         let proc_name = proc.name().to_string();

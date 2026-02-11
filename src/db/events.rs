@@ -17,33 +17,13 @@ pub struct Event {
 
 /// Data needed to create a new event.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct NewEvent {
     pub event_type: String,
     pub account_id: String,
     pub mailbox_name: String,
     pub email_id: Option<i64>,
     pub payload: serde_json::Value,
-}
-
-/// Insert an event. Returns the event ID.
-pub async fn insert_event(pool: &PgPool, event: &NewEvent) -> Result<i64> {
-    let id = sqlx::query_scalar::<_, i64>(
-        r#"
-        INSERT INTO events (event_type, account_id, mailbox_name, email_id, payload)
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING id
-        "#,
-    )
-    .bind(&event.event_type)
-    .bind(&event.account_id)
-    .bind(&event.mailbox_name)
-    .bind(event.email_id)
-    .bind(&event.payload)
-    .fetch_one(pool)
-    .await
-    .context("inserting event")?;
-
-    Ok(id)
 }
 
 /// Insert an email and its corresponding event atomically in a single transaction.

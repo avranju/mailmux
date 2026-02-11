@@ -58,15 +58,6 @@ pub fn inc_processor_runs(processor: &str, status: &str) {
         .increment(1);
 }
 
-pub fn set_active_connections(account: &str, count: f64) {
-    gauge!("mailmux_active_connections", "account" => account.to_owned()).set(count);
-}
-
 pub fn set_mailboxes_monitored(account: &str, count: f64) {
     gauge!("mailmux_mailboxes_monitored", "account" => account.to_owned()).set(count);
-}
-
-/// Render metrics in Prometheus text exposition format.
-pub fn render(handle: &metrics_exporter_prometheus::PrometheusHandle) -> String {
-    handle.render()
 }

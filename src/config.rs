@@ -58,6 +58,7 @@ fn default_max_connections() -> u32 {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct AccountConfig {
     pub id: String,
     pub imap_host: String,
@@ -99,6 +100,7 @@ fn default_account_max_connections() -> u32 {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ProcessorConfig {
     pub name: String,
     #[serde(default = "default_enabled")]

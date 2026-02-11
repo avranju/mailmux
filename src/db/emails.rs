@@ -38,37 +38,10 @@ pub struct NewEmail {
     pub size_bytes: Option<i64>,
 }
 
-/// Insert an email record. Uses ON CONFLICT DO UPDATE for idempotency.
-/// Returns the email ID.
-pub async fn insert_email(pool: &PgPool, email: &NewEmail) -> Result<i64> {
-    let row = sqlx::query_scalar::<_, i64>(
-        r#"
-        INSERT INTO emails (account_id, mailbox_name, uid, message_id, subject, sender, recipients, date, flags, raw_message_path, size_bytes)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-        ON CONFLICT (account_id, mailbox_name, uid) DO UPDATE SET updated_at = now()
-        RETURNING id
-        "#,
-    )
-    .bind(&email.account_id)
-    .bind(&email.mailbox_name)
-    .bind(email.uid)
-    .bind(&email.message_id)
-    .bind(&email.subject)
-    .bind(&email.sender)
-    .bind(&email.recipients)
-    .bind(email.date)
-    .bind(&email.flags)
-    .bind(&email.raw_message_path)
-    .bind(email.size_bytes)
-    .fetch_one(pool)
-    .await
-    .context("inserting email record")?;
-
-    Ok(row)
-}
 
 /// Sync state for a mailbox.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MailboxState {
     pub id: i64,
     pub account_id: String,

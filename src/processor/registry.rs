@@ -60,8 +60,4 @@ impl ProcessorRegistry {
             .collect()
     }
 
-    /// Get all registered processor names.
-    pub fn processor_names(&self) -> Vec<&str> {
-        self.processors.iter().map(|p| p.name()).collect()
-    }
 }
