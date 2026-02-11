@@ -1,0 +1,84 @@
+# Mailmux example configuration
+# Copy this file to config.toml and edit to suit your environment.
+# Values wrapped in ${VAR} are substituted from environment variables.
+
+[general]
+# Directory where raw .eml message files are stored
+data_dir = "/var/lib/mailmux"
+
+# Logging: trace | debug | info | warn | error
+log_level = "info"
+
+# Log output format: json | pretty
+log_format = "json"
+
+# Seconds to wait for in-flight work before forced shutdown
+shutdown_grace_period_secs = 10
+
+# Automatically delete processed events older than this many days
+event_retention_days = 30
+
+# HTTP port for /health, /ready, and /metrics endpoints (omit to disable)
+health_port = 8080
+
+[database]
+url = "postgres://mailmux:${DB_PASSWORD}@localhost:5432/mailmux"
+max_connections = 10
+
+# ---------------------------------------------------------------------------
+# IMAP accounts — add one [[accounts]] block per mailbox you want to monitor.
+# ---------------------------------------------------------------------------
+
+[[accounts]]
+id = "personal"
+imap_host = "imap.gmail.com"
+imap_port = 993
+tls = true
+username = "user@gmail.com"
+password = "${GMAIL_APP_PASSWORD}"
+poll_interval_secs = 60
+rate_limit_per_second = 5
+max_connections = 2
+mailboxes = ["INBOX"]
+
+# Limit how far back the very first sync goes (optional)
+initial_sync_max_messages = 1000
+# initial_sync_max_age_days = 90
+
+# [[accounts]]
+# id = "work"
+# imap_host = "outlook.office365.com"
+# imap_port = 993
+# tls = true
+# username = "user@company.com"
+# password = "${WORK_PASSWORD}"
+# poll_interval_secs = 120
+# rate_limit_per_second = 3
+# max_connections = 2
+# mailboxes = ["INBOX", "Sent"]
+
+# ---------------------------------------------------------------------------
+# Processors — define pipelines that run when events occur.
+# ---------------------------------------------------------------------------
+
+# Built-in: logs every event via tracing (useful for debugging)
+[[processors]]
+name = "logger"
+enabled = true
+events = ["email_arrived"]
+timeout_secs = 5
+concurrency = 1
+
+# Example: run an external command for each new email
+# [[processors]]
+# name = "notify"
+# enabled = true
+# events = ["email_arrived"]
+# max_retries = 3
+# retry_backoff_secs = [5, 30, 300]
+# timeout_secs = 30
+# concurrency = 2
+#
+# [processors.config]
+# command = "/usr/local/bin/notify-new-mail"
+# args = ["--json"]
