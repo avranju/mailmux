@@ -38,26 +38,17 @@ emphasis on data integrity, recoverability, and idempotency.
 
 ## Architecture
 
-```
-IMAP servers
-    |
-    v
-AccountManager (per account)
-    |
-    v
-MailboxWatcher (per mailbox)  -->  raw .eml files on disk
-    |                               +
-    v                               metadata in PostgreSQL
-Atomic transaction: INSERT email + INSERT event + pg_notify
-    |
-    v
-EventLoop (LISTEN/NOTIFY + poll fallback)
-    |
-    v
-JobScheduler --> Processor (logger, command, custom)
-    |
-    v
-processor_jobs table (status tracking, retries)
+```mermaid
+graph TD
+    A[IMAP Servers] --> B[AccountManager\nper account]
+    B --> C[MailboxWatcher\nper mailbox]
+    C --> D[Atomic Transaction\nINSERT email + INSERT event + pg_notify]
+    C --> E[(Filesystem\nraw .eml files)]
+    D --> F[(PostgreSQL\nmetadata + events)]
+    D --> G[EventLoop\nLISTEN/NOTIFY + poll fallback]
+    G --> H[JobScheduler]
+    H --> I[Processor\nlogger / command / custom]
+    I --> J[(processor_jobs\nstatus tracking + retries)]
 ```
 
 Storage is split between PostgreSQL (metadata, events, job state) and the
