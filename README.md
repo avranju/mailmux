@@ -56,7 +56,7 @@ filesystem (raw RFC 5322 messages stored as `.eml` files).
 
 ## Prerequisites
 
-- **Rust** 1.85+ (edition 2024) — install via [rustup](https://rustup.rs)
+- **Rust** 1.93+ (edition 2024) — install via [rustup](https://rustup.rs)
 - **PostgreSQL** 12+
 
 ## Build
