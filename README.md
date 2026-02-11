@@ -40,15 +40,15 @@ emphasis on data integrity, recoverability, and idempotency.
 
 ```mermaid
 graph TD
-    A[IMAP Servers] --> B[AccountManager\nper account]
-    B --> C[MailboxWatcher\nper mailbox]
-    C --> D[Atomic Transaction\nINSERT email + INSERT event + pg_notify]
-    C --> E[(Filesystem\nraw .eml files)]
-    D --> F[(PostgreSQL\nmetadata + events)]
-    D --> G[EventLoop\nLISTEN/NOTIFY + poll fallback]
+    A[IMAP Servers] --> B[AccountManager<br/>per account]
+    B --> C[MailboxWatcher<br/>per mailbox]
+    C --> D[Atomic Transaction<br/>INSERT email + INSERT event + pg_notify]
+    C --> E[(Filesystem<br/>raw .eml files)]
+    D --> F[(PostgreSQL<br/>metadata + events)]
+    D --> G[EventLoop<br/>LISTEN/NOTIFY + poll fallback]
     G --> H[JobScheduler]
-    H --> I[Processor\nlogger / command / custom]
-    I --> J[(processor_jobs\nstatus tracking + retries)]
+    H --> I[Processor<br/>logger / command / custom]
+    I --> J[(processor_jobs<br/>status tracking + retries)]
 ```
 
 Storage is split between PostgreSQL (metadata, events, job state) and the
