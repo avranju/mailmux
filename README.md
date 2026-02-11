@@ -233,6 +233,67 @@ mailmux replay --event-id 42 --processor notify
 mailmux dry-run --event-id 42 --processor notify
 ```
 
+## Docker
+
+Build the image:
+
+```bash
+docker build -t mailmux .
+```
+
+Run with an existing PostgreSQL instance:
+
+```bash
+docker run --rm \
+  -v $(pwd)/config.toml:/etc/mailmux/config.toml:ro \
+  -v mailmux-data:/var/lib/mailmux \
+  -e DB_PASSWORD=secret \
+  -e GMAIL_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx \
+  -p 8080:8080 \
+  mailmux
+```
+
+### Docker Compose
+
+A `docker-compose.yml` is included that starts both PostgreSQL and mailmux.
+
+1. Create a `config.toml` in the project root (see [Configuration](#configuration)).
+   Use the Compose-internal hostname `postgres` for the database:
+
+   ```toml
+   [database]
+   url = "postgres://mailmux:${DB_PASSWORD}@postgres:5432/mailmux"
+   ```
+
+2. Set IMAP credentials as environment variables in `docker-compose.yml` or in
+   a `.env` file next to it:
+
+   ```
+   GMAIL_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
+   ```
+
+3. Start the stack:
+
+   ```bash
+   docker compose up -d
+   ```
+
+4. View logs:
+
+   ```bash
+   docker compose logs -f mailmux
+   ```
+
+5. Stop:
+
+   ```bash
+   docker compose down
+   ```
+
+Data is persisted in named Docker volumes (`pgdata` for the database,
+`mailmux-data` for raw `.eml` files). To start fresh, add `-v` when
+tearing down: `docker compose down -v`.
+
 ## Deployment with systemd
 
 An example unit file is provided in `contrib/mailmux.service`. Install it:
