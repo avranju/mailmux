@@ -246,7 +246,7 @@ async fn cmd_replay(
         let timeout = std::time::Duration::from_secs(timeout_secs);
 
         if let Err(e) =
-            db::jobs::update_job_status(&pool, job_id, "in_progress", None, None).await
+            db::jobs::update_job_status(&pool, job_id, "in_progress", None, None, true).await
         {
             error!(job_id, error = %e, "failed to update job status");
             continue;
@@ -262,6 +262,7 @@ async fn cmd_replay(
                     "completed",
                     msg,
                     None,
+                    false,
                 )
                 .await;
             }
@@ -269,7 +270,7 @@ async fn cmd_replay(
                 let msg = output.message.unwrap_or_default();
                 warn!(processor = proc_name, message = msg, "replay completed with failure");
                 let _ =
-                    db::jobs::update_job_status(&pool, job_id, "failed", Some(&msg), None).await;
+                    db::jobs::update_job_status(&pool, job_id, "failed", Some(&msg), None, false).await;
             }
             Ok(Err(e)) => {
                 error!(processor = proc_name, error = %e, "replay failed with error");
@@ -279,6 +280,7 @@ async fn cmd_replay(
                     "failed",
                     Some(&e.to_string()),
                     None,
+                    false,
                 )
                 .await;
             }
@@ -290,6 +292,7 @@ async fn cmd_replay(
                     "failed",
                     Some("timed out"),
                     None,
+                    false,
                 )
                 .await;
             }

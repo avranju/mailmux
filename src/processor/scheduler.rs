@@ -135,7 +135,7 @@ impl JobScheduler {
         timeout_secs: u64,
     ) {
         if let Err(e) =
-            jobs::update_job_status(&self.pool, job_id, "in_progress", None, None).await
+            jobs::update_job_status(&self.pool, job_id, "in_progress", None, None, true).await
         {
             error!(job_id, error = %e, "failed to update job status to in_progress");
             return;
@@ -146,7 +146,17 @@ impl JobScheduler {
             .find(|p| p.name() == processor_name)
         {
             Some(p) => p,
-            None => return,
+            None => {
+                // Can happen if a processor was removed from config after a job was
+                // persisted (e.g. during a retry sweep). Not a bug from process_events.
+                error!(
+                    job_id,
+                    processor = processor_name,
+                    event_id = event.id,
+                    "processor not found in registry; was it removed from config?"
+                );
+                return;
+            }
         };
 
         let timeout = Duration::from_secs(timeout_secs);
@@ -155,7 +165,7 @@ impl JobScheduler {
         match result {
             Ok(Ok(output)) if output.success => {
                 debug!(job_id, processor = processor_name, event_id = event.id, "processor completed");
-                let _ = jobs::update_job_status(&self.pool, job_id, "completed", None, None).await;
+                let _ = jobs::update_job_status(&self.pool, job_id, "completed", None, None, false).await;
                 crate::metrics::inc_processor_runs(processor_name, "success");
             }
             Ok(Ok(output)) => {
@@ -179,11 +189,17 @@ impl JobScheduler {
         let max_retries = config.map(|c| c.max_retries).unwrap_or(0);
         let backoff_secs = config.map(|c| &c.retry_backoff_secs[..]).unwrap_or(&[]);
 
-        // Get current attempt count
-        let current_job = jobs::get_pending_jobs(&self.pool, processor_name, 1).await;
-        let attempts = match current_job {
-            Ok(jobs_list) => jobs_list.first().map(|j| j.attempts).unwrap_or(0),
-            Err(_) => 0,
+        // Get current attempt count for this specific job.
+        let attempts = match jobs::get_job_by_id(&self.pool, job_id).await {
+            Ok(Some(job)) => job.attempts,
+            Ok(None) => {
+                error!(job_id, "job not found when handling failure");
+                return;
+            }
+            Err(e) => {
+                error!(job_id, error = %e, "failed to fetch job when handling failure");
+                return;
+            }
         };
 
         if max_retries == 0 || attempts as u32 >= max_retries {
@@ -193,12 +209,20 @@ impl JobScheduler {
                 error = error_msg,
                 "processor failed, marking as abandoned (max retries exceeded)"
             );
-            let _ = jobs::update_job_status(&self.pool, job_id, "abandoned", Some(error_msg), None)
+            let _ = jobs::update_job_status(&self.pool, job_id, "abandoned", Some(error_msg), None, false)
                 .await;
         } else {
-            // Calculate next retry time from backoff schedule
-            let backoff_idx = (attempts as usize).min(backoff_secs.len().saturating_sub(1));
+            // Map attempts → backoff schedule index. `attempts` is already 1 on the
+            // first failure (incremented when transitioning to in_progress), so subtract
+            // 1 to align the first failure with index 0. Clamp to the last entry so
+            // that retries beyond the schedule length keep using the longest delay.
+            let backoff_idx = (attempts as usize)
+                .saturating_sub(1)
+                .min(backoff_secs.len().saturating_sub(1));
+            // Fall back to 60 s if retry_backoff_secs was left empty in config.
             let delay_secs = backoff_secs.get(backoff_idx).copied().unwrap_or(60);
+            // Compute an absolute timestamp; the retry sweep compares next_retry_at
+            // against now() to decide when to re-queue the job.
             let next_retry = chrono::Utc::now() + chrono::Duration::seconds(delay_secs as i64);
 
             warn!(
@@ -215,6 +239,7 @@ impl JobScheduler {
                 "failed",
                 Some(error_msg),
                 Some(next_retry),
+                false,
             )
             .await;
         }

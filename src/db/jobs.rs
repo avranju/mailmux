@@ -40,19 +40,23 @@ pub async fn create_job(
     Ok(id)
 }
 
-/// Update a job's status.
+/// Update a job's status. Pass `increment_attempts = true` only when the job
+/// is transitioning to `in_progress` so that each dispatch cycle counts as
+/// exactly one attempt.
 pub async fn update_job_status(
     pool: &PgPool,
     job_id: i64,
     status: &str,
     error: Option<&str>,
     next_retry_at: Option<DateTime<Utc>>,
+    increment_attempts: bool,
 ) -> Result<()> {
     sqlx::query(
         r#"
         UPDATE processor_jobs
         SET status = $2, last_error = $3, next_retry_at = $4,
-            attempts = attempts + 1, updated_at = now()
+            attempts = CASE WHEN $5 THEN attempts + 1 ELSE attempts END,
+            updated_at = now()
         WHERE id = $1
         "#,
     )
@@ -60,6 +64,7 @@ pub async fn update_job_status(
     .bind(status)
     .bind(error)
     .bind(next_retry_at)
+    .bind(increment_attempts)
     .execute(pool)
     .await
     .context("updating job status")?;
@@ -67,30 +72,24 @@ pub async fn update_job_status(
     Ok(())
 }
 
-/// Get pending jobs for a specific processor.
-pub async fn get_pending_jobs(
-    pool: &PgPool,
-    processor_name: &str,
-    limit: i64,
-) -> Result<Vec<ProcessorJob>> {
-    let rows = sqlx::query(
+/// Get a single job by its ID.
+pub async fn get_job_by_id(pool: &PgPool, job_id: i64) -> Result<Option<ProcessorJob>> {
+    let row = sqlx::query(
         r#"
         SELECT id, event_id, processor_name, status, attempts, last_error,
                next_retry_at, created_at, updated_at
         FROM processor_jobs
-        WHERE processor_name = $1 AND status = 'pending'
-        ORDER BY id ASC
-        LIMIT $2
+        WHERE id = $1
         "#,
     )
-    .bind(processor_name)
-    .bind(limit)
-    .fetch_all(pool)
+    .bind(job_id)
+    .fetch_optional(pool)
     .await
-    .context("fetching pending jobs")?;
+    .context("fetching job by id")?;
 
-    Ok(rows.into_iter().map(row_to_job).collect())
+    Ok(row.map(row_to_job))
 }
+
 
 /// Get failed jobs that are ready to retry.
 pub async fn get_retryable_jobs(pool: &PgPool, limit: i64) -> Result<Vec<ProcessorJob>> {
