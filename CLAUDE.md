@@ -32,7 +32,7 @@ cargo clippy
 # Run standalone (pipe JSON on stdin)
 echo '{"event":{"id":1},"email":{"subject":"Txn alert","sender":"alerts@mybank.com","raw_message_path":"/tmp/test.eml"}}' \
   | ALLOWED_SENDERS=alerts@mybank.com \
-    ANTHROPIC_API_KEY=sk-ant-... \
+    ANTHROPIC_API_KEY=sk-ant-... \   # or OPENAI_API_KEY / GEMINI_API_KEY depending on LLM_MODEL
     ENDPOINT_URL=https://example.com/transactions \
     ENDPOINT_AUTH="Bearer token" \
     ./target/debug/bank-tx-processor
@@ -75,10 +75,12 @@ process environment):
 | Variable | Required | Notes |
 |---|---|---|
 | `ALLOWED_SENDERS` | yes | Comma-separated; matched as case-insensitive substrings of the sender field |
-| `ANTHROPIC_API_KEY` | yes | |
 | `ENDPOINT_URL` | yes | |
 | `ENDPOINT_AUTH` | yes | Full `Authorization` header value |
-| `ANTHROPIC_MODEL` | no | Default: `claude-haiku-4-5-20251001` |
+| `LLM_MODEL` | no | Default: `claude-haiku-4-5-20251001`. Provider is inferred by `genai` from the model name. |
+| `ANTHROPIC_API_KEY` | provider-dependent | Required when using any `claude-` model; read directly by `genai`, not by our code |
+| `OPENAI_API_KEY` | provider-dependent | Required when using any `gpt-` or `o1-`/`o3-` model |
+| `GEMINI_API_KEY` | provider-dependent | Required when using any `gemini-` model |
 | `RUST_LOG` | no | Standard tracing env filter |
 
 ## mailmux Integration
@@ -128,8 +130,9 @@ environment that starts mailmux (systemd `EnvironmentFile`, Docker Compose
 2. Update the prompt string in `PROMPT_TEMPLATE`
 3. Update `TransactionPayload` in `src/post.rs` if the field should be posted
 
-**To change the LLM model**, update the `ANTHROPIC_MODEL` env var at runtime —
-no code change needed.
+**To change the LLM model**, update the `LLM_MODEL` env var at runtime — no
+code change needed. `genai` infers the provider from the model name and reads
+the relevant API key env var automatically.
 
 **To change the endpoint payload shape**, edit `TransactionPayload` in
 `src/post.rs`.

@@ -3,8 +3,10 @@ use anyhow::{Context, Result};
 pub struct Config {
     /// Lowercase email addresses (or substrings) that are accepted as bank senders.
     pub allowed_senders: Vec<String>,
-    pub anthropic_api_key: String,
-    pub anthropic_model: String,
+    /// Model name passed to genai, e.g. "claude-haiku-4-5-20251001" or "gpt-4o-mini".
+    /// genai infers the provider from the model name and reads the corresponding
+    /// API key from the environment automatically (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.).
+    pub llm_model: String,
     pub endpoint_url: String,
     /// Full value for the Authorization header, e.g. "Bearer <token>".
     pub endpoint_auth: String,
@@ -19,10 +21,7 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
 
-        let anthropic_api_key =
-            std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY env var required")?;
-
-        let anthropic_model = std::env::var("ANTHROPIC_MODEL")
+        let llm_model = std::env::var("LLM_MODEL")
             .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
 
         let endpoint_url =
@@ -33,8 +32,7 @@ impl Config {
 
         Ok(Self {
             allowed_senders,
-            anthropic_api_key,
-            anthropic_model,
+            llm_model,
             endpoint_url,
             endpoint_auth,
         })

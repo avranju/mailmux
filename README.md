@@ -112,11 +112,21 @@ runtime rather than stored in the mailmux config file.
 | Variable | Required | Description |
 |---|---|---|
 | `ALLOWED_SENDERS` | yes | Comma-separated list of sender addresses or substrings to accept, e.g. `alerts@mybank.com,noreply@anotherbank.com` |
-| `ANTHROPIC_API_KEY` | yes | Anthropic API key |
 | `ENDPOINT_URL` | yes | URL to POST extracted transaction data to |
 | `ENDPOINT_AUTH` | yes | Full value for the `Authorization` header, e.g. `Bearer eyJ...` |
-| `ANTHROPIC_MODEL` | no | Claude model ID (default: `claude-haiku-4-5-20251001`) |
+| `LLM_MODEL` | no | Model name (default: `claude-haiku-4-5-20251001`). See provider API keys below. |
 | `RUST_LOG` | no | Log level filter, e.g. `debug` or `bank_tx_processor=debug` |
+
+The LLM provider is inferred automatically from the model name by the `genai`
+crate. Set the corresponding API key env var for whichever provider you use:
+
+| Provider | Example model | API key env var |
+|---|---|---|
+| Anthropic | `claude-haiku-4-5-20251001` | `ANTHROPIC_API_KEY` |
+| OpenAI | `gpt-4o-mini` | `OPENAI_API_KEY` |
+| Google Gemini | `gemini-2.0-flash` | `GEMINI_API_KEY` |
+| Groq | `llama-3.1-8b-instant` | `GROQ_API_KEY` |
+| Ollama (local) | `llama3.2` | *(no key required)* |
 
 ### Sender matching
 
@@ -150,7 +160,7 @@ concurrency = 1
 command = "/usr/local/bin/bank-tx-processor"
 ```
 
-**`timeout_secs`** must be generous enough to cover an Anthropic API round-trip
+**`timeout_secs`** must be generous enough to cover an LLM API round-trip
 (typically 2–10 s) plus the downstream HTTP POST. 90 s is a safe default.
 
 **`concurrency = 1`** is appropriate for low-volume bank notification emails.
@@ -178,6 +188,7 @@ ALLOWED_SENDERS=alerts@mybank.com,noreply@anotherbank.com
 ANTHROPIC_API_KEY=sk-ant-...
 ENDPOINT_URL=https://your-api.example.com/transactions
 ENDPOINT_AUTH=Bearer eyJ...
+# LLM_MODEL=claude-haiku-4-5-20251001  # optional, this is the default
 ```
 
 Reload after changes:
@@ -194,9 +205,10 @@ Add to the `environment` section of the mailmux service:
 ```yaml
 environment:
   ALLOWED_SENDERS: alerts@mybank.com
-  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}   # or OPENAI_API_KEY, GEMINI_API_KEY, etc.
   ENDPOINT_URL: ${ENDPOINT_URL}
   ENDPOINT_AUTH: ${ENDPOINT_AUTH}
+  # LLM_MODEL: claude-haiku-4-5-20251001    # optional override
 ```
 
 And set the values in your `.env` file alongside `docker-compose.yml`.
@@ -251,4 +263,5 @@ echo '{"event":{"id":1},"email":{"subject":"Test","sender":"alerts@mybank.com","
     ENDPOINT_URL=https://... \
     ENDPOINT_AUTH="Bearer ..." \
     ./target/debug/bank-tx-processor
+    # Set LLM_MODEL=gpt-4o-mini and OPENAI_API_KEY=... to use OpenAI instead
 ```

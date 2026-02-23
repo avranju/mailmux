@@ -56,23 +56,17 @@ async fn run() -> Result<()> {
 
     let body = email::extract_body(&email.raw_message_path)?;
 
-    let client = reqwest::Client::new();
+    let llm_client = genai::Client::default();
+    let http_client = reqwest::Client::new();
 
-    let tx = llm::extract_transaction(
-        &client,
-        &config.anthropic_api_key,
-        &config.anthropic_model,
-        subject,
-        &body,
-    )
-    .await?;
+    let tx = llm::extract_transaction(&llm_client, &config.llm_model, subject, &body).await?;
 
     if tx.status != "found" {
         info!("LLM did not find transaction data in email, skipping");
         return Ok(());
     }
 
-    post::post_transaction(&client, &config.endpoint_url, &config.endpoint_auth, &tx).await?;
+    post::post_transaction(&http_client, &config.endpoint_url, &config.endpoint_auth, &tx).await?;
 
     info!(
         amount = tx.amount,
