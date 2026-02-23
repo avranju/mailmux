@@ -199,7 +199,7 @@ args = ["--json"]
 |---|---|---|
 | `name` | *required* | Unique processor name |
 | `enabled` | `true` | Whether the processor is active |
-| `events` | `[]` | Event types to subscribe to |
+| `events` | `[]` | Event types to subscribe to. Currently `email_arrived` is the only supported type. |
 | `max_retries` | `0` | Max retry attempts on failure |
 | `retry_backoff_secs` | `[]` | Backoff schedule (seconds per attempt) |
 | `timeout_secs` | `30` | Execution timeout |

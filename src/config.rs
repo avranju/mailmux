@@ -192,6 +192,7 @@ impl Config {
         }
 
         // Validate processors
+        const KNOWN_EVENT_TYPES: &[&str] = &["email_arrived"];
         let mut seen_names = std::collections::HashSet::new();
         for processor in &self.processors {
             if processor.name.is_empty() {
@@ -199,6 +200,16 @@ impl Config {
             }
             if !seen_names.insert(&processor.name) {
                 bail!("duplicate processor name: {}", processor.name);
+            }
+            for event in &processor.events {
+                if !KNOWN_EVENT_TYPES.contains(&event.as_str()) {
+                    bail!(
+                        "processor '{}': unknown event type '{}' (supported: {})",
+                        processor.name,
+                        event,
+                        KNOWN_EVENT_TYPES.join(", ")
+                    );
+                }
             }
         }
 
@@ -349,6 +360,32 @@ mailboxes = []
         let f = write_temp_config(toml);
         let err = Config::load(f.path()).unwrap_err();
         assert!(err.to_string().contains("at least one mailbox"));
+    }
+
+    #[test]
+    fn test_unknown_event_type() {
+        let toml = r#"
+[general]
+data_dir = "/tmp/mailmux"
+
+[database]
+url = "postgres://localhost/mailmux"
+
+[[accounts]]
+id = "test"
+imap_host = "imap.example.com"
+username = "a"
+password = "b"
+mailboxes = ["INBOX"]
+
+[[processors]]
+name = "notify"
+events = ["email_deleted"]
+"#;
+        let f = write_temp_config(toml);
+        let err = Config::load(f.path()).unwrap_err();
+        assert!(err.to_string().contains("unknown event type"));
+        assert!(err.to_string().contains("email_deleted"));
     }
 
     #[test]
