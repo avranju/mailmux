@@ -21,6 +21,13 @@ mod store;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Explicitly install ring as the rustls crypto provider. Without this,
+    // rustls 0.23 may fail to determine a provider automatically when multiple
+    // providers are present in the dependency graph.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     let cli = cli::Cli::parse();
 
     // Load configuration
