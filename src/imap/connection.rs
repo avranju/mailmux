@@ -252,7 +252,12 @@ impl ImapConnection {
                             debug!(mailbox, uid_validity = uv.get(), "UIDVALIDITY");
                         }
                         check_status(&status, "SELECT")?;
-                        break;
+                        // Only the tagged response terminates SELECT. Untagged
+                        // status lines (e.g. * OK [UNSEEN n]) may arrive
+                        // before the tagged completion — keep looping.
+                        if matches!(status, Status::Tagged(_)) {
+                            break;
+                        }
                     }
                     Event::CommandSent { .. } => {}
                     other => {
@@ -324,7 +329,12 @@ impl ImapConnection {
                 }
                 Event::StatusReceived { status } => {
                     check_status(&status, "UID FETCH")?;
-                    break;
+                    // Only the tagged response terminates the FETCH. Untagged
+                    // status lines (e.g. * OK [UIDNEXT n]) may arrive before
+                    // the server has finished streaming data — keep looping.
+                    if matches!(status, Status::Tagged(_)) {
+                        break;
+                    }
                 }
                 Event::CommandSent { .. } => {}
                 other => {
