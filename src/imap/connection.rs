@@ -2,17 +2,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
 use imap_next::client::{Client, Event, Options};
 use imap_next::imap_types::command::{Command, CommandBody};
 use imap_next::imap_types::core::Tag;
-use imap_next::imap_types::fetch::{MessageDataItem, MessageDataItemName, MacroOrMessageDataItemNames};
+use imap_next::imap_types::fetch::{
+    MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName,
+};
 use imap_next::imap_types::flag::{Flag, FlagFetch};
 use imap_next::imap_types::response::{Code, Data, Status, StatusKind};
 use imap_next::imap_types::sequence::SequenceSet;
 use imap_next::stream::Stream;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
@@ -20,6 +22,11 @@ use tracing::{debug, trace};
 use crate::config::AccountConfig;
 
 const IDLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to wait for trailing FETCH responses after a tagged OK.
+/// Proton Mail Bridge sends the tagged completion before the message data;
+/// this grace period lets those responses arrive before we return.
+const FETCH_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// A TLS certificate verifier that accepts any certificate without validation.
 /// Only use for local bridges (e.g. Proton Mail Bridge) on loopback interfaces.
@@ -91,8 +98,10 @@ impl ImapConnection {
             .with_context(|| format!("connecting to {addr}"))?;
 
         let stream = if config.tls {
-            let server_name: ServerName<'_> = config.imap_host.clone().try_into()
-                .map_err(|e| anyhow::anyhow!("invalid server name '{}': {e}", config.imap_host))?;
+            let server_name: ServerName<'_> =
+                config.imap_host.clone().try_into().map_err(|e| {
+                    anyhow::anyhow!("invalid server name '{}': {e}", config.imap_host)
+                })?;
 
             let tls_config = if config.tls_accept_invalid_certs {
                 tracing::warn!(
@@ -113,15 +122,17 @@ impl ImapConnection {
                 if let Some(ca_file) = &config.tls_ca_file {
                     let pem = std::fs::read(ca_file)
                         .with_context(|| format!("reading TLS CA file '{ca_file}'"))?;
-                    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut pem.as_slice())
-                        .collect::<Result<_, _>>()
-                        .with_context(|| format!("parsing TLS CA file '{ca_file}'"))?;
+                    let certs: Vec<CertificateDer<'static>> =
+                        rustls_pemfile::certs(&mut pem.as_slice())
+                            .collect::<Result<_, _>>()
+                            .with_context(|| format!("parsing TLS CA file '{ca_file}'"))?;
                     if certs.is_empty() {
                         bail!("TLS CA file '{ca_file}' contains no certificates");
                     }
                     for cert in certs {
-                        root_store.add(cert)
-                            .with_context(|| format!("adding certificate from '{ca_file}' to trust store"))?;
+                        root_store.add(cert).with_context(|| {
+                            format!("adding certificate from '{ca_file}' to trust store")
+                        })?;
                     }
                     debug!(account = %config.id, ca_file, "loaded custom TLS CA certificate(s)");
                 }
@@ -134,7 +145,9 @@ impl ImapConnection {
             };
 
             let connector = tokio_rustls::TlsConnector::from(tls_config);
-            let tls_stream = connector.connect(server_name.to_owned(), tcp).await
+            let tls_stream = connector
+                .connect(server_name.to_owned(), tcp)
+                .await
                 .context("TLS handshake failed")?;
             Stream::tls(tls_stream.into())
         } else {
@@ -170,7 +183,10 @@ impl ImapConnection {
         let timeout = self.command_timeout;
         tokio::time::timeout(timeout, async {
             loop {
-                let event = self.stream.next(&mut self.client).await
+                let event = self
+                    .stream
+                    .next(&mut self.client)
+                    .await
                     .context("waiting for server greeting")?;
                 match event {
                     Event::GreetingReceived { greeting } => {
@@ -200,7 +216,10 @@ impl ImapConnection {
         let timeout = self.command_timeout;
         tokio::time::timeout(timeout, async {
             loop {
-                let event = self.stream.next(&mut self.client).await
+                let event = self
+                    .stream
+                    .next(&mut self.client)
+                    .await
                     .context("during LOGIN")?;
                 match event {
                     Event::StatusReceived { status } => {
@@ -225,8 +244,7 @@ impl ImapConnection {
         let tag = self.next_tag();
         let cmd = Command {
             tag,
-            body: CommandBody::select(mailbox.to_owned())
-                .context("building SELECT command")?,
+            body: CommandBody::select(mailbox.to_owned()).context("building SELECT command")?,
         };
         let _handle = self.client.enqueue_command(cmd);
 
@@ -236,7 +254,10 @@ impl ImapConnection {
         let timeout = self.command_timeout;
         tokio::time::timeout(timeout, async {
             loop {
-                let event = self.stream.next(&mut self.client).await
+                let event = self
+                    .stream
+                    .next(&mut self.client)
+                    .await
                     .context("during SELECT")?;
                 match event {
                     Event::DataReceived { data } => {
@@ -286,7 +307,8 @@ impl ImapConnection {
         };
 
         let tag = self.next_tag();
-        let sequence_set: SequenceSet = range.parse()
+        let sequence_set: SequenceSet = range
+            .parse()
             .map_err(|_| anyhow::anyhow!("invalid UID range: {range}"))?;
 
         let fetch_attrs = MacroOrMessageDataItemNames::MessageDataItemNames(vec![
@@ -314,10 +336,15 @@ impl ImapConnection {
         let timeout = self.command_timeout;
 
         loop {
-            let event = match tokio::time::timeout(timeout, self.stream.next(&mut self.client)).await {
-                Ok(result) => result.context("during UID FETCH")?,
-                Err(_) => bail!("IMAP UID FETCH timed out after {}s (no data received for {}s)", timeout.as_secs(), timeout.as_secs()),
-            };
+            let event =
+                match tokio::time::timeout(timeout, self.stream.next(&mut self.client)).await {
+                    Ok(result) => result.context("during UID FETCH")?,
+                    Err(_) => bail!(
+                        "IMAP UID FETCH timed out after {}s (no data received for {}s)",
+                        timeout.as_secs(),
+                        timeout.as_secs()
+                    ),
+                };
             match event {
                 Event::DataReceived { data } => {
                     if let Data::Fetch { seq: _, items } = data {
@@ -333,6 +360,28 @@ impl ImapConnection {
                     // status lines (e.g. * OK [UIDNEXT n]) may arrive before
                     // the server has finished streaming data — keep looping.
                     if matches!(status, Status::Tagged(_)) {
+                        // Some servers (e.g. Proton Mail Bridge) send the
+                        // tagged OK before the FETCH data. If nothing has
+                        // arrived yet, drain briefly for trailing responses.
+                        if messages.is_empty() {
+                            loop {
+                                match tokio::time::timeout(
+                                    FETCH_DRAIN_TIMEOUT,
+                                    self.stream.next(&mut self.client),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(Event::DataReceived {
+                                        data: Data::Fetch { items, .. },
+                                    })) => {
+                                        if let Some(msg) = parse_fetch_response(items.as_ref()) {
+                                            messages.push(msg);
+                                        }
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
                         break;
                     }
                 }
@@ -361,7 +410,10 @@ impl ImapConnection {
         let timeout = self.command_timeout;
         tokio::time::timeout(timeout, async {
             loop {
-                let event = self.stream.next(&mut self.client).await
+                let event = self
+                    .stream
+                    .next(&mut self.client)
+                    .await
                     .context("during IDLE setup")?;
                 match event {
                     Event::IdleCommandSent { .. } => {
@@ -457,7 +509,8 @@ impl ImapConnection {
                     Err(_) => break,
                 }
             }
-        }).await;
+        })
+        .await;
 
         Ok(())
     }
@@ -488,7 +541,11 @@ fn parse_fetch_response(items: &[MessageDataItem]) -> Option<FetchedMessage> {
                     flags.push(flag_fetch_to_string(flag));
                 }
             }
-            MessageDataItem::BodyExt { section: None, data, .. } => {
+            MessageDataItem::BodyExt {
+                section: None,
+                data,
+                ..
+            } => {
                 if let Some(bytes) = data.clone().into_option() {
                     raw_bytes = Some(bytes.into_owned());
                 }
