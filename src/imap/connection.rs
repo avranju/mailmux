@@ -364,21 +364,16 @@ impl ImapConnection {
                         // tagged OK before the FETCH data. If nothing has
                         // arrived yet, drain briefly for trailing responses.
                         if messages.is_empty() {
-                            loop {
-                                match tokio::time::timeout(
-                                    FETCH_DRAIN_TIMEOUT,
-                                    self.stream.next(&mut self.client),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(Event::DataReceived {
-                                        data: Data::Fetch { items, .. },
-                                    })) => {
-                                        if let Some(msg) = parse_fetch_response(items.as_ref()) {
-                                            messages.push(msg);
-                                        }
-                                    }
-                                    _ => break,
+                            while let Ok(Ok(Event::DataReceived {
+                                data: Data::Fetch { items, .. },
+                            })) = tokio::time::timeout(
+                                FETCH_DRAIN_TIMEOUT,
+                                self.stream.next(&mut self.client),
+                            )
+                            .await
+                            {
+                                if let Some(msg) = parse_fetch_response(items.as_ref()) {
+                                    messages.push(msg);
                                 }
                             }
                         }
