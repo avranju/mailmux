@@ -45,6 +45,10 @@ mailboxes = ["INBOX"]
 initial_sync_max_messages = 1000
 # initial_sync_max_age_days = 90
 
+# Timeout in seconds for individual IMAP command exchanges (greeting, login,
+# select, fetch inactivity, etc.). Default: 60
+# imap_command_timeout_secs = 60
+
 # [[accounts]]
 # id = "work"
 # imap_host = "outlook.office365.com"

@@ -77,6 +77,8 @@ pub struct AccountConfig {
     pub mailboxes: Vec<String>,
     pub initial_sync_max_messages: Option<u64>,
     pub initial_sync_max_age_days: Option<u64>,
+    #[serde(default = "default_imap_command_timeout")]
+    pub imap_command_timeout_secs: u64,
 }
 
 fn default_imap_port() -> u16 {
@@ -97,6 +99,10 @@ fn default_rate_limit() -> u32 {
 
 fn default_account_max_connections() -> u32 {
     2
+}
+
+fn default_imap_command_timeout() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Deserialize)]

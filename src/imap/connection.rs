@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use imap_next::client::{Client, Event, Options};
@@ -15,11 +16,14 @@ use tracing::{debug, trace};
 
 use crate::config::AccountConfig;
 
+const IDLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Wraps an imap-next client+stream pair.
 pub struct ImapConnection {
     stream: Stream,
     client: Client,
     tag_counter: u32,
+    command_timeout: Duration,
 }
 
 impl ImapConnection {
@@ -51,10 +55,12 @@ impl ImapConnection {
         };
 
         let client = Client::new(Options::default());
+        let command_timeout = Duration::from_secs(config.imap_command_timeout_secs);
         let mut conn = Self {
             stream,
             client,
             tag_counter: 0,
+            command_timeout,
         };
 
         // Wait for server greeting
@@ -74,19 +80,24 @@ impl ImapConnection {
     }
 
     async fn wait_for_greeting(&mut self) -> Result<()> {
-        loop {
-            let event = self.stream.next(&mut self.client).await
-                .context("waiting for server greeting")?;
-            match event {
-                Event::GreetingReceived { greeting } => {
-                    debug!(greeting = ?greeting.kind, "received server greeting");
-                    return Ok(());
-                }
-                other => {
-                    trace!(event = ?other, "ignoring event while waiting for greeting");
+        let timeout = self.command_timeout;
+        tokio::time::timeout(timeout, async {
+            loop {
+                let event = self.stream.next(&mut self.client).await
+                    .context("waiting for server greeting")?;
+                match event {
+                    Event::GreetingReceived { greeting } => {
+                        debug!(greeting = ?greeting.kind, "received server greeting");
+                        return Ok(());
+                    }
+                    other => {
+                        trace!(event = ?other, "ignoring event while waiting for greeting");
+                    }
                 }
             }
-        }
+        })
+        .await
+        .unwrap_or_else(|_| bail!("IMAP greeting timed out after {}s", timeout.as_secs()))
     }
 
     async fn login(&mut self, username: &str, password: &str) -> Result<()> {
@@ -99,22 +110,27 @@ impl ImapConnection {
         };
         let _handle = self.client.enqueue_command(cmd);
 
-        loop {
-            let event = self.stream.next(&mut self.client).await
-                .context("during LOGIN")?;
-            match event {
-                Event::StatusReceived { status } => {
-                    return check_status(&status, "LOGIN");
-                }
-                Event::CommandSent { .. } => {
-                    debug!("LOGIN command sent");
-                }
-                Event::DataReceived { .. } => {}
-                other => {
-                    trace!(event = ?other, "ignoring event during LOGIN");
+        let timeout = self.command_timeout;
+        tokio::time::timeout(timeout, async {
+            loop {
+                let event = self.stream.next(&mut self.client).await
+                    .context("during LOGIN")?;
+                match event {
+                    Event::StatusReceived { status } => {
+                        return check_status(&status, "LOGIN");
+                    }
+                    Event::CommandSent { .. } => {
+                        debug!("LOGIN command sent");
+                    }
+                    Event::DataReceived { .. } => {}
+                    other => {
+                        trace!(event = ?other, "ignoring event during LOGIN");
+                    }
                 }
             }
-        }
+        })
+        .await
+        .unwrap_or_else(|_| bail!("IMAP LOGIN timed out after {}s", timeout.as_secs()))
     }
 
     /// SELECT a mailbox. Returns (uid_validity, exists_count).
@@ -130,31 +146,37 @@ impl ImapConnection {
         let mut uid_validity: Option<u32> = None;
         let mut exists: u32 = 0;
 
-        loop {
-            let event = self.stream.next(&mut self.client).await
-                .context("during SELECT")?;
-            match event {
-                Event::DataReceived { data } => {
-                    if let Data::Exists(n) = data {
-                        exists = n;
-                        debug!(mailbox, exists = n, "mailbox EXISTS");
+        let timeout = self.command_timeout;
+        tokio::time::timeout(timeout, async {
+            loop {
+                let event = self.stream.next(&mut self.client).await
+                    .context("during SELECT")?;
+                match event {
+                    Event::DataReceived { data } => {
+                        if let Data::Exists(n) = data {
+                            exists = n;
+                            debug!(mailbox, exists = n, "mailbox EXISTS");
+                        }
                     }
-                }
-                Event::StatusReceived { status } => {
-                    // Check for UIDVALIDITY in the status code
-                    if let Some(Code::UidValidity(uv)) = status.code() {
-                        uid_validity = Some(uv.get());
-                        debug!(mailbox, uid_validity = uv.get(), "UIDVALIDITY");
+                    Event::StatusReceived { status } => {
+                        // Check for UIDVALIDITY in the status code
+                        if let Some(Code::UidValidity(uv)) = status.code() {
+                            uid_validity = Some(uv.get());
+                            debug!(mailbox, uid_validity = uv.get(), "UIDVALIDITY");
+                        }
+                        check_status(&status, "SELECT")?;
+                        break;
                     }
-                    check_status(&status, "SELECT")?;
-                    break;
-                }
-                Event::CommandSent { .. } => {}
-                other => {
-                    trace!(event = ?other, "ignoring event during SELECT");
+                    Event::CommandSent { .. } => {}
+                    other => {
+                        trace!(event = ?other, "ignoring event during SELECT");
+                    }
                 }
             }
-        }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .unwrap_or_else(|_| bail!("IMAP SELECT timed out after {}s", timeout.as_secs()))?;
 
         let uid_validity = uid_validity.unwrap_or(0);
         Ok((uid_validity, exists))
@@ -197,10 +219,13 @@ impl ImapConnection {
         let _handle = self.client.enqueue_command(cmd);
 
         let mut messages = Vec::new();
+        let timeout = self.command_timeout;
 
         loop {
-            let event = self.stream.next(&mut self.client).await
-                .context("during UID FETCH")?;
+            let event = match tokio::time::timeout(timeout, self.stream.next(&mut self.client)).await {
+                Ok(result) => result.context("during UID FETCH")?,
+                Err(_) => bail!("IMAP UID FETCH timed out after {}s (no data received for {}s)", timeout.as_secs(), timeout.as_secs()),
+            };
             match event {
                 Event::DataReceived { data } => {
                     if let Data::Fetch { seq: _, items } = data {
@@ -236,28 +261,33 @@ impl ImapConnection {
         let _handle = self.client.enqueue_command(cmd);
 
         // Wait for IDLE to be accepted
-        loop {
-            let event = self.stream.next(&mut self.client).await
-                .context("during IDLE setup")?;
-            match event {
-                Event::IdleCommandSent { .. } => {
-                    debug!("IDLE command sent");
-                }
-                Event::IdleAccepted { .. } => {
-                    debug!("IDLE accepted, waiting for updates");
-                    break;
-                }
-                Event::IdleRejected { .. } => {
-                    bail!("IDLE rejected by server");
-                }
-                Event::StatusReceived { status } => {
-                    check_status(&status, "IDLE")?;
-                }
-                other => {
-                    trace!(event = ?other, "ignoring event during IDLE setup");
+        let timeout = self.command_timeout;
+        tokio::time::timeout(timeout, async {
+            loop {
+                let event = self.stream.next(&mut self.client).await
+                    .context("during IDLE setup")?;
+                match event {
+                    Event::IdleCommandSent { .. } => {
+                        debug!("IDLE command sent");
+                    }
+                    Event::IdleAccepted { .. } => {
+                        debug!("IDLE accepted, waiting for updates");
+                        return Ok(());
+                    }
+                    Event::IdleRejected { .. } => {
+                        bail!("IDLE rejected by server");
+                    }
+                    Event::StatusReceived { status } => {
+                        check_status(&status, "IDLE")?;
+                    }
+                    other => {
+                        trace!(event = ?other, "ignoring event during IDLE setup");
+                    }
                 }
             }
-        }
+        })
+        .await
+        .unwrap_or_else(|_| bail!("IMAP IDLE setup timed out after {}s", timeout.as_secs()))?;
 
         // Now in IDLE mode — wait for updates or cancellation
         let got_update = loop {
@@ -292,15 +322,18 @@ impl ImapConnection {
                 _ = token.cancelled() => {
                     debug!("IDLE cancelled by shutdown");
                     self.client.set_idle_done();
-                    // Drain until we get the tagged response
-                    loop {
-                        match self.stream.next(&mut self.client).await {
-                            Ok(Event::StatusReceived { .. }) => break,
-                            Ok(Event::IdleDoneSent { .. }) => continue,
-                            Ok(_) => continue,
-                            Err(_) => break,
+                    // Drain until we get the tagged response, with a short timeout
+                    // to avoid blocking shutdown indefinitely.
+                    let _ = tokio::time::timeout(IDLE_DRAIN_TIMEOUT, async {
+                        loop {
+                            match self.stream.next(&mut self.client).await {
+                                Ok(Event::StatusReceived { .. }) => break,
+                                Ok(Event::IdleDoneSent { .. }) => continue,
+                                Ok(_) => continue,
+                                Err(_) => break,
+                            }
                         }
-                    }
+                    }).await;
                     break false;
                 }
             }
@@ -318,13 +351,16 @@ impl ImapConnection {
         };
         let _handle = self.client.enqueue_command(cmd);
 
-        loop {
-            match self.stream.next(&mut self.client).await {
-                Ok(Event::StatusReceived { .. }) => break,
-                Ok(_) => continue,
-                Err(_) => break,
+        let timeout = self.command_timeout;
+        let _ = tokio::time::timeout(timeout, async {
+            loop {
+                match self.stream.next(&mut self.client).await {
+                    Ok(Event::StatusReceived { .. }) => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
             }
-        }
+        }).await;
 
         Ok(())
     }

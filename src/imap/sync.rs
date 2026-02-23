@@ -140,6 +140,9 @@ impl MailboxWatcher {
                     let _ = conn.logout().await;
                     return Ok(());
                 }
+                Err(e) if e.to_string().contains("timed out") => {
+                    return Err(e);
+                }
                 Err(e) => {
                     debug!(
                         account = self.account.id,
