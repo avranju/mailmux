@@ -12,8 +12,10 @@ use tracing::{debug, error, info, warn};
 use crate::config::AccountConfig;
 use crate::db::emails::NewEmail;
 use crate::db::events::NewEvent;
-use crate::imap::connection::ImapConnection;
+use crate::imap::connection::{FetchedMessage, ImapConnection};
 use crate::store::MessageStore;
+
+const FETCH_BATCH_SIZE: usize = 500;
 
 /// Watches a single mailbox, performing initial + incremental sync.
 /// Supports IDLE when available, falls back to polling.
@@ -180,6 +182,9 @@ impl MailboxWatcher {
     }
 
     /// Fetch new messages since last_seen_uid and persist them.
+    /// Uses a UID-only scan first to avoid downloading large mailboxes in one
+    /// shot, then fetches bodies in batches of FETCH_BATCH_SIZE, checkpointing
+    /// after each batch so progress is not lost on interruption.
     async fn do_incremental_sync(
         &self,
         conn: &mut ImapConnection,
@@ -208,56 +213,12 @@ impl MailboxWatcher {
             None => 0,
         };
 
-        let mut fetch_from = last_seen_uid + 1;
-
-        // For the initial sync with a configured message limit, do a cheap
-        // UID-only fetch first to find the right starting UID. This avoids
-        // downloading the full body of every message in the mailbox before
-        // we can apply the limit.
-        if last_seen_uid == 0
-            && let Some(max_msgs) = self.account.initial_sync_max_messages
-        {
-            rate_limiter.until_ready().await;
-            let all_uids = conn.uid_fetch_uid_list(1).await?;
-            if all_uids.is_empty() {
-                debug!(
-                    account = self.account.id,
-                    mailbox = self.mailbox,
-                    "no new messages"
-                );
-                crate::db::emails::upsert_mailbox_state(
-                    &self.pool,
-                    &self.account.id,
-                    &self.mailbox,
-                    uid_validity as i64,
-                    0,
-                )
-                .await?;
-                return Ok(());
-            }
-            let skip = all_uids.len().saturating_sub(max_msgs as usize);
-            fetch_from = all_uids[skip];
-            debug!(
-                account = self.account.id,
-                mailbox = self.mailbox,
-                total_uids = all_uids.len(),
-                limit = max_msgs,
-                fetch_from,
-                "initial sync: fetched UID list, starting from most recent"
-            );
-        }
-
-        debug!(
-            account = self.account.id,
-            mailbox = self.mailbox,
-            fetch_from,
-            "fetching messages"
-        );
-
+        // Step 1: UID-only scan to discover new message UIDs without
+        // downloading bodies. This is cheap even for large mailboxes.
         rate_limiter.until_ready().await;
-        let messages = conn.uid_fetch_range(fetch_from, None).await?;
+        let all_uids = conn.uid_fetch_uid_list(last_seen_uid + 1).await?;
 
-        if messages.is_empty() {
+        if all_uids.is_empty() {
             debug!(
                 account = self.account.id,
                 mailbox = self.mailbox,
@@ -274,147 +235,177 @@ impl MailboxWatcher {
             return Ok(());
         }
 
+        // Step 2: Apply initial_sync_max_messages limit on first sync only.
+        let skip = if last_seen_uid == 0 {
+            self.account
+                .initial_sync_max_messages
+                .map(|max| all_uids.len().saturating_sub(max as usize))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let uids_to_fetch = &all_uids[skip..];
+
+        debug!(
+            account = self.account.id,
+            mailbox = self.mailbox,
+            count = uids_to_fetch.len(),
+            "fetching messages in batches"
+        );
+
         let mut max_uid = last_seen_uid;
-        let mut ingested = 0u64;
+        let mut total_ingested = 0u64;
         let parser = MessageParser::default();
 
-        // Apply initial sync bounds
-        let max_messages = self.account.initial_sync_max_messages.unwrap_or(u64::MAX);
-        let messages_to_process: Vec<_> = if last_seen_uid == 0 {
-            let skip = messages.len().saturating_sub(max_messages as usize);
-            messages.into_iter().skip(skip).collect()
-        } else {
-            messages
-        };
-
-        for msg in messages_to_process {
+        // Step 3: Fetch and ingest in batches, checkpointing after each.
+        'batch_loop: for chunk in uids_to_fetch.chunks(FETCH_BATCH_SIZE) {
             if self.token.is_cancelled() {
                 break;
             }
 
+            let uid_start = chunk[0];
+            let uid_end = *chunk.last().expect("chunks are non-empty");
+
             rate_limiter.until_ready().await;
+            let messages = conn.uid_fetch_range(uid_start, Some(uid_end)).await?;
 
-            let uid = msg.uid;
-            if uid > max_uid {
-                max_uid = uid;
+            let mut batch_ingested = 0u64;
+            for msg in &messages {
+                if self.token.is_cancelled() {
+                    break 'batch_loop;
+                }
+
+                let uid = msg.uid;
+                if uid > max_uid {
+                    max_uid = uid;
+                }
+
+                batch_ingested += self.ingest_message(msg, &parser).await? as u64;
             }
 
-            let parsed = parser.parse(&msg.raw_bytes);
+            crate::db::emails::upsert_mailbox_state(
+                &self.pool,
+                &self.account.id,
+                &self.mailbox,
+                uid_validity as i64,
+                max_uid as i64,
+            )
+            .await?;
 
-            let (message_id, subject, sender, recipients, date) = match parsed {
-                Some(ref parsed) => {
-                    let message_id = parsed.message_id().map(|s| s.to_string());
-                    let subject = parsed.subject().map(|s| s.to_string());
-                    let sender = parsed.from().and_then(|addrs| {
-                        addrs.first().map(|a| {
-                            match (&a.name, &a.address) {
-                                (Some(name), Some(addr)) => format!("{name} <{addr}>"),
-                                (None, Some(addr)) => addr.to_string(),
-                                (Some(name), None) => name.to_string(),
-                                (None, None) => String::new(),
-                            }
-                        })
-                    });
-                    let recipients = parsed.to().map(|addrs| {
-                        let list: Vec<String> = addrs.iter().map(|a| {
-                            a.address.as_deref().unwrap_or("").to_string()
-                        }).collect();
-                        serde_json::json!(list)
-                    });
-                    let date = parsed.date().and_then(|d| {
-                        chrono::DateTime::from_timestamp(d.to_timestamp(), 0)
-                    });
-
-                    (message_id, subject, sender, recipients, date)
-                }
-                None => {
-                    warn!(
-                        account = self.account.id,
-                        mailbox = self.mailbox,
-                        uid,
-                        "failed to parse message, storing raw only"
-                    );
-                    (None, None, None, None, None)
-                }
-            };
-
-            let raw_path = self
-                .store
-                .save(&self.account.id, &self.mailbox, uid, &msg.raw_bytes)
-                .await
-                .with_context(|| format!("saving raw message uid={uid}"))?;
-
-            let new_email = NewEmail {
-                account_id: self.account.id.clone(),
-                mailbox_name: self.mailbox.clone(),
-                uid: uid as i64,
-                message_id,
-                subject: subject.clone(),
-                sender: sender.clone(),
-                recipients,
-                date,
-                flags: msg.flags.clone(),
-                raw_message_path: raw_path.to_string_lossy().to_string(),
-                size_bytes: msg.size.map(|s| s as i64),
-            };
-
-            let new_event = NewEvent {
-                event_type: "email_arrived".to_string(),
-                account_id: self.account.id.clone(),
-                mailbox_name: self.mailbox.clone(),
-                email_id: None,
-                payload: serde_json::json!({
-                    "uid": uid,
-                    "subject": subject,
-                    "sender": sender,
-                }),
-            };
-
-            match crate::db::events::insert_email_with_event(&self.pool, &new_email, &new_event)
-                .await
-            {
-                Ok((email_id, event_id)) => {
-                    debug!(
-                        account = self.account.id,
-                        mailbox = self.mailbox,
-                        uid,
-                        email_id,
-                        event_id,
-                        "ingested message"
-                    );
-                    crate::metrics::inc_messages_ingested(&self.account.id, &self.mailbox);
-                    crate::metrics::inc_events_created("email_arrived");
-                    ingested += 1;
-                }
-                Err(e) => {
-                    warn!(
-                        account = self.account.id,
-                        mailbox = self.mailbox,
-                        uid,
-                        error = %e,
-                        "failed to persist message, will retry next cycle"
-                    );
-                }
-            }
+            total_ingested += batch_ingested;
         }
-
-        crate::db::emails::upsert_mailbox_state(
-            &self.pool,
-            &self.account.id,
-            &self.mailbox,
-            uid_validity as i64,
-            max_uid as i64,
-        )
-        .await?;
 
         info!(
             account = self.account.id,
             mailbox = self.mailbox,
-            ingested,
+            ingested = total_ingested,
             last_seen_uid = max_uid,
             "sync complete"
         );
 
         Ok(())
+    }
+
+    /// Parse and persist a single fetched message. Returns 1 on success, 0 on
+    /// failure (failure is logged as a warning rather than propagated so that
+    /// one bad message does not abort the entire batch).
+    async fn ingest_message(&self, msg: &FetchedMessage, parser: &MessageParser) -> Result<u8> {
+        let uid = msg.uid;
+        let parsed = parser.parse(&msg.raw_bytes);
+
+        let (message_id, subject, sender, recipients, date) = match parsed {
+            Some(ref parsed) => {
+                let message_id = parsed.message_id().map(|s| s.to_string());
+                let subject = parsed.subject().map(|s| s.to_string());
+                let sender = parsed.from().and_then(|addrs| {
+                    addrs.first().map(|a| match (&a.name, &a.address) {
+                        (Some(name), Some(addr)) => format!("{name} <{addr}>"),
+                        (None, Some(addr)) => addr.to_string(),
+                        (Some(name), None) => name.to_string(),
+                        (None, None) => String::new(),
+                    })
+                });
+                let recipients = parsed.to().map(|addrs| {
+                    let list: Vec<String> = addrs
+                        .iter()
+                        .map(|a| a.address.as_deref().unwrap_or("").to_string())
+                        .collect();
+                    serde_json::json!(list)
+                });
+                let date = parsed
+                    .date()
+                    .and_then(|d| chrono::DateTime::from_timestamp(d.to_timestamp(), 0));
+
+                (message_id, subject, sender, recipients, date)
+            }
+            None => {
+                warn!(
+                    account = self.account.id,
+                    mailbox = self.mailbox,
+                    uid,
+                    "failed to parse message, storing raw only"
+                );
+                (None, None, None, None, None)
+            }
+        };
+
+        let raw_path = self
+            .store
+            .save(&self.account.id, &self.mailbox, uid, &msg.raw_bytes)
+            .await
+            .with_context(|| format!("saving raw message uid={uid}"))?;
+
+        let new_email = NewEmail {
+            account_id: self.account.id.clone(),
+            mailbox_name: self.mailbox.clone(),
+            uid: uid as i64,
+            message_id,
+            subject: subject.clone(),
+            sender: sender.clone(),
+            recipients,
+            date,
+            flags: msg.flags.clone(),
+            raw_message_path: raw_path.to_string_lossy().to_string(),
+            size_bytes: msg.size.map(|s| s as i64),
+        };
+
+        let new_event = NewEvent {
+            event_type: "email_arrived".to_string(),
+            account_id: self.account.id.clone(),
+            mailbox_name: self.mailbox.clone(),
+            email_id: None,
+            payload: serde_json::json!({
+                "uid": uid,
+                "subject": subject,
+                "sender": sender,
+            }),
+        };
+
+        match crate::db::events::insert_email_with_event(&self.pool, &new_email, &new_event).await
+        {
+            Ok((email_id, event_id)) => {
+                debug!(
+                    account = self.account.id,
+                    mailbox = self.mailbox,
+                    uid,
+                    email_id,
+                    event_id,
+                    "ingested message"
+                );
+                crate::metrics::inc_messages_ingested(&self.account.id, &self.mailbox);
+                crate::metrics::inc_events_created("email_arrived");
+                Ok(1)
+            }
+            Err(e) => {
+                warn!(
+                    account = self.account.id,
+                    mailbox = self.mailbox,
+                    uid,
+                    error = %e,
+                    "failed to persist message, will retry next cycle"
+                );
+                Ok(0)
+            }
+        }
     }
 }
