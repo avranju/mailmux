@@ -173,7 +173,7 @@ args = ["--json"]
 | `id` | *required* | Unique identifier for the account |
 | `imap_host` | *required* | IMAP server hostname |
 | `imap_port` | `993` | IMAP server port |
-| `tls` | `true` | Use TLS |
+| `tls` | `true` | Use implicit TLS (port 993). See note below. |
 | `username` | *required* | IMAP username |
 | `password` | *required* | IMAP password (supports `${VAR}`) |
 | `poll_interval_secs` | `60` | Polling interval when IDLE is unavailable |
@@ -182,6 +182,16 @@ args = ["--json"]
 | `mailboxes` | *required* | List of mailbox names to monitor |
 | `initial_sync_max_messages` | unlimited | Cap on messages during first sync |
 | `initial_sync_max_age_days` | unlimited | Age limit during first sync |
+| `imap_command_timeout_secs` | `60` | Timeout for individual IMAP command exchanges |
+| `tls_ca_file` | — | Path to a PEM file with extra CA cert(s) to trust (e.g. for local bridges with self-signed certs). Requires `tls = true`. |
+| `tls_accept_invalid_certs` | `false` | Disable TLS certificate verification entirely. Only for local bridges on loopback. Requires `tls = true`. |
+
+> **TLS mode note:** mailmux supports **implicit TLS** only (`tls = true` wraps
+> the connection in TLS before any IMAP traffic, typically port 993). **STARTTLS**
+> — where a plain-text connection is upgraded in-band via the `STARTTLS` command
+> (typically port 143) — is not supported. If your mail server or local bridge
+> (e.g. Proton Mail Bridge) offers a choice, select **SSL/TLS** rather than
+> **STARTTLS**.
 
 ### Processor options
 
