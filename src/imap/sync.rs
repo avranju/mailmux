@@ -208,7 +208,45 @@ impl MailboxWatcher {
             None => 0,
         };
 
-        let fetch_from = last_seen_uid + 1;
+        let mut fetch_from = last_seen_uid + 1;
+
+        // For the initial sync with a configured message limit, do a cheap
+        // UID-only fetch first to find the right starting UID. This avoids
+        // downloading the full body of every message in the mailbox before
+        // we can apply the limit.
+        if last_seen_uid == 0
+            && let Some(max_msgs) = self.account.initial_sync_max_messages
+        {
+            rate_limiter.until_ready().await;
+            let all_uids = conn.uid_fetch_uid_list(1).await?;
+            if all_uids.is_empty() {
+                debug!(
+                    account = self.account.id,
+                    mailbox = self.mailbox,
+                    "no new messages"
+                );
+                crate::db::emails::upsert_mailbox_state(
+                    &self.pool,
+                    &self.account.id,
+                    &self.mailbox,
+                    uid_validity as i64,
+                    0,
+                )
+                .await?;
+                return Ok(());
+            }
+            let skip = all_uids.len().saturating_sub(max_msgs as usize);
+            fetch_from = all_uids[skip];
+            debug!(
+                account = self.account.id,
+                mailbox = self.mailbox,
+                total_uids = all_uids.len(),
+                limit = max_msgs,
+                fetch_from,
+                "initial sync: fetched UID list, starting from most recent"
+            );
+        }
+
         debug!(
             account = self.account.id,
             mailbox = self.mailbox,

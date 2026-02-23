@@ -390,6 +390,82 @@ impl ImapConnection {
         Ok(messages)
     }
 
+    /// UID FETCH a range returning only UIDs — no message bodies.
+    /// Used for the initial sync scan so we can find the right starting UID
+    /// without downloading the full body of every message in the mailbox.
+    pub async fn uid_fetch_uid_list(&mut self, uid_start: u32) -> Result<Vec<u32>> {
+        let range = format!("{uid_start}:*");
+        let tag = self.next_tag();
+        let sequence_set: SequenceSet = range
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid UID range: {range}"))?;
+
+        let cmd = Command {
+            tag,
+            body: CommandBody::Fetch {
+                sequence_set,
+                macro_or_item_names: MacroOrMessageDataItemNames::MessageDataItemNames(vec![
+                    MessageDataItemName::Uid,
+                ]),
+                uid: true,
+            },
+        };
+        let _handle = self.client.enqueue_command(cmd);
+
+        let mut uids = Vec::new();
+        let timeout = self.command_timeout;
+
+        loop {
+            let event =
+                match tokio::time::timeout(timeout, self.stream.next(&mut self.client)).await {
+                    Ok(result) => result.context("during UID FETCH (uid list)")?,
+                    Err(_) => bail!(
+                        "IMAP UID FETCH (uid list) timed out after {}s",
+                        timeout.as_secs()
+                    ),
+                };
+            match event {
+                Event::DataReceived { data } => {
+                    if let Data::Fetch { items, .. } = data {
+                        for item in items.as_ref() {
+                            if let MessageDataItem::Uid(u) = item {
+                                uids.push(u.get());
+                            }
+                        }
+                    }
+                }
+                Event::StatusReceived { status } => {
+                    check_status(&status, "UID FETCH (uid list)")?;
+                    if matches!(status, Status::Tagged(_)) {
+                        if uids.is_empty() {
+                            while let Ok(Ok(Event::DataReceived {
+                                data: Data::Fetch { items, .. },
+                            })) = tokio::time::timeout(
+                                FETCH_DRAIN_TIMEOUT,
+                                self.stream.next(&mut self.client),
+                            )
+                            .await
+                            {
+                                for item in items.as_ref() {
+                                    if let MessageDataItem::Uid(u) = item {
+                                        uids.push(u.get());
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+                Event::CommandSent { .. } => {}
+                other => {
+                    trace!(event = ?other, "ignoring event during UID FETCH (uid list)");
+                }
+            }
+        }
+
+        Ok(uids)
+    }
+
     /// Enter IMAP IDLE mode. Returns when the server sends an update
     /// (EXISTS, EXPUNGE, etc.) or the token is cancelled.
     /// Returns `true` if an update was received, `false` if cancelled.
