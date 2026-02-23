@@ -49,6 +49,17 @@ initial_sync_max_messages = 1000
 # select, fetch inactivity, etc.). Default: 60
 # imap_command_timeout_secs = 60
 
+# Path to a PEM file containing additional CA certificate(s) to trust.
+# Use this for local mail bridges that present a self-signed certificate,
+# e.g. Proton Mail Bridge exports a cert.pem from its settings screen.
+# Requires tls = true.
+# tls_ca_file = "/home/user/.config/protonmail/bridge/cert.pem"
+
+# Disable TLS certificate verification entirely.
+# Only for local bridges on loopback interfaces where MITM is not a risk.
+# Requires tls = true.
+# tls_accept_invalid_certs = false
+
 # [[accounts]]
 # id = "work"
 # imap_host = "outlook.office365.com"

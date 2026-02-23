@@ -18,6 +18,7 @@ metrics-exporter-prometheus = "0.18"
 nonzero_ext = "0.3"
 regex = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
 sd-notify = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

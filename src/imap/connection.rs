@@ -2,6 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use imap_next::client::{Client, Event, Options};
 use imap_next::imap_types::command::{Command, CommandBody};
 use imap_next::imap_types::core::Tag;
@@ -17,6 +20,57 @@ use tracing::{debug, trace};
 use crate::config::AccountConfig;
 
 const IDLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A TLS certificate verifier that accepts any certificate without validation.
+/// Only use for local bridges (e.g. Proton Mail Bridge) on loopback interfaces.
+#[derive(Debug)]
+struct NoCertVerifier;
+
+impl ServerCertVerifier for NoCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+        ]
+    }
+}
 
 /// Wraps an imap-next client+stream pair.
 pub struct ImapConnection {
@@ -37,15 +91,48 @@ impl ImapConnection {
             .with_context(|| format!("connecting to {addr}"))?;
 
         let stream = if config.tls {
-            let server_name: rustls::pki_types::ServerName<'_> = config.imap_host.clone().try_into()
+            let server_name: ServerName<'_> = config.imap_host.clone().try_into()
                 .map_err(|e| anyhow::anyhow!("invalid server name '{}': {e}", config.imap_host))?;
-            let mut root_store = rustls::RootCertStore::empty();
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let tls_config = Arc::new(
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(root_store)
-                    .with_no_client_auth(),
-            );
+
+            let tls_config = if config.tls_accept_invalid_certs {
+                tracing::warn!(
+                    account = %config.id,
+                    host = %config.imap_host,
+                    "TLS certificate verification is disabled — only use for local bridges on loopback"
+                );
+                Arc::new(
+                    rustls::ClientConfig::builder()
+                        .dangerous()
+                        .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
+                        .with_no_client_auth(),
+                )
+            } else {
+                let mut root_store = rustls::RootCertStore::empty();
+                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+                if let Some(ca_file) = &config.tls_ca_file {
+                    let pem = std::fs::read(ca_file)
+                        .with_context(|| format!("reading TLS CA file '{ca_file}'"))?;
+                    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut pem.as_slice())
+                        .collect::<Result<_, _>>()
+                        .with_context(|| format!("parsing TLS CA file '{ca_file}'"))?;
+                    if certs.is_empty() {
+                        bail!("TLS CA file '{ca_file}' contains no certificates");
+                    }
+                    for cert in certs {
+                        root_store.add(cert)
+                            .with_context(|| format!("adding certificate from '{ca_file}' to trust store"))?;
+                    }
+                    debug!(account = %config.id, ca_file, "loaded custom TLS CA certificate(s)");
+                }
+
+                Arc::new(
+                    rustls::ClientConfig::builder()
+                        .with_root_certificates(root_store)
+                        .with_no_client_auth(),
+                )
+            };
+
             let connector = tokio_rustls::TlsConnector::from(tls_config);
             let tls_stream = connector.connect(server_name.to_owned(), tcp).await
                 .context("TLS handshake failed")?;

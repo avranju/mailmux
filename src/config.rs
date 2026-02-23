@@ -79,6 +79,9 @@ pub struct AccountConfig {
     pub initial_sync_max_age_days: Option<u64>,
     #[serde(default = "default_imap_command_timeout")]
     pub imap_command_timeout_secs: u64,
+    pub tls_ca_file: Option<String>,
+    #[serde(default)]
+    pub tls_accept_invalid_certs: bool,
 }
 
 fn default_imap_port() -> u16 {
@@ -179,6 +182,12 @@ impl Config {
                 if mailbox.is_empty() {
                     bail!("account '{}': mailbox name must not be empty", account.id);
                 }
+            }
+            if account.tls_ca_file.is_some() && !account.tls {
+                bail!("account '{}': tls_ca_file requires tls = true", account.id);
+            }
+            if account.tls_accept_invalid_certs && !account.tls {
+                bail!("account '{}': tls_accept_invalid_certs requires tls = true", account.id);
             }
         }
 
