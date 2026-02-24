@@ -148,7 +148,7 @@ impl ImapConnection {
             let tls_stream = connector
                 .connect(server_name.to_owned(), tcp)
                 .await
-                .context("TLS handshake failed")?;
+                .map_err(|e| anyhow::anyhow!(format!("TLS handshake failed: {e}")))?;
             Stream::tls(tls_stream.into())
         } else {
             Stream::insecure(tcp)
