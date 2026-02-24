@@ -52,9 +52,11 @@ async fn main() -> Result<()> {
 
 /// Main daemon run loop.
 async fn cmd_run(config: config::Config) -> Result<()> {
+    let enabled_accounts = config.accounts.iter().filter(|a| a.enabled).count();
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        accounts = config.accounts.len(),
+        accounts = enabled_accounts,
+        configured_accounts = config.accounts.len(),
         processors = config.processors.len(),
         "mailmux starting"
     );
@@ -142,6 +144,10 @@ async fn cmd_run(config: config::Config) -> Result<()> {
     // Spawn account managers
     let mut account_tasks = JoinSet::new();
     for account_config in config.accounts {
+        if !account_config.enabled {
+            info!(account = account_config.id, "account disabled in config; skipping");
+            continue;
+        }
         let account_id = account_config.id.clone();
         let manager = imap::AccountManager::new(
             account_config,

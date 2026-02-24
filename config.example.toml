@@ -31,6 +31,7 @@ max_connections = 10
 
 [[accounts]]
 id = "personal"
+enabled = true
 imap_host = "imap.gmail.com"
 imap_port = 993
 tls = true
@@ -62,6 +63,7 @@ initial_sync_max_messages = 1000
 
 # [[accounts]]
 # id = "work"
+# enabled = false
 # imap_host = "outlook.office365.com"
 # imap_port = 993
 # tls = true

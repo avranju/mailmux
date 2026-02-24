@@ -122,6 +122,7 @@ max_connections = 10
 
 [[accounts]]
 id = "personal"
+enabled = true
 imap_host = "imap.gmail.com"
 imap_port = 993
 tls = true
@@ -135,6 +136,7 @@ initial_sync_max_messages = 1000
 
 [[accounts]]
 id = "work"
+enabled = true
 imap_host = "outlook.office365.com"
 imap_port = 993
 tls = true
@@ -171,6 +173,7 @@ args = ["--json"]
 | Field | Default | Description |
 |---|---|---|
 | `id` | *required* | Unique identifier for the account |
+| `enabled` | `true` | Whether the account is active; if `false`, mailmux logs and skips it |
 | `imap_host` | *required* | IMAP server hostname |
 | `imap_port` | `993` | IMAP server port |
 | `tls` | `true` | Use implicit TLS (port 993). See note below. |

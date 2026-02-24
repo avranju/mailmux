@@ -61,6 +61,8 @@ fn default_max_connections() -> u32 {
 #[allow(dead_code)]
 pub struct AccountConfig {
     pub id: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     pub imap_host: String,
     #[serde(default = "default_imap_port")]
     pub imap_port: u16,
@@ -253,6 +255,7 @@ max_connections = 5
 
 [[accounts]]
 id = "test"
+enabled = true
 imap_host = "imap.example.com"
 imap_port = 993
 tls = true
@@ -285,8 +288,52 @@ concurrency = 1
         assert_eq!(config.database.max_connections, 5);
         assert_eq!(config.accounts.len(), 1);
         assert_eq!(config.accounts[0].id, "test");
+        assert!(config.accounts[0].enabled);
         assert_eq!(config.processors.len(), 1);
         assert_eq!(config.processors[0].name, "logger");
+    }
+
+    #[test]
+    fn test_account_enabled_defaults_true() {
+        let toml = r#"
+[general]
+data_dir = "/tmp/mailmux"
+
+[database]
+url = "postgres://localhost/mailmux"
+
+[[accounts]]
+id = "test"
+imap_host = "imap.example.com"
+username = "a"
+password = "b"
+mailboxes = ["INBOX"]
+"#;
+        let f = write_temp_config(toml);
+        let config = Config::load(f.path()).unwrap();
+        assert!(config.accounts[0].enabled);
+    }
+
+    #[test]
+    fn test_account_enabled_can_be_false() {
+        let toml = r#"
+[general]
+data_dir = "/tmp/mailmux"
+
+[database]
+url = "postgres://localhost/mailmux"
+
+[[accounts]]
+id = "test"
+enabled = false
+imap_host = "imap.example.com"
+username = "a"
+password = "b"
+mailboxes = ["INBOX"]
+"#;
+        let f = write_temp_config(toml);
+        let config = Config::load(f.path()).unwrap();
+        assert!(!config.accounts[0].enabled);
     }
 
     #[test]
