@@ -1,13 +1,36 @@
-# mailmux
+# mailmux workspace
 
-An event-driven IMAP email processing daemon written in Rust. Mailmux
-synchronizes emails from IMAP servers into a PostgreSQL database and triggers
+This repository is a Rust workspace with:
+
+- `mailmux`: an event-driven IMAP email processing daemon
+- `mailtx`: a command-processor companion crate for extracting bank transaction
+  data from emails and posting it to an HTTP endpoint
+
+`mailmux` synchronizes emails from IMAP servers into PostgreSQL and triggers
 configurable processing pipelines for each incoming message.
 
-The core value is **reliable, replayable, event-driven mail processing** with
+The core value of `mailmux` is **reliable, replayable, event-driven mail processing** with
 emphasis on data integrity, recoverability, and idempotency.
 
-## Features
+## Workspace layout
+
+```text
+.
+├── Cargo.toml                  # workspace manifest
+├── README.md                   # workspace overview (this file)
+├── mailmux/                    # daemon crate
+│   ├── config.example.toml
+│   ├── Dockerfile
+│   ├── docker-compose.yml
+│   ├── migrations/
+│   └── src/
+├── mailtx/                     # command processor crate
+│   ├── README.md
+│   └── src/
+└── run/                        # local helper scripts
+```
+
+## mailmux features
 
 - **Multi-account IMAP sync** — monitor multiple accounts and mailboxes
   concurrently with UID-based incremental sync
@@ -62,15 +85,18 @@ filesystem (raw RFC 5322 messages stored as `.eml` files).
 ## Build
 
 ```bash
-cargo build --release
+cargo build --workspace --release
 ```
 
-The binary is written to `target/release/mailmux`.
+Workspace binaries are written to:
+
+- `target/release/mailmux`
+- `target/release/mailtx`
 
 Run the tests:
 
 ```bash
-cargo test
+cargo test --workspace
 ```
 
 ## Database setup
@@ -97,10 +123,11 @@ Migrations run automatically on startup. The schema creates four tables:
 | `events` | Append-only event log (email_arrived, etc.) |
 | `processor_jobs` | Processing state per event/processor pair |
 
-## Configuration
+## mailmux configuration
 
-Mailmux uses a TOML configuration file. By default it looks for `config.toml`
-in the working directory; override with `-c /path/to/config.toml`.
+`mailmux` uses a TOML configuration file. By default it looks for `config.toml`
+in the working directory; override with `-c /path/to/config.toml`. A complete
+example lives at `mailmux/config.example.toml`.
 
 Values can reference environment variables with `${VAR_NAME}` syntax — useful
 for secrets.
@@ -215,12 +242,39 @@ Built-in processor types:
 - **`command`** — executes a CLI command, passing event JSON on stdin
   (set `config.command` and optionally `config.args` and `config.env`)
 
+## mailtx crate notes
+
+`mailtx` is designed to be run from `mailmux`'s built-in `command` processor.
+It reads event/email JSON from stdin, extracts transaction details via an LLM,
+and posts normalized data to your endpoint.
+
+- Crate path: `mailtx/`
+- Detailed docs: `mailtx/README.md`
+- Typical integration in `mailmux` config:
+
+```toml
+[[processors]]
+name = "bank-tx"
+events = ["email_arrived"]
+timeout_secs = 90
+concurrency = 1
+
+[processors.config]
+command = "/usr/local/bin/mailtx"
+env = { ALLOWED_SENDERS = "alerts@mybank.com", ENDPOINT_URL = "${ENDPOINT_URL}" }
+```
+
+`config.env` is the preferred way to pass processor-specific environment
+variables to `mailtx` when `mailmux` spawns it.
+
 ## Running
 
 Start the daemon:
 
 ```bash
 mailmux --config config.toml
+# or from workspace root:
+cargo run -p mailmux -- --config mailmux/config.toml
 ```
 
 Override the log level:
@@ -252,14 +306,14 @@ mailmux dry-run --event-id 42 --processor notify
 Build the image:
 
 ```bash
-docker build -t mailmux .
+docker build -t mailmux -f mailmux/Dockerfile mailmux
 ```
 
 Run with an existing PostgreSQL instance:
 
 ```bash
 docker run --rm \
-  -v $(pwd)/config.toml:/etc/mailmux/config.toml:ro \
+  -v $(pwd)/mailmux/config.toml:/etc/mailmux/config.toml:ro \
   -v mailmux-data:/var/lib/mailmux \
   -e DB_PASSWORD=secret \
   -e GMAIL_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx \
@@ -269,9 +323,10 @@ docker run --rm \
 
 ### Docker Compose
 
-A `docker-compose.yml` is included that starts both PostgreSQL and mailmux.
+A `docker-compose.yml` is provided at `mailmux/docker-compose.yml` and starts
+both PostgreSQL and `mailmux`.
 
-1. Create a `config.toml` in the project root (see [Configuration](#configuration)).
+1. Create `mailmux/config.toml` (see [mailmux configuration](#mailmux-configuration)).
    Use the Compose-internal hostname `postgres` for the database:
 
    ```toml
@@ -289,31 +344,31 @@ A `docker-compose.yml` is included that starts both PostgreSQL and mailmux.
 3. Start the stack:
 
    ```bash
-   docker compose up -d
+   docker compose -f mailmux/docker-compose.yml up -d
    ```
 
 4. View logs:
 
    ```bash
-   docker compose logs -f mailmux
+   docker compose -f mailmux/docker-compose.yml logs -f mailmux
    ```
 
 5. Stop:
 
    ```bash
-   docker compose down
+   docker compose -f mailmux/docker-compose.yml down
    ```
 
 Data is persisted in named Docker volumes (`pgdata` for the database,
 `mailmux-data` for raw `.eml` files). To start fresh, add `-v` when
-tearing down: `docker compose down -v`.
+tearing down: `docker compose -f mailmux/docker-compose.yml down -v`.
 
 ## Deployment with systemd
 
-An example unit file is provided in `contrib/mailmux.service`. Install it:
+An example unit file is provided in `mailmux/contrib/mailmux.service`. Install it:
 
 ```bash
-sudo cp contrib/mailmux.service /etc/systemd/system/
+sudo cp mailmux/contrib/mailmux.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now mailmux
 ```
