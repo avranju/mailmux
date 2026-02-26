@@ -1,0 +1,14 @@
+# Rust / Cargo
+target/
+*.orig
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Environment / secrets
+.env
+*.pem

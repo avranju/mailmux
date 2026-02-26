@@ -1,0 +1,3 @@
+[workspace]
+members = ["mailmux", "bank-tx-processor"]
+resolver = "2"
