@@ -1,15 +1,15 @@
 # bank-tx-processor
 
 A mailmux command processor that extracts structured transaction data from bank
-notification emails and posts it to a configurable HTTP endpoint.
+notification emails and posts it to Firefly III.
 
 For each incoming email it:
 
 1. Checks the sender against a configured allow-list — skips silently if not matched
 2. Reads the raw `.eml` file and extracts a plain-text body (strips HTML if needed)
 3. Sends the subject and body to the Anthropic Claude API with a structured prompt
-4. If Claude identifies a bank transaction, posts the extracted data (amount,
-   type, narration) to a configured HTTP endpoint
+4. If Claude identifies a bank transaction, maps it to Firefly's transaction
+   schema and posts it to Firefly III
 
 ## Design
 
@@ -58,7 +58,7 @@ ignores the rest.
 | `src/input.rs` | Serde types mirroring the mailmux stdin schema |
 | `src/email.rs` | Reads `.eml` file, extracts plain-text body (HTML stripping) |
 | `src/llm.rs` | Anthropic Messages API call and JSON response parsing |
-| `src/post.rs` | HTTP POST to the configured endpoint |
+| `src/endpoint/` | Endpoint abstraction and Firefly III implementation |
 
 ### LLM prompt
 
@@ -77,18 +77,28 @@ The prompt asks Claude to return a JSON object with four fields:
 monetary amount, `"not_found"` otherwise. Processing stops without error when
 `status` is `"not_found"`.
 
-### Endpoint payload
+### Firefly request payload
 
 ```json
 {
-  "amount": 1234.56,
-  "transaction_type": "withdrawal",
-  "narration": "Amazon Pay"
+  "apply_rules": false,
+  "fire_webhooks": true,
+  "error_if_duplicate_hash": false,
+  "transactions": [
+    {
+      "type": "withdrawal",
+      "date": "2026-02-26T20:00:00+00:00",
+      "amount": "1234.56",
+      "description": "Amazon Pay",
+      "source_id": "12",
+      "destination_name": "Amazon Pay"
+    }
+  ]
 }
 ```
 
-Sent as `Content-Type: application/json` with an `Authorization` header whose
-value is taken directly from `ENDPOINT_AUTH`.
+Posted to `POST /v1/transactions` under your Firefly API base URL with
+`Authorization: Bearer <token>`.
 
 ## Prerequisites
 
@@ -112,9 +122,14 @@ runtime rather than stored in the mailmux config file.
 | Variable | Required | Description |
 |---|---|---|
 | `ALLOWED_SENDERS` | yes | Comma-separated list of sender addresses or substrings to accept, e.g. `alerts@mybank.com,noreply@anotherbank.com` |
-| `ENDPOINT_URL` | yes | URL to POST extracted transaction data to |
-| `ENDPOINT_AUTH` | yes | Full value for the `Authorization` header, e.g. `Bearer eyJ...` |
-| `LLM_MODEL` | no | Model name (default: `claude-haiku-4-5-20251001`). See provider API keys below. |
+| `LLM_MODEL` | yes | Model name passed to `genai`, e.g. `claude-haiku-4-5-20251001` |
+| `FIREFLY_BASE_URL` | yes | Firefly API base URL, usually `https://<host>/api` |
+| `FIREFLY_ACCESS_TOKEN` | yes | Firefly personal access token (with or without `Bearer ` prefix) |
+| `FIREFLY_ASSET_ACCOUNT_ID` | yes | Firefly asset account ID where transactions are posted |
+| `FIREFLY_CURRENCY_CODE` | no | Currency code to include in each split, e.g. `USD` |
+| `FIREFLY_APPLY_RULES` | no | `true`/`false`, default `false` |
+| `FIREFLY_FIRE_WEBHOOKS` | no | `true`/`false`, default `true` |
+| `FIREFLY_ERROR_IF_DUPLICATE_HASH` | no | `true`/`false`, default `false` |
 | `RUST_LOG` | no | Log level filter, e.g. `debug` or `bank_tx_processor=debug` |
 
 The LLM provider is inferred automatically from the model name by the `genai`
@@ -186,8 +201,9 @@ EnvironmentFile=/etc/mailmux/env
 ```
 ALLOWED_SENDERS=alerts@mybank.com,noreply@anotherbank.com
 ANTHROPIC_API_KEY=sk-ant-...
-ENDPOINT_URL=https://your-api.example.com/transactions
-ENDPOINT_AUTH=Bearer eyJ...
+FIREFLY_BASE_URL=https://firefly.example.com/api
+FIREFLY_ACCESS_TOKEN=eyJ...
+FIREFLY_ASSET_ACCOUNT_ID=12
 # LLM_MODEL=claude-haiku-4-5-20251001  # optional, this is the default
 ```
 
@@ -206,8 +222,9 @@ Add to the `environment` section of the mailmux service:
 environment:
   ALLOWED_SENDERS: alerts@mybank.com
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}   # or OPENAI_API_KEY, GEMINI_API_KEY, etc.
-  ENDPOINT_URL: ${ENDPOINT_URL}
-  ENDPOINT_AUTH: ${ENDPOINT_AUTH}
+  FIREFLY_BASE_URL: ${FIREFLY_BASE_URL}
+  FIREFLY_ACCESS_TOKEN: ${FIREFLY_ACCESS_TOKEN}
+  FIREFLY_ASSET_ACCOUNT_ID: ${FIREFLY_ASSET_ACCOUNT_ID}
   # LLM_MODEL: claude-haiku-4-5-20251001    # optional override
 ```
 
@@ -242,10 +259,9 @@ mailmux replay --event-id <id> --processor bank-tx
 ## Retry behaviour
 
 mailmux retries the entire invocation on non-zero exit. This means a retry
-re-runs the LLM call even if it succeeded the first time. The downstream
-endpoint should therefore be **idempotent** — posting the same transaction twice
-should be a no-op or produce a meaningful error that the endpoint handles
-gracefully.
+re-runs the LLM call even if it succeeded the first time. Firefly processing
+should therefore be configured to tolerate retries (for example by enabling
+`FIREFLY_ERROR_IF_DUPLICATE_HASH` when duplicate hashes are available).
 
 ## Logging
 
@@ -260,8 +276,9 @@ echo '{"event":{"id":1},"email":{"subject":"Test","sender":"alerts@mybank.com","
   | RUST_LOG=debug \
     ALLOWED_SENDERS=alerts@mybank.com \
     ANTHROPIC_API_KEY=sk-ant-... \
-    ENDPOINT_URL=https://... \
-    ENDPOINT_AUTH="Bearer ..." \
+    FIREFLY_BASE_URL=https://firefly.example.com/api \
+    FIREFLY_ACCESS_TOKEN=eyJ... \
+    FIREFLY_ASSET_ACCOUNT_ID=12 \
     ./target/debug/bank-tx-processor
     # Set LLM_MODEL=gpt-4o-mini and OPENAI_API_KEY=... to use OpenAI instead
 ```

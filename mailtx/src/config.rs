@@ -7,9 +7,24 @@ pub struct Config {
     /// genai infers the provider from the model name and reads the corresponding
     /// API key from the environment automatically (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.).
     pub llm_model: String,
-    pub endpoint_url: String,
-    /// Full value for the Authorization header, e.g. "Bearer <token>".
-    pub endpoint_auth: String,
+    pub firefly: FireflyConfig,
+}
+
+pub struct FireflyConfig {
+    /// Firefly API base URL, usually "https://<host>/api".
+    pub base_url: String,
+    /// Personal access token.
+    pub access_token: String,
+    /// The asset account ID in Firefly where transactions are booked.
+    pub asset_account_id: String,
+    /// Optional transaction currency code (e.g. "USD", "EUR").
+    pub currency_code: Option<String>,
+    /// Whether Firefly should apply rules for the new transaction.
+    pub apply_rules: bool,
+    /// Whether Firefly should fire webhooks for the new transaction.
+    pub fire_webhooks: bool,
+    /// Whether Firefly should reject duplicate transaction hashes.
+    pub error_if_duplicate_hash: bool,
 }
 
 impl Config {
@@ -21,20 +36,35 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
 
-        let llm_model = std::env::var("LLM_MODEL")
-            .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+        let llm_model = std::env::var("LLM_MODEL").context("LLM_MODEL env var required")?;
 
-        let endpoint_url =
-            std::env::var("ENDPOINT_URL").context("ENDPOINT_URL env var required")?;
+        let base_url =
+            std::env::var("FIREFLY_BASE_URL").context("FIREFLY_BASE_URL env var required")?;
+        let access_token = std::env::var("FIREFLY_ACCESS_TOKEN")
+            .context("FIREFLY_ACCESS_TOKEN env var required")?;
+        let asset_account_id = std::env::var("FIREFLY_ASSET_ACCOUNT_ID")
+            .context("FIREFLY_ASSET_ACCOUNT_ID env var required")?;
+        let currency_code = std::env::var("FIREFLY_CURRENCY_CODE")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
-        let endpoint_auth =
-            std::env::var("ENDPOINT_AUTH").context("ENDPOINT_AUTH env var required")?;
+        let apply_rules = env_bool("FIREFLY_APPLY_RULES", false)?;
+        let fire_webhooks = env_bool("FIREFLY_FIRE_WEBHOOKS", true)?;
+        let error_if_duplicate_hash = env_bool("FIREFLY_ERROR_IF_DUPLICATE_HASH", false)?;
 
         Ok(Self {
             allowed_senders,
             llm_model,
-            endpoint_url,
-            endpoint_auth,
+            firefly: FireflyConfig {
+                base_url,
+                access_token,
+                asset_account_id,
+                currency_code,
+                apply_rules,
+                fire_webhooks,
+                error_if_duplicate_hash,
+            },
         })
     }
 
@@ -45,5 +75,19 @@ impl Config {
         self.allowed_senders
             .iter()
             .any(|allowed| sender_lower.contains(allowed.as_str()))
+    }
+}
+
+fn env_bool(name: &str, default: bool) -> Result<bool> {
+    match std::env::var(name) {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => {
+                anyhow::bail!("{name} must be a boolean (one of: true/false, 1/0, yes/no, on/off)")
+            }
+        },
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(e) => Err(anyhow::anyhow!("failed to read {name}: {e}")),
     }
 }

@@ -1593,6 +1593,8 @@ name = "mailtx"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "chrono",
  "genai",
  "html2text",
  "mail-parser",

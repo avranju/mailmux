@@ -246,7 +246,7 @@ Built-in processor types:
 
 `mailtx` is designed to be run from `mailmux`'s built-in `command` processor.
 It reads event/email JSON from stdin, extracts transaction details via an LLM,
-and posts normalized data to your endpoint.
+and posts normalized data to Firefly III.
 
 - Crate path: `mailtx/`
 - Detailed docs: `mailtx/README.md`
@@ -261,7 +261,7 @@ concurrency = 1
 
 [processors.config]
 command = "/usr/local/bin/mailtx"
-env = { ALLOWED_SENDERS = "alerts@mybank.com", ENDPOINT_URL = "${ENDPOINT_URL}" }
+env = { ALLOWED_SENDERS = "alerts@mybank.com", FIREFLY_BASE_URL = "${FIREFLY_BASE_URL}", FIREFLY_ASSET_ACCOUNT_ID = "${FIREFLY_ASSET_ACCOUNT_ID}" }
 ```
 
 `config.env` is the preferred way to pass processor-specific environment

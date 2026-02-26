@@ -5,9 +5,9 @@ use tracing::{debug, info, warn};
 
 mod config;
 mod email;
+mod endpoint;
 mod input;
 mod llm;
-mod post;
 
 #[tokio::main]
 async fn main() {
@@ -28,6 +28,7 @@ async fn run() -> Result<()> {
         .init();
 
     let config = config::Config::from_env()?;
+    let endpoint = endpoint::build_endpoint(&config);
 
     let mut raw = String::new();
     std::io::stdin()
@@ -40,7 +41,10 @@ async fn run() -> Result<()> {
     let email = match &input.email {
         Some(e) => e,
         None => {
-            warn!(event_id = input.event.id, "no email record attached to event, skipping");
+            warn!(
+                event_id = input.event.id,
+                "no email record attached to event, skipping"
+            );
             return Ok(());
         }
     };
@@ -66,12 +70,20 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
-    post::post_transaction(&http_client, &config.endpoint_url, &config.endpoint_auth, &tx).await?;
+    let canonical_tx = endpoint::canonical_from_llm(&tx)?;
+    let receipt = endpoint
+        .post_transaction(&http_client, &canonical_tx)
+        .await?;
 
     info!(
-        amount = tx.amount,
-        transaction_type = tx.transaction_type.as_deref(),
-        narration = tx.narration.as_deref(),
+        endpoint = endpoint.name(),
+        endpoint_transaction_id = receipt.id.as_deref(),
+        amount = canonical_tx.amount,
+        transaction_type = match canonical_tx.kind {
+            endpoint::TransactionKind::Deposit => "deposit",
+            endpoint::TransactionKind::Withdrawal => "withdrawal",
+        },
+        narration = canonical_tx.narration.as_str(),
         "transaction posted successfully"
     );
 

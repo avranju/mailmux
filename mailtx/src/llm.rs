@@ -12,6 +12,8 @@ pub struct TransactionData {
     /// "deposit" or "withdrawal"
     pub transaction_type: Option<String>,
     pub narration: Option<String>,
+    /// Transaction date/time from the email, preferably RFC3339. Can be date-only (YYYY-MM-DD).
+    pub transaction_date: Option<String>,
 }
 
 const PROMPT_TEMPLATE: &str = "\
@@ -51,6 +53,10 @@ pub async fn extract_transaction(
             "narration": {
                 "type": "string",
                 "description": "Brief description of the merchant or transaction purpose"
+            },
+            "transaction_date": {
+                "type": "string",
+                "description": "Transaction timestamp from the email. Prefer RFC3339 (e.g. 2026-02-26T13:45:00+05:30). If only date is available, return YYYY-MM-DD."
             }
         },
         "required": ["status"]
@@ -59,7 +65,8 @@ pub async fn extract_transaction(
     let chat_req = ChatRequest::new(vec![
         ChatMessage::system(
             "You extract structured bank transaction data from notification emails. \
-             Return only the JSON object, with no additional text.",
+             Return only the JSON object, with no additional text. \
+             If transaction date/time is present, extract it into transaction_date.",
         ),
         ChatMessage::user(prompt),
     ]);
@@ -85,6 +92,5 @@ pub async fn extract_transaction(
         .trim_end_matches("```")
         .trim();
 
-    serde_json::from_str(json_str)
-        .with_context(|| format!("parsing LLM JSON output: {json_str}"))
+    serde_json::from_str(json_str).with_context(|| format!("parsing LLM JSON output: {json_str}"))
 }
