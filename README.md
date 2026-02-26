@@ -166,6 +166,7 @@ concurrency = 2
 [processors.config]
 command = "/usr/local/bin/notify-new-mail"
 args = ["--json"]
+env = { NOTIFY_TOKEN = "${NOTIFY_TOKEN}" }
 ```
 
 ### Account options
@@ -212,7 +213,7 @@ args = ["--json"]
 Built-in processor types:
 - **`logger`** — logs event details via tracing
 - **`command`** — executes a CLI command, passing event JSON on stdin
-  (set `config.command` and optionally `config.args`)
+  (set `config.command` and optionally `config.args` and `config.env`)
 
 ## Running
 

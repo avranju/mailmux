@@ -99,3 +99,4 @@ concurrency = 1
 # [processors.config]
 # command = "/usr/local/bin/notify-new-mail"
 # args = ["--json"]
+# env = { NOTIFY_TOKEN = "${NOTIFY_TOKEN}", LOG_LEVEL = "info" }

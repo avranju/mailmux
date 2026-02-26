@@ -17,6 +17,7 @@ pub struct CommandProcessor {
     events: Vec<String>,
     command: String,
     args: Vec<String>,
+    env: Vec<(String, String)>,
     timeout: Duration,
 }
 
@@ -38,12 +39,24 @@ impl CommandProcessor {
                     .collect()
             })
             .unwrap_or_default();
+        let env: Vec<(String, String)> = config
+            .config
+            .get("env")
+            .and_then(|v| v.as_table())
+            .map(|table| {
+                table
+                    .iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.to_string(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         Self {
             name: config.name.clone(),
             events: config.events.clone(),
             command,
             args,
+            env,
             timeout: Duration::from_secs(config.timeout_secs),
         }
     }
@@ -76,11 +89,15 @@ impl Processor for CommandProcessor {
             "executing command processor"
         );
 
-        let mut child = tokio::process::Command::new(&self.command)
+        let mut command = tokio::process::Command::new(&self.command);
+        command
             .args(&self.args)
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let mut child = command
             .spawn()
             .with_context(|| format!("spawning command: {}", self.command))?;
 
