@@ -1,0 +1,32 @@
+[Unit]
+Description=Mailmux — event-driven IMAP email processing daemon
+After=network-online.target postgresql.service
+Wants=network-online.target
+Documentation=https://github.com/your-org/mailmux
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/mailmux --config /etc/mailmux/config.toml
+Restart=on-failure
+RestartSec=10
+WatchdogSec=60
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/mailmux
+
+# Resource limits
+LimitNOFILE=65536
+
+# Environment
+EnvironmentFile=-/etc/mailmux/env
+
+[Install]
+WantedBy=multi-user.target

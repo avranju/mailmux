@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: mailmux
+      POSTGRES_PASSWORD: mailmux
+      POSTGRES_DB: mailmux
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mailmux"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mailmux:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_PASSWORD: mailmux
+      # Set IMAP credentials via environment variables:
+      # GMAIL_APP_PASSWORD: xxxx-xxxx-xxxx-xxxx
+    volumes:
+      - ./config.toml:/etc/mailmux/config.toml:ro
+      - mailmux-data:/var/lib/mailmux
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/ready || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  pgdata:
+  mailmux-data:
