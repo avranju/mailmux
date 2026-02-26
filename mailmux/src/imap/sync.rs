@@ -46,11 +46,9 @@ impl MailboxWatcher {
 
     pub async fn run(&self) -> Result<()> {
         let rate_limit = self.account.rate_limit_per_second.max(1);
-        let rate_limiter = Arc::new(RateLimiter::direct(
-            Quota::per_second(
-                std::num::NonZeroU32::new(rate_limit).unwrap_or(nonzero!(1u32)),
-            ),
-        ));
+        let rate_limiter = Arc::new(RateLimiter::direct(Quota::per_second(
+            std::num::NonZeroU32::new(rate_limit).unwrap_or(nonzero!(1u32)),
+        )));
 
         let poll_interval = Duration::from_secs(self.account.poll_interval_secs);
         let mut retry_attempt: u32 = 0;
@@ -105,7 +103,13 @@ impl MailboxWatcher {
     /// the connection is lost or shutdown is requested.
     async fn sync_and_idle_cycle(
         &self,
-        rate_limiter: &Arc<RateLimiter<governor::state::NotKeyed, governor::state::InMemoryState, governor::clock::DefaultClock>>,
+        rate_limiter: &Arc<
+            RateLimiter<
+                governor::state::NotKeyed,
+                governor::state::InMemoryState,
+                governor::clock::DefaultClock,
+            >,
+        >,
         poll_interval: Duration,
     ) -> Result<()> {
         debug!(
@@ -118,7 +122,8 @@ impl MailboxWatcher {
         let (uid_validity, _exists) = conn.select(&self.mailbox).await?;
 
         // Initial sync
-        self.do_incremental_sync(&mut conn, uid_validity, rate_limiter).await?;
+        self.do_incremental_sync(&mut conn, uid_validity, rate_limiter)
+            .await?;
 
         // Try IDLE mode — if it fails, fall back to polling
         loop {
@@ -135,7 +140,8 @@ impl MailboxWatcher {
                         mailbox = self.mailbox,
                         "IDLE update received, syncing"
                     );
-                    self.do_incremental_sync(&mut conn, uid_validity, rate_limiter).await?;
+                    self.do_incremental_sync(&mut conn, uid_validity, rate_limiter)
+                        .await?;
                 }
                 Ok(false) => {
                     // Cancelled
@@ -163,13 +169,20 @@ impl MailboxWatcher {
     /// Polling fallback when IDLE is not available.
     async fn poll_cycle(
         &self,
-        rate_limiter: &Arc<RateLimiter<governor::state::NotKeyed, governor::state::InMemoryState, governor::clock::DefaultClock>>,
+        rate_limiter: &Arc<
+            RateLimiter<
+                governor::state::NotKeyed,
+                governor::state::InMemoryState,
+                governor::clock::DefaultClock,
+            >,
+        >,
         poll_interval: Duration,
     ) -> Result<()> {
         let mut conn = ImapConnection::connect(&self.account).await?;
         let (uid_validity, _exists) = conn.select(&self.mailbox).await?;
 
-        self.do_incremental_sync(&mut conn, uid_validity, rate_limiter).await?;
+        self.do_incremental_sync(&mut conn, uid_validity, rate_limiter)
+            .await?;
         let _ = conn.logout().await;
 
         // Wait for next poll
@@ -189,7 +202,13 @@ impl MailboxWatcher {
         &self,
         conn: &mut ImapConnection,
         uid_validity: u32,
-        rate_limiter: &Arc<RateLimiter<governor::state::NotKeyed, governor::state::InMemoryState, governor::clock::DefaultClock>>,
+        rate_limiter: &Arc<
+            RateLimiter<
+                governor::state::NotKeyed,
+                governor::state::InMemoryState,
+                governor::clock::DefaultClock,
+            >,
+        >,
     ) -> Result<()> {
         let stored_state =
             crate::db::emails::get_mailbox_state(&self.pool, &self.account.id, &self.mailbox)
@@ -381,8 +400,7 @@ impl MailboxWatcher {
             }),
         };
 
-        match crate::db::events::insert_email_with_event(&self.pool, &new_email, &new_event).await
-        {
+        match crate::db::events::insert_email_with_event(&self.pool, &new_email, &new_event).await {
             Ok((email_id, event_id)) => {
                 debug!(
                     account = self.account.id,

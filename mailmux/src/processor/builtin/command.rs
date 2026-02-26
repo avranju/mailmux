@@ -72,11 +72,7 @@ impl Processor for CommandProcessor {
         &self.events
     }
 
-    async fn process(
-        &self,
-        event: &Event,
-        email: Option<&EmailRecord>,
-    ) -> Result<ProcessorOutput> {
+    async fn process(&self, event: &Event, email: Option<&EmailRecord>) -> Result<ProcessorOutput> {
         let input = serde_json::json!({
             "event": event,
             "email": email,

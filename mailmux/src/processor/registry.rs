@@ -21,24 +21,24 @@ impl ProcessorRegistry {
 
             match config.name.as_str() {
                 "logger" => {
-                    processors.push(Box::new(
-                        super::builtin::logger::LoggerProcessor::new(config),
-                    ));
+                    processors.push(Box::new(super::builtin::logger::LoggerProcessor::new(
+                        config,
+                    )));
                     info!(processor = "logger", "registered built-in logger processor");
                 }
                 "command" => {
-                    processors.push(Box::new(
-                        super::builtin::command::CommandProcessor::new(config),
-                    ));
+                    processors.push(Box::new(super::builtin::command::CommandProcessor::new(
+                        config,
+                    )));
                     info!(processor = "command", "registered command processor");
                 }
                 name => {
                     // Treat unknown processor types as command processors
                     // if they have a "command" in their config
                     if config.config.contains_key("command") {
-                        processors.push(Box::new(
-                            super::builtin::command::CommandProcessor::new(config),
-                        ));
+                        processors.push(Box::new(super::builtin::command::CommandProcessor::new(
+                            config,
+                        )));
                         info!(processor = name, "registered as command processor");
                     } else {
                         info!(processor = name, "unknown processor type, skipping");
@@ -59,5 +59,4 @@ impl ProcessorRegistry {
             .map(|p| p.as_ref())
             .collect()
     }
-
 }

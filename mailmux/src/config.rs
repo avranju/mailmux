@@ -144,13 +144,13 @@ fn default_concurrency() -> u32 {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let content =
-            std::fs::read_to_string(path).with_context(|| format!("reading config file: {}", path.display()))?;
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("reading config file: {}", path.display()))?;
 
         let content = substitute_env_vars(&content);
 
-        let config: Config =
-            toml::from_str(&content).with_context(|| format!("parsing config file: {}", path.display()))?;
+        let config: Config = toml::from_str(&content)
+            .with_context(|| format!("parsing config file: {}", path.display()))?;
 
         config.validate()?;
 
@@ -178,7 +178,10 @@ impl Config {
                 bail!("account '{}': username must not be empty", account.id);
             }
             if account.mailboxes.is_empty() {
-                bail!("account '{}': at least one mailbox must be configured", account.id);
+                bail!(
+                    "account '{}': at least one mailbox must be configured",
+                    account.id
+                );
             }
             for mailbox in &account.mailboxes {
                 if mailbox.is_empty() {
@@ -189,7 +192,10 @@ impl Config {
                 bail!("account '{}': tls_ca_file requires tls = true", account.id);
             }
             if account.tls_accept_invalid_certs && !account.tls {
-                bail!("account '{}': tls_accept_invalid_certs requires tls = true", account.id);
+                bail!(
+                    "account '{}': tls_accept_invalid_certs requires tls = true",
+                    account.id
+                );
             }
         }
 

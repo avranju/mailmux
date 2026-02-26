@@ -120,8 +120,14 @@ impl JobScheduler {
                     }
                 };
 
-                self.execute_job(job_id, &processor_name, &event, email.as_ref(), timeout_secs)
-                    .await;
+                self.execute_job(
+                    job_id,
+                    &processor_name,
+                    &event,
+                    email.as_ref(),
+                    timeout_secs,
+                )
+                .await;
             }
         }
     }
@@ -141,7 +147,9 @@ impl JobScheduler {
             return;
         }
 
-        let processor = match self.registry.processors_for_event(&event.event_type)
+        let processor = match self
+            .registry
+            .processors_for_event(&event.event_type)
             .into_iter()
             .find(|p| p.name() == processor_name)
         {
@@ -164,8 +172,14 @@ impl JobScheduler {
 
         match result {
             Ok(Ok(output)) if output.success => {
-                debug!(job_id, processor = processor_name, event_id = event.id, "processor completed");
-                let _ = jobs::update_job_status(&self.pool, job_id, "completed", None, None, false).await;
+                debug!(
+                    job_id,
+                    processor = processor_name,
+                    event_id = event.id,
+                    "processor completed"
+                );
+                let _ = jobs::update_job_status(&self.pool, job_id, "completed", None, None, false)
+                    .await;
                 crate::metrics::inc_processor_runs(processor_name, "success");
             }
             Ok(Ok(output)) => {
@@ -174,11 +188,13 @@ impl JobScheduler {
                 crate::metrics::inc_processor_runs(processor_name, "failure");
             }
             Ok(Err(e)) => {
-                self.handle_failure(job_id, processor_name, &e.to_string()).await;
+                self.handle_failure(job_id, processor_name, &e.to_string())
+                    .await;
                 crate::metrics::inc_processor_runs(processor_name, "error");
             }
             Err(_) => {
-                self.handle_failure(job_id, processor_name, "execution timed out").await;
+                self.handle_failure(job_id, processor_name, "execution timed out")
+                    .await;
                 crate::metrics::inc_processor_runs(processor_name, "timeout");
             }
         }
@@ -209,8 +225,15 @@ impl JobScheduler {
                 error = error_msg,
                 "processor failed, marking as abandoned (max retries exceeded)"
             );
-            let _ = jobs::update_job_status(&self.pool, job_id, "abandoned", Some(error_msg), None, false)
-                .await;
+            let _ = jobs::update_job_status(
+                &self.pool,
+                job_id,
+                "abandoned",
+                Some(error_msg),
+                None,
+                false,
+            )
+            .await;
         } else {
             // Map attempts → backoff schedule index. `attempts` is already 1 on the
             // first failure (incremented when transitioning to in_progress), so subtract
@@ -265,7 +288,11 @@ impl JobScheduler {
             let event = match get_event_by_id(&self.pool, job.event_id).await {
                 Ok(Some(e)) => e,
                 Ok(None) => {
-                    warn!(job_id = job.id, event_id = job.event_id, "event not found for retry");
+                    warn!(
+                        job_id = job.id,
+                        event_id = job.event_id,
+                        "event not found for retry"
+                    );
                     continue;
                 }
                 Err(e) => {
@@ -286,8 +313,14 @@ impl JobScheduler {
                 .map(|c| c.timeout_secs)
                 .unwrap_or(30);
 
-            self.execute_job(job.id, &job.processor_name, &event, email.as_ref(), timeout_secs)
-                .await;
+            self.execute_job(
+                job.id,
+                &job.processor_name,
+                &event,
+                email.as_ref(),
+                timeout_secs,
+            )
+            .await;
         }
     }
 }

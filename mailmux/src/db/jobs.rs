@@ -18,11 +18,7 @@ pub struct ProcessorJob {
 }
 
 /// Create a new processor job (pending).
-pub async fn create_job(
-    pool: &PgPool,
-    event_id: i64,
-    processor_name: &str,
-) -> Result<i64> {
+pub async fn create_job(pool: &PgPool, event_id: i64, processor_name: &str) -> Result<i64> {
     let id = sqlx::query_scalar::<_, i64>(
         r#"
         INSERT INTO processor_jobs (event_id, processor_name, status)
@@ -89,7 +85,6 @@ pub async fn get_job_by_id(pool: &PgPool, job_id: i64) -> Result<Option<Processo
 
     Ok(row.map(row_to_job))
 }
-
 
 /// Get failed jobs that are ready to retry.
 pub async fn get_retryable_jobs(pool: &PgPool, limit: i64) -> Result<Vec<ProcessorJob>> {

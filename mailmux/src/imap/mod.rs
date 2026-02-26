@@ -51,10 +51,7 @@ impl AccountManager {
         let mut failure_times: VecDeque<Instant> = VecDeque::new();
 
         // Report monitored mailboxes
-        crate::metrics::set_mailboxes_monitored(
-            account_id,
-            self.account.mailboxes.len() as f64,
-        );
+        crate::metrics::set_mailboxes_monitored(account_id, self.account.mailboxes.len() as f64);
 
         // Spawn initial watchers
         for mailbox in &self.account.mailboxes {

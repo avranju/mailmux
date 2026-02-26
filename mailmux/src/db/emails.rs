@@ -38,7 +38,6 @@ pub struct NewEmail {
     pub size_bytes: Option<i64>,
 }
 
-
 /// Sync state for a mailbox.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]

@@ -27,9 +27,5 @@ pub trait Processor: Send + Sync {
     fn subscribed_events(&self) -> &[String];
 
     /// Process a single event. May optionally receive the associated email record.
-    async fn process(
-        &self,
-        event: &Event,
-        email: Option<&EmailRecord>,
-    ) -> Result<ProcessorOutput>;
+    async fn process(&self, event: &Event, email: Option<&EmailRecord>) -> Result<ProcessorOutput>;
 }

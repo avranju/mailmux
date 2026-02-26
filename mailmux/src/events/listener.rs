@@ -22,11 +22,7 @@ pub struct EventLoop {
 }
 
 impl EventLoop {
-    pub fn new(
-        pool: PgPool,
-        token: CancellationToken,
-        event_tx: mpsc::Sender<Vec<Event>>,
-    ) -> Self {
+    pub fn new(pool: PgPool, token: CancellationToken, event_tx: mpsc::Sender<Vec<Event>>) -> Self {
         Self {
             pool,
             token,

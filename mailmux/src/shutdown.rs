@@ -5,9 +5,8 @@ use tracing::info;
 pub fn spawn_signal_handler(token: CancellationToken) {
     tokio::spawn(async move {
         let ctrl_c = tokio::signal::ctrl_c();
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to register SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
 
         tokio::select! {
             _ = ctrl_c => {

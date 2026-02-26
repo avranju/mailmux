@@ -33,11 +33,7 @@ impl Processor for LoggerProcessor {
         &self.events
     }
 
-    async fn process(
-        &self,
-        event: &Event,
-        email: Option<&EmailRecord>,
-    ) -> Result<ProcessorOutput> {
+    async fn process(&self, event: &Event, email: Option<&EmailRecord>) -> Result<ProcessorOutput> {
         info!(
             processor = self.name,
             event_id = event.id,

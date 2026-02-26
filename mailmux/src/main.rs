@@ -34,7 +34,10 @@ async fn main() -> Result<()> {
     let config = config::Config::load(&cli.config)?;
 
     // Initialize logging (CLI override takes precedence)
-    let log_level = cli.log_level.as_deref().unwrap_or(&config.general.log_level);
+    let log_level = cli
+        .log_level
+        .as_deref()
+        .unwrap_or(&config.general.log_level);
     logging::init(log_level, &config.general.log_format)?;
 
     match cli.command {
@@ -145,7 +148,10 @@ async fn cmd_run(config: config::Config) -> Result<()> {
     let mut account_tasks = JoinSet::new();
     for account_config in config.accounts {
         if !account_config.enabled {
-            info!(account = account_config.id, "account disabled in config; skipping");
+            info!(
+                account = account_config.id,
+                "account disabled in config; skipping"
+            );
             continue;
         }
         let account_id = account_config.id.clone();
@@ -233,7 +239,10 @@ async fn cmd_replay(
     let processors = registry.processors_for_event(&event.event_type);
 
     if processors.is_empty() {
-        bail!("no processors configured for event type '{}'", event.event_type);
+        bail!(
+            "no processors configured for event type '{}'",
+            event.event_type
+        );
     }
 
     for proc in processors {
@@ -269,21 +278,19 @@ async fn cmd_replay(
             Ok(Ok(output)) if output.success => {
                 info!(processor = proc_name, "replay completed successfully");
                 let msg = output.message.as_deref();
-                let _ = db::jobs::update_job_status(
-                    &pool,
-                    job_id,
-                    "completed",
-                    msg,
-                    None,
-                    false,
-                )
-                .await;
+                let _ =
+                    db::jobs::update_job_status(&pool, job_id, "completed", msg, None, false).await;
             }
             Ok(Ok(output)) => {
                 let msg = output.message.unwrap_or_default();
-                warn!(processor = proc_name, message = msg, "replay completed with failure");
+                warn!(
+                    processor = proc_name,
+                    message = msg,
+                    "replay completed with failure"
+                );
                 let _ =
-                    db::jobs::update_job_status(&pool, job_id, "failed", Some(&msg), None, false).await;
+                    db::jobs::update_job_status(&pool, job_id, "failed", Some(&msg), None, false)
+                        .await;
             }
             Ok(Err(e)) => {
                 error!(processor = proc_name, error = %e, "replay failed with error");
@@ -318,11 +325,7 @@ async fn cmd_replay(
 }
 
 /// Dry-run command: run a processor without persisting results.
-async fn cmd_dry_run(
-    config: config::Config,
-    event_id: i64,
-    processor_name: String,
-) -> Result<()> {
+async fn cmd_dry_run(config: config::Config, event_id: i64, processor_name: String) -> Result<()> {
     info!(event_id, processor = processor_name, "dry-run starting");
 
     let pool = db::connect(&config.database).await?;
