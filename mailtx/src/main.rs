@@ -1,5 +1,6 @@
 use std::io::Read;
 
+use crate::matcher::AccountMatcher;
 use anyhow::Result;
 use tracing::{debug, info, warn};
 
@@ -8,6 +9,7 @@ mod email;
 mod endpoint;
 mod input;
 mod llm;
+mod matcher;
 
 #[tokio::main]
 async fn main() {
@@ -27,8 +29,12 @@ async fn run() -> Result<()> {
         )
         .init();
 
-    let config = config::Config::from_env()?;
+    let config = config::Config::load()?;
     let endpoint = endpoint::build_endpoint(&config);
+    let account_matcher = matcher::DeterministicAccountMatcher::new(
+        &config.firefly.asset_accounts,
+        config.firefly.default_asset_account_id.clone(),
+    )?;
 
     let mut raw = String::new();
     std::io::stdin()
@@ -70,7 +76,8 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
-    let canonical_tx = endpoint::canonical_from_llm(&tx)?;
+    let resolved = account_matcher.resolve_asset_account(subject, &body)?;
+    let canonical_tx = endpoint::canonical_from_llm(&tx, resolved.firefly_account_id.clone())?;
     let receipt = endpoint
         .post_transaction(&http_client, &canonical_tx)
         .await?;
@@ -83,6 +90,10 @@ async fn run() -> Result<()> {
             endpoint::TransactionKind::Deposit => "deposit",
             endpoint::TransactionKind::Withdrawal => "withdrawal",
         },
+        resolved_account_id = resolved.account_id.as_str(),
+        resolved_firefly_asset_account_id = resolved.firefly_account_id.as_str(),
+        account_match_method = resolved.method,
+        account_match_value = resolved.matched_value.as_deref(),
         narration = canonical_tx.narration.as_str(),
         "transaction posted successfully"
     );

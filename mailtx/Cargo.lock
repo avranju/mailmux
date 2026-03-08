@@ -61,7 +61,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bank-tx-processor"
+name = "mailtx"
 version = "0.1.0"
 dependencies = [
  "anyhow",

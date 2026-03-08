@@ -1,4 +1,4 @@
-# bank-tx-processor
+# mailtx
 
 A mailmux command processor that extracts structured transaction data from bank
 notification emails and posts it to Firefly III.
@@ -51,14 +51,14 @@ ignores the rest.
 
 ### Module layout
 
-| File | Responsibility |
-|---|---|
-| `src/main.rs` | Reads stdin, orchestrates the pipeline, owns exit code |
-| `src/config.rs` | Loads configuration from environment variables |
-| `src/input.rs` | Serde types mirroring the mailmux stdin schema |
-| `src/email.rs` | Reads `.eml` file, extracts plain-text body (HTML stripping) |
-| `src/llm.rs` | Anthropic Messages API call and JSON response parsing |
-| `src/endpoint/` | Endpoint abstraction and Firefly III implementation |
+| File            | Responsibility                                               |
+| --------------- | ------------------------------------------------------------ |
+| `src/main.rs`   | Reads stdin, orchestrates the pipeline, owns exit code       |
+| `src/config.rs` | Loads configuration from a TOML file (`MAILTX_CONFIG`)       |
+| `src/input.rs`  | Serde types mirroring the mailmux stdin schema               |
+| `src/email.rs`  | Reads `.eml` file, extracts plain-text body (HTML stripping) |
+| `src/llm.rs`    | Anthropic Messages API call and JSON response parsing        |
+| `src/endpoint/` | Endpoint abstraction and Firefly III implementation          |
 
 ### LLM prompt
 
@@ -112,43 +112,90 @@ Posted to `POST /v1/transactions` under your Firefly API base URL with
 cargo build --release
 ```
 
-The binary is written to `target/release/bank-tx-processor`.
+The binary is written to `target/release/mailtx`.
 
 ## Configuration
 
-All configuration is via environment variables. Secrets should be injected at
-runtime rather than stored in the mailmux config file.
+Most configuration lives in a TOML file. Point `MAILTX_CONFIG` at it:
 
-| Variable | Required | Description |
-|---|---|---|
-| `ALLOWED_SENDERS` | yes | Comma-separated list of sender addresses or substrings to accept, e.g. `alerts@mybank.com,noreply@anotherbank.com` |
-| `LLM_MODEL` | yes | Model name passed to `genai`, e.g. `claude-haiku-4-5-20251001` |
-| `FIREFLY_BASE_URL` | yes | Firefly API base URL, usually `https://<host>/api` |
-| `FIREFLY_ACCESS_TOKEN` | yes | Firefly personal access token (with or without `Bearer ` prefix) |
-| `FIREFLY_ASSET_ACCOUNT_ID` | yes | Firefly asset account ID where transactions are posted |
-| `FIREFLY_CURRENCY_CODE` | no | Currency code to include in each split, e.g. `USD` |
-| `FIREFLY_APPLY_RULES` | no | `true`/`false`, default `false` |
-| `FIREFLY_FIRE_WEBHOOKS` | no | `true`/`false`, default `true` |
-| `FIREFLY_ERROR_IF_DUPLICATE_HASH` | no | `true`/`false`, default `false` |
-| `RUST_LOG` | no | Log level filter, e.g. `debug` or `bank_tx_processor=debug` |
+```
+MAILTX_CONFIG=/etc/mailtx/config.toml
+```
 
-The LLM provider is inferred automatically from the model name by the `genai`
-crate. Set the corresponding API key env var for whichever provider you use:
+LLM API keys are read from the environment by the `genai` crate — they do not
+go in the TOML file.
 
-| Provider | Example model | API key env var |
-|---|---|---|
-| Anthropic | `claude-haiku-4-5-20251001` | `ANTHROPIC_API_KEY` |
-| OpenAI | `gpt-4o-mini` | `OPENAI_API_KEY` |
-| Google Gemini | `gemini-2.0-flash` | `GEMINI_API_KEY` |
-| Groq | `llama-3.1-8b-instant` | `GROQ_API_KEY` |
-| Ollama (local) | `llama3.2` | *(no key required)* |
+### Environment variables
+
+| Variable            | Required           | Description                                                   |
+| ------------------- | ------------------ | ------------------------------------------------------------- |
+| `MAILTX_CONFIG`     | yes                | Path to the TOML config file                                  |
+| `ANTHROPIC_API_KEY` | provider-dependent | Required for any `claude-` model                              |
+| `OPENAI_API_KEY`    | provider-dependent | Required for any `gpt-` / `o1-` / `o3-` model                |
+| `GEMINI_API_KEY`    | provider-dependent | Required for any `gemini-` model                              |
+| `RUST_LOG`          | no                 | Log level filter, e.g. `debug`                                |
+
+### TOML config file
+
+```toml
+# Senders matched as case-insensitive substrings of the From header.
+allowed_senders = ["alerts@mybank.com", "noreply@anotherbank.com"]
+
+# Model name passed to genai. Provider (and required API key) is inferred from
+# the name. Default: "claude-haiku-4-5-20251001"
+llm_model = "claude-haiku-4-5-20251001"
+
+[firefly]
+base_url     = "https://firefly.example.com/api"
+access_token = "eyJ..."
+
+# Optional — shown with defaults:
+# default_asset_account_id = "12"
+# currency_code            = "USD"
+# apply_rules              = false
+# fire_webhooks            = true
+# error_if_duplicate_hash  = false
+
+[[firefly.asset_accounts]]
+id                 = "hdfc_9772"
+firefly_account_id = "12"
+account_suffixes   = ["9772"]
+debit_card_last4   = ["7406"]
+aliases            = ["hdfc salary account"]
+
+[[firefly.asset_accounts]]
+id                 = "sbm_3989"
+firefly_account_id = "42"
+account_suffixes   = ["3989"]
+debit_card_last4   = []
+aliases            = ["sbm bank"]
+```
+
+The LLM provider is inferred automatically from the model name by `genai`:
+
+| Provider       | Example model               | API key env var     |
+| -------------- | --------------------------- | ------------------- |
+| Anthropic      | `claude-haiku-4-5-20251001` | `ANTHROPIC_API_KEY` |
+| OpenAI         | `gpt-4o-mini`               | `OPENAI_API_KEY`    |
+| Google Gemini  | `gemini-2.0-flash`          | `GEMINI_API_KEY`    |
+| Groq           | `llama-3.1-8b-instant`      | `GROQ_API_KEY`      |
+| Ollama (local) | `llama3.2`                  | _(no key required)_ |
 
 ### Sender matching
 
-`ALLOWED_SENDERS` entries are matched as **case-insensitive substrings** of the
+`allowed_senders` entries are matched as **case-insensitive substrings** of the
 full sender field, which may be in `"Display Name <email@domain.com>"` format.
 Matching on the bare email address (e.g. `alerts@mybank.com`) is sufficient and
 is the recommended approach.
+
+### Asset account matching
+
+The processor resolves the Firefly asset account from email content using a deterministic matcher:
+
+1. Debit card last4 (highest priority)
+2. Account suffix in account mentions
+3. Alias substring match
+4. Optional default fallback (`default_asset_account_id`)
 
 ## mailmux integration
 
@@ -156,14 +203,14 @@ is the recommended approach.
 
 ```bash
 cargo build --release
-sudo cp target/release/bank-tx-processor /usr/local/bin/
+sudo cp target/release/mailtx /usr/local/bin/
 ```
 
 ### 2. Add a processor block to your mailmux config
 
 ```toml
 [[processors]]
-name = "bank-tx"
+name = "mailtx"
 enabled = true
 events = ["email_arrived"]
 max_retries = 3
@@ -172,7 +219,7 @@ timeout_secs = 90
 concurrency = 1
 
 [processors.config]
-command = "/usr/local/bin/bank-tx-processor"
+command = "/usr/local/bin/mailtx"
 ```
 
 **`timeout_secs`** must be generous enough to cover an LLM API round-trip
@@ -181,15 +228,17 @@ command = "/usr/local/bin/bank-tx-processor"
 **`concurrency = 1`** is appropriate for low-volume bank notification emails.
 Increase it only if you observe a queue backlog.
 
-### 3. Set environment variables
+### 3. Create a config file and set environment variables
 
-The variables must be present in the environment that runs mailmux, since the
+Write your config file (e.g. `/etc/mailtx/config.toml`) — see the
+[Configuration](#configuration) section for the full schema.
+
+The env vars must be present in the environment that runs mailmux, since the
 command processor inherits mailmux's environment.
 
 #### systemd
 
-Add an `EnvironmentFile` directive to your mailmux service unit, or extend the
-existing one:
+Add an `EnvironmentFile` directive to your mailmux service unit:
 
 ```ini
 [Service]
@@ -199,12 +248,8 @@ EnvironmentFile=/etc/mailmux/env
 `/etc/mailmux/env`:
 
 ```
-ALLOWED_SENDERS=alerts@mybank.com,noreply@anotherbank.com
+MAILTX_CONFIG=/etc/mailtx/config.toml
 ANTHROPIC_API_KEY=sk-ant-...
-FIREFLY_BASE_URL=https://firefly.example.com/api
-FIREFLY_ACCESS_TOKEN=eyJ...
-FIREFLY_ASSET_ACCOUNT_ID=12
-# LLM_MODEL=claude-haiku-4-5-20251001  # optional, this is the default
 ```
 
 Reload after changes:
@@ -216,19 +261,15 @@ sudo systemctl restart mailmux
 
 #### Docker Compose
 
-Add to the `environment` section of the mailmux service:
+Mount the config file into the container and set env vars:
 
 ```yaml
 environment:
-  ALLOWED_SENDERS: alerts@mybank.com
-  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}   # or OPENAI_API_KEY, GEMINI_API_KEY, etc.
-  FIREFLY_BASE_URL: ${FIREFLY_BASE_URL}
-  FIREFLY_ACCESS_TOKEN: ${FIREFLY_ACCESS_TOKEN}
-  FIREFLY_ASSET_ACCOUNT_ID: ${FIREFLY_ASSET_ACCOUNT_ID}
-  # LLM_MODEL: claude-haiku-4-5-20251001    # optional override
+  MAILTX_CONFIG: /etc/mailtx/config.toml
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+volumes:
+  - ./mailtx.toml:/etc/mailtx/config.toml:ro
 ```
-
-And set the values in your `.env` file alongside `docker-compose.yml`.
 
 ### 4. Test with mailmux dry-run
 
@@ -236,7 +277,7 @@ Once mailmux has ingested at least one bank email, test the processor without
 persisting results:
 
 ```bash
-mailmux dry-run --event-id <id> --processor bank-tx
+mailmux dry-run --event-id <id> --processor mailtx
 ```
 
 Find a recent event ID:
@@ -253,7 +294,7 @@ LIMIT 10;
 To retroactively process emails that arrived before the processor was configured:
 
 ```bash
-mailmux replay --event-id <id> --processor bank-tx
+mailmux replay --event-id <id> --processor mailtx
 ```
 
 ## Retry behaviour
@@ -261,12 +302,12 @@ mailmux replay --event-id <id> --processor bank-tx
 mailmux retries the entire invocation on non-zero exit. This means a retry
 re-runs the LLM call even if it succeeded the first time. Firefly processing
 should therefore be configured to tolerate retries (for example by enabling
-`FIREFLY_ERROR_IF_DUPLICATE_HASH` when duplicate hashes are available).
+`error_if_duplicate_hash = true` in the TOML config when duplicate hashes are available).
 
 ## Logging
 
 Logs are written to stderr in the default tracing compact format. To enable
-debug logging when running under mailmux, set `RUST_LOG=bank_tx_processor=debug`
+debug logging when running under mailmux, set `RUST_LOG=mailtx_processor=debug`
 in the mailmux environment.
 
 To inspect logs when running standalone:
@@ -274,11 +315,7 @@ To inspect logs when running standalone:
 ```bash
 echo '{"event":{"id":1},"email":{"subject":"Test","sender":"alerts@mybank.com","raw_message_path":"/tmp/test.eml"}}' \
   | RUST_LOG=debug \
-    ALLOWED_SENDERS=alerts@mybank.com \
+    MAILTX_CONFIG=/path/to/mailtx.toml \
     ANTHROPIC_API_KEY=sk-ant-... \
-    FIREFLY_BASE_URL=https://firefly.example.com/api \
-    FIREFLY_ACCESS_TOKEN=eyJ... \
-    FIREFLY_ASSET_ACCOUNT_ID=12 \
-    ./target/debug/bank-tx-processor
-    # Set LLM_MODEL=gpt-4o-mini and OPENAI_API_KEY=... to use OpenAI instead
+    ./target/debug/mailtx
 ```

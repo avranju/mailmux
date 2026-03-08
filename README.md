@@ -116,12 +116,12 @@ GRANT ALL PRIVILEGES ON DATABASE mailmux TO mailmux;
 
 Migrations run automatically on startup. The schema creates four tables:
 
-| Table | Purpose |
-|---|---|
+| Table            | Purpose                                                     |
+| ---------------- | ----------------------------------------------------------- |
 | `mailbox_states` | Tracks sync state per mailbox (uid_validity, last_seen_uid) |
-| `emails` | Email metadata with path to raw message on disk |
-| `events` | Append-only event log (email_arrived, etc.) |
-| `processor_jobs` | Processing state per event/processor pair |
+| `emails`         | Email metadata with path to raw message on disk             |
+| `events`         | Append-only event log (email_arrived, etc.)                 |
+| `processor_jobs` | Processing state per event/processor pair                   |
 
 ## mailmux configuration
 
@@ -198,24 +198,24 @@ env = { NOTIFY_TOKEN = "${NOTIFY_TOKEN}" }
 
 ### Account options
 
-| Field | Default | Description |
-|---|---|---|
-| `id` | *required* | Unique identifier for the account |
-| `enabled` | `true` | Whether the account is active; if `false`, mailmux logs and skips it |
-| `imap_host` | *required* | IMAP server hostname |
-| `imap_port` | `993` | IMAP server port |
-| `tls` | `true` | Use implicit TLS (port 993). See note below. |
-| `username` | *required* | IMAP username |
-| `password` | *required* | IMAP password (supports `${VAR}`) |
-| `poll_interval_secs` | `60` | Polling interval when IDLE is unavailable |
-| `rate_limit_per_second` | `5` | Max IMAP fetches per second |
-| `max_connections` | `2` | Connection pool size for this account |
-| `mailboxes` | *required* | List of mailbox names to monitor |
-| `initial_sync_max_messages` | unlimited | Cap on messages during first sync |
-| `initial_sync_max_age_days` | unlimited | Age limit during first sync |
-| `imap_command_timeout_secs` | `60` | Timeout for individual IMAP command exchanges |
-| `tls_ca_file` | — | Path to a PEM file with extra CA cert(s) to trust (e.g. for local bridges with self-signed certs). Requires `tls = true`. |
-| `tls_accept_invalid_certs` | `false` | Disable TLS certificate verification entirely. Only for local bridges on loopback. Requires `tls = true`. |
+| Field                       | Default    | Description                                                                                                               |
+| --------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `id`                        | _required_ | Unique identifier for the account                                                                                         |
+| `enabled`                   | `true`     | Whether the account is active; if `false`, mailmux logs and skips it                                                      |
+| `imap_host`                 | _required_ | IMAP server hostname                                                                                                      |
+| `imap_port`                 | `993`      | IMAP server port                                                                                                          |
+| `tls`                       | `true`     | Use implicit TLS (port 993). See note below.                                                                              |
+| `username`                  | _required_ | IMAP username                                                                                                             |
+| `password`                  | _required_ | IMAP password (supports `${VAR}`)                                                                                         |
+| `poll_interval_secs`        | `60`       | Polling interval when IDLE is unavailable                                                                                 |
+| `rate_limit_per_second`     | `5`        | Max IMAP fetches per second                                                                                               |
+| `max_connections`           | `2`        | Connection pool size for this account                                                                                     |
+| `mailboxes`                 | _required_ | List of mailbox names to monitor                                                                                          |
+| `initial_sync_max_messages` | unlimited  | Cap on messages during first sync                                                                                         |
+| `initial_sync_max_age_days` | unlimited  | Age limit during first sync                                                                                               |
+| `imap_command_timeout_secs` | `60`       | Timeout for individual IMAP command exchanges                                                                             |
+| `tls_ca_file`               | —          | Path to a PEM file with extra CA cert(s) to trust (e.g. for local bridges with self-signed certs). Requires `tls = true`. |
+| `tls_accept_invalid_certs`  | `false`    | Disable TLS certificate verification entirely. Only for local bridges on loopback. Requires `tls = true`.                 |
 
 > **TLS mode note:** mailmux supports **implicit TLS** only (`tls = true` wraps
 > the connection in TLS before any IMAP traffic, typically port 993). **STARTTLS**
@@ -226,18 +226,19 @@ env = { NOTIFY_TOKEN = "${NOTIFY_TOKEN}" }
 
 ### Processor options
 
-| Field | Default | Description |
-|---|---|---|
-| `name` | *required* | Unique processor name |
-| `enabled` | `true` | Whether the processor is active |
-| `events` | `[]` | Event types to subscribe to. Currently `email_arrived` is the only supported type. |
-| `max_retries` | `0` | Max retry attempts on failure |
-| `retry_backoff_secs` | `[]` | Backoff schedule (seconds per attempt) |
-| `timeout_secs` | `30` | Execution timeout |
-| `concurrency` | `1` | Max concurrent executions |
-| `config` | `{}` | Processor-specific key/value config |
+| Field                | Default    | Description                                                                        |
+| -------------------- | ---------- | ---------------------------------------------------------------------------------- |
+| `name`               | _required_ | Unique processor name                                                              |
+| `enabled`            | `true`     | Whether the processor is active                                                    |
+| `events`             | `[]`       | Event types to subscribe to. Currently `email_arrived` is the only supported type. |
+| `max_retries`        | `0`        | Max retry attempts on failure                                                      |
+| `retry_backoff_secs` | `[]`       | Backoff schedule (seconds per attempt)                                             |
+| `timeout_secs`       | `30`       | Execution timeout                                                                  |
+| `concurrency`        | `1`        | Max concurrent executions                                                          |
+| `config`             | `{}`       | Processor-specific key/value config                                                |
 
 Built-in processor types:
+
 - **`logger`** — logs event details via tracing
 - **`command`** — executes a CLI command, passing event JSON on stdin
   (set `config.command` and optionally `config.args` and `config.env`)
@@ -254,14 +255,14 @@ and posts normalized data to Firefly III.
 
 ```toml
 [[processors]]
-name = "bank-tx"
+name = "mailtx"
 events = ["email_arrived"]
 timeout_secs = 90
 concurrency = 1
 
 [processors.config]
 command = "/usr/local/bin/mailtx"
-env = { ALLOWED_SENDERS = "alerts@mybank.com", FIREFLY_BASE_URL = "${FIREFLY_BASE_URL}", FIREFLY_ASSET_ACCOUNT_ID = "${FIREFLY_ASSET_ACCOUNT_ID}" }
+env = { ALLOWED_SENDERS = "alerts@mybank.com", FIREFLY_BASE_URL = "${FIREFLY_BASE_URL}", FIREFLY_ASSET_ACCOUNTS_JSON = "${FIREFLY_ASSET_ACCOUNTS_JSON}" }
 ```
 
 `config.env` is the preferred way to pass processor-specific environment
@@ -394,21 +395,21 @@ sudo journalctl -u mailmux -f
 
 When `health_port` is set in the config:
 
-| Endpoint | Description |
-|---|---|
-| `GET /health` | Returns `200 OK` if the database is reachable |
-| `GET /ready` | Returns `200 OK` after initial setup is complete |
-| `GET /metrics` | Prometheus metrics in text exposition format |
+| Endpoint       | Description                                      |
+| -------------- | ------------------------------------------------ |
+| `GET /health`  | Returns `200 OK` if the database is reachable    |
+| `GET /ready`   | Returns `200 OK` after initial setup is complete |
+| `GET /metrics` | Prometheus metrics in text exposition format     |
 
 Exported metrics:
 
-| Metric | Type | Labels |
-|---|---|---|
-| `mailmux_messages_ingested_total` | counter | account, mailbox |
-| `mailmux_events_created_total` | counter | event_type |
-| `mailmux_processor_runs_total` | counter | processor, status |
-| `mailmux_active_connections` | gauge | account |
-| `mailmux_mailboxes_monitored` | gauge | account |
+| Metric                            | Type    | Labels            |
+| --------------------------------- | ------- | ----------------- |
+| `mailmux_messages_ingested_total` | counter | account, mailbox  |
+| `mailmux_events_created_total`    | counter | event_type        |
+| `mailmux_processor_runs_total`    | counter | processor, status |
+| `mailmux_active_connections`      | gauge   | account           |
+| `mailmux_mailboxes_monitored`     | gauge   | account           |
 
 ## License
 

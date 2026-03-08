@@ -19,6 +19,7 @@ pub struct CanonicalTransaction {
     pub kind: TransactionKind,
     pub narration: String,
     pub occurred_at: DateTime<Utc>,
+    pub asset_account_id: String,
 }
 
 pub struct PostReceipt {
@@ -39,7 +40,10 @@ pub fn build_endpoint(config: &Config) -> Box<dyn TransactionEndpoint> {
     Box::new(firefly::FireflyEndpoint::from_config(&config.firefly))
 }
 
-pub fn canonical_from_llm(data: &TransactionData) -> Result<CanonicalTransaction> {
+pub fn canonical_from_llm(
+    data: &TransactionData,
+    asset_account_id: String,
+) -> Result<CanonicalTransaction> {
     if data.status != "found" {
         anyhow::bail!("LLM status must be 'found' before posting");
     }
@@ -72,6 +76,7 @@ pub fn canonical_from_llm(data: &TransactionData) -> Result<CanonicalTransaction
         kind,
         narration,
         occurred_at,
+        asset_account_id,
     })
 }
 

@@ -8,7 +8,6 @@ use crate::endpoint::{CanonicalTransaction, PostReceipt, TransactionEndpoint, Tr
 pub struct FireflyEndpoint {
     base_url: String,
     access_token: String,
-    asset_account_id: String,
     currency_code: Option<String>,
     apply_rules: bool,
     fire_webhooks: bool,
@@ -20,7 +19,6 @@ impl FireflyEndpoint {
         Self {
             base_url: config.base_url.trim_end_matches('/').to_string(),
             access_token: config.access_token.trim().to_string(),
-            asset_account_id: config.asset_account_id.trim().to_string(),
             currency_code: config.currency_code.clone(),
             apply_rules: config.apply_rules,
             fire_webhooks: config.fire_webhooks,
@@ -52,7 +50,7 @@ impl FireflyEndpoint {
                 date: occurred_at.clone(),
                 amount,
                 description,
-                source_id: Some(self.asset_account_id.as_str()),
+                source_id: Some(tx.asset_account_id.as_str()),
                 source_name: None,
                 destination_id: None,
                 destination_name: Some(counterparty),
@@ -65,7 +63,7 @@ impl FireflyEndpoint {
                 description,
                 source_id: None,
                 source_name: Some(counterparty),
-                destination_id: Some(self.asset_account_id.as_str()),
+                destination_id: Some(tx.asset_account_id.as_str()),
                 destination_name: None,
                 currency_code: self.currency_code.as_deref(),
             },

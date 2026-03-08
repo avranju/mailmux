@@ -8,13 +8,13 @@ replace the hand-rolled Anthropic HTTP client in `src/llm.rs`.
 
 ## Candidates Evaluated
 
-| Crate | Version | Total Downloads | Last Published | GitHub Stars | Verdict |
-|---|---|---|---|---|---|
-| `rig-core` | 0.31.0 | 284,261 | 2026-02-17 | 6,105 | Strong but fast-moving and breaking |
-| `genai` | 0.5.3 | 123,610 | 2026-01-31 | 660 | **Recommended** |
-| `langchain-rust` | 4.6.0 | 129,786 | 2024-10-06 | 1,232 | Stale — avoid |
-| `llm` (graniet) | 1.3.7 | 58,719 | 2026-01-09 | 312 | Niche adoption, awkward design |
-| `llm-chain` | 0.13.0 | 82,452 | 2023-11-15 | 1,591 | Abandoned — avoid |
+| Crate            | Version | Total Downloads | Last Published | GitHub Stars | Verdict                             |
+| ---------------- | ------- | --------------- | -------------- | ------------ | ----------------------------------- |
+| `rig-core`       | 0.31.0  | 284,261         | 2026-02-17     | 6,105        | Strong but fast-moving and breaking |
+| `genai`          | 0.5.3   | 123,610         | 2026-01-31     | 660          | **Recommended**                     |
+| `langchain-rust` | 4.6.0   | 129,786         | 2024-10-06     | 1,232        | Stale — avoid                       |
+| `llm` (graniet)  | 1.3.7   | 58,719          | 2026-01-09     | 312          | Niche adoption, awkward design      |
+| `llm-chain`      | 0.13.0  | 82,452          | 2023-11-15     | 1,591        | Abandoned — avoid                   |
 
 ---
 
@@ -58,6 +58,7 @@ let tx = extractor.extract("Your debit of ₹1,234 at Amazon Pay").await?;
 ```
 
 **Strengths:**
+
 - Largest community by a wide margin (6k stars, active Discord)
 - 20+ providers with a consistent abstraction layer
 - Batteries-included: RAG, vector store integrations (LanceDB, Qdrant,
@@ -68,11 +69,12 @@ let tx = extractor.extract("Your debit of ₹1,234 at Amazon Pay").await?;
   automatically
 
 **Weaknesses:**
+
 - Provider-specific client types leak into application code:
   `anthropic::Client`, `openai::Client`, etc. Swapping providers requires
   code changes, not just a config change.
-- The README carries an explicit warning: *"Here be dragons! future updates
-  **will** contain breaking changes."* The version history confirms this — 31
+- The README carries an explicit warning: _"Here be dragons! future updates
+  **will** contain breaking changes."_ The version history confirms this — 31
   major version bumps (v0.1 → v0.31) in approximately 18 months, releasing
   roughly every two weeks.
 - `schemars` is a mandatory dependency for structured output, adding compile
@@ -166,6 +168,7 @@ client.exec_chat("claude-haiku-4-5-20251001", chat_req, Some(&options)).await?;
 ```
 
 **Strengths:**
+
 - Single `Client` dispatches to all providers transparently. Switching
   providers is a model name string change — no code restructuring, no import
   changes.
@@ -180,6 +183,7 @@ client.exec_chat("claude-haiku-4-5-20251001", chat_req, Some(&options)).await?;
   (v0.6.0-beta.2 published 2026-02-22).
 
 **Weaknesses:**
+
 - Smaller community than rig-core (660 vs 6,105 stars).
 - No built-in RAG or vector store abstractions (by design — the author
   recommends provider-specific SDKs for those use cases).
@@ -212,7 +216,7 @@ Last published to crates.io in November 2023. Do not use for new projects.
 
 ## Recommendation: `genai`
 
-For the bank-tx-processor use case — a single structured extraction call per
+For the mailtx use case — a single structured extraction call per
 email, with the ability to switch LLM providers via config — `genai` is the
 correct choice.
 

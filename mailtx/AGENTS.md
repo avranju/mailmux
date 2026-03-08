@@ -5,7 +5,7 @@ repository.
 
 ## What This Project Is
 
-**bank-tx-processor** is a mailmux command processor binary. It is invoked by
+**mailtx** is a mailmux command processor binary. It is invoked by
 mailmux once per `email_arrived` event, reads a JSON payload from stdin,
 extracts bank transaction data from the email using the Anthropic Claude API,
 and posts the result to a configured HTTP endpoint.
@@ -31,11 +31,9 @@ cargo clippy
 
 # Run standalone (pipe JSON on stdin)
 echo '{"event":{"id":1},"email":{"subject":"Txn alert","sender":"alerts@mybank.com","raw_message_path":"/tmp/test.eml"}}' \
-  | ALLOWED_SENDERS=alerts@mybank.com \
-    ANTHROPIC_API_KEY=sk-ant-... \   # or OPENAI_API_KEY / GEMINI_API_KEY depending on LLM_MODEL
-    ENDPOINT_URL=https://example.com/transactions \
-    ENDPOINT_AUTH="Bearer token" \
-    ./target/debug/bank-tx-processor
+  | MAILTX_CONFIG=/path/to/mailtx.toml \
+    ANTHROPIC_API_KEY=sk-ant-... \
+    ./target/debug/mailtx
 ```
 
 No Makefile — everything goes through standard Cargo.
@@ -58,30 +56,63 @@ stdin JSON
 
 ## Key Modules (`src/`)
 
-| File | Role |
-|---|---|
-| `main.rs` | Orchestrates the pipeline; owns stdin reading and exit code |
-| `config.rs` | Loads all config from env vars; `sender_allowed()` does substring match |
-| `input.rs` | Minimal serde types mirroring mailmux's stdin schema; only used fields are declared |
-| `email.rs` | Reads `.eml` file with `mail-parser`; prefers text/plain, strips HTML via regex if only text/html is available |
-| `llm.rs` | Anthropic Messages API (`POST /v1/messages`); parses JSON response; strips markdown code fences from model output |
-| `post.rs` | HTTP POST to `ENDPOINT_URL` with `Authorization` header |
+| File        | Role                                                                                                              |
+| ----------- | ----------------------------------------------------------------------------------------------------------------- |
+| `main.rs`   | Orchestrates the pipeline; owns stdin reading and exit code                                                       |
+| `config.rs` | Loads config from a TOML file (`MAILTX_CONFIG`); `sender_allowed()` does substring match                         |
+| `input.rs`  | Minimal serde types mirroring mailmux's stdin schema; only used fields are declared                               |
+| `email.rs`  | Reads `.eml` file with `mail-parser`; prefers text/plain, strips HTML via regex if only text/html is available    |
+| `llm.rs`    | Anthropic Messages API (`POST /v1/messages`); parses JSON response; strips markdown code fences from model output |
+| `post.rs`   | HTTP POST to `ENDPOINT_URL` with `Authorization` header                                                           |
 
 ## Configuration
 
-All configuration comes from environment variables (inherited from mailmux's
-process environment):
+Configuration is split between a TOML file (most settings) and a few env vars
+(secrets and runtime knobs that are better kept out of files).
 
-| Variable | Required | Notes |
-|---|---|---|
-| `ALLOWED_SENDERS` | yes | Comma-separated; matched as case-insensitive substrings of the sender field |
-| `ENDPOINT_URL` | yes | |
-| `ENDPOINT_AUTH` | yes | Full `Authorization` header value |
-| `LLM_MODEL` | no | Default: `claude-haiku-4-5-20251001`. Provider is inferred by `genai` from the model name. |
-| `ANTHROPIC_API_KEY` | provider-dependent | Required when using any `claude-` model; read directly by `genai`, not by our code |
-| `OPENAI_API_KEY` | provider-dependent | Required when using any `gpt-` or `o1-`/`o3-` model |
-| `GEMINI_API_KEY` | provider-dependent | Required when using any `gemini-` model |
-| `RUST_LOG` | no | Standard tracing env filter |
+### Environment variables
+
+| Variable            | Required           | Notes                                                                           |
+| ------------------- | ------------------ | ------------------------------------------------------------------------------- |
+| `MAILTX_CONFIG`     | yes                | Path to the TOML config file                                                    |
+| `ANTHROPIC_API_KEY` | provider-dependent | Required when using any `claude-` model; read by `genai`, not by our code       |
+| `OPENAI_API_KEY`    | provider-dependent | Required when using any `gpt-` or `o1-`/`o3-` model                            |
+| `GEMINI_API_KEY`    | provider-dependent | Required when using any `gemini-` model                                         |
+| `RUST_LOG`          | no                 | Standard tracing env filter                                                     |
+
+### TOML config file
+
+```toml
+# Senders matched as case-insensitive substrings of the From header.
+allowed_senders = ["alerts@mybank.com", "noreply@anotherbank.com"]
+
+# Model name passed to genai. Provider is inferred from the name.
+# Default: "claude-haiku-4-5-20251001"
+llm_model = "claude-haiku-4-5-20251001"
+
+[firefly]
+base_url     = "https://firefly.example.com/api"
+access_token = "eyJ..."
+
+# Optional Firefly settings (shown with their defaults):
+# default_asset_account_id = "12"
+# currency_code            = "USD"
+# apply_rules              = false
+# fire_webhooks            = true
+# error_if_duplicate_hash  = false
+
+[[firefly.asset_accounts]]
+id                 = "hdfc_9772"
+firefly_account_id = "12"
+account_suffixes   = ["9772"]
+debit_card_last4   = ["7406"]
+aliases            = ["hdfc salary account"]
+
+[[firefly.asset_accounts]]
+id                 = "sbm_3989"
+firefly_account_id = "42"
+account_suffixes   = ["3989"]
+```
 
 ## mailmux Integration
 
@@ -89,7 +120,7 @@ mailmux config block:
 
 ```toml
 [[processors]]
-name = "bank-tx"
+name = "mailtx
 enabled = true
 events = ["email_arrived"]
 max_retries = 3
@@ -98,7 +129,7 @@ timeout_secs = 90
 concurrency = 1
 
 [processors.config]
-command = "/usr/local/bin/bank-tx-processor"
+command = "/usr/local/bin/mailtx"
 ```
 
 The binary inherits mailmux's environment, so all env vars must be set in the
@@ -120,29 +151,32 @@ environment that starts mailmux (systemd `EnvironmentFile`, Docker Compose
   on `html5ever` (the Servo HTML parser). It handles malformed HTML gracefully
   and is spec-compliant. The `width` parameter (120) controls line wrapping and
   has no effect on LLM input quality.
-- **LLM output may include markdown fences.** `llm.rs` strips `` ```json `` /
+- **LLM output may include markdown fences.** `llm.rs` strips ` ```json ` /
   ` ``` ` wrappers before parsing the JSON response.
 
 ## Adding or Changing Behaviour
 
 **To add a new extracted field** (e.g. account number):
+
 1. Add the field to `TransactionData` in `src/llm.rs`
 2. Update the prompt string in `PROMPT_TEMPLATE`
 3. Update `TransactionPayload` in `src/post.rs` if the field should be posted
 
-**To change the LLM model**, update the `LLM_MODEL` env var at runtime — no
+**To change the LLM model**, update `llm_model` in the TOML config file — no
 code change needed. `genai` infers the provider from the model name and reads
 the relevant API key env var automatically.
 
 **To change the endpoint payload shape**, edit `TransactionPayload` in
 `src/post.rs`.
 
-**To add a new config variable**, add it to `Config` in `src/config.rs`, load
-it with `std::env::var`, and document it in README.md and this file.
+**To add a new config variable**, add it to the appropriate struct in
+`src/config.rs` (derive `Deserialize`), document it in the TOML example in
+README.md and this file.
 
 ## Tests
 
 No tests currently exist. When adding tests:
+
 - Unit-test `config::Config::sender_allowed` with edge cases (full "Name
   <email>" format, case differences, partial substrings)
 - Unit-test `email::html_to_text` with samples of real bank notification HTML
