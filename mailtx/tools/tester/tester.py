@@ -28,6 +28,11 @@ import re
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+# tester.py lives inside mailtx/tools/tester/; workspace root is three levels up
+_WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+_SEP = "─" * 60
 
 # ── ANSI colour rendering ────────────────────────────────────────────────────
 
@@ -51,7 +56,7 @@ def _parse_ansi(line: str) -> list[tuple[str, int]]:
     """Split *line* into (text, curses_attr) segments by interpreting ANSI SGR codes."""
     segments: list[tuple[str, int]] = []
     pos = 0
-    fg = -1    # -1 = terminal default colour
+    fg = -1  # -1 = terminal default colour
     bold = False
 
     def attr() -> int:
@@ -115,7 +120,7 @@ class MockFireflyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(resp)
 
-    def log_message(self, format: str, *_):
+    def log_message(self, fmt: str, *_):
         pass  # suppress default access log
 
 
@@ -138,6 +143,7 @@ def extract_email_info(path: str) -> tuple[str, str]:
 
 
 def run_mailtx(config_path: str, api_key: str, eml_path: str) -> None:
+    abs_eml = os.path.abspath(eml_path)
     subject, sender = extract_email_info(eml_path)
     event_id = random.randint(1, 1_000_000)
     stdin_payload = json.dumps(
@@ -146,49 +152,79 @@ def run_mailtx(config_path: str, api_key: str, eml_path: str) -> None:
             "email": {
                 "subject": subject,
                 "sender": sender,
-                "raw_message_path": os.path.abspath(eml_path),
+                "raw_message_path": abs_eml,
             },
         }
-    )
+    ).encode("utf-8")
 
     proc_queue.put(f"Subject  : {subject}")
     proc_queue.put(f"Sender   : {sender}")
     proc_queue.put(f"Event ID : {event_id}")
-    proc_queue.put(f"EML path : {os.path.abspath(eml_path)}")
+    proc_queue.put(f"EML path : {abs_eml}")
     proc_queue.put("")
 
     env = os.environ.copy()
     env["MAILTX_CONFIG"] = os.path.abspath(config_path)
     env["XAI_API_KEY"] = api_key
 
-    # tester.py lives inside mailtx/tools/tester/; workspace root is three levels up
-    workspace_root = os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    )
+    try:
+        proc = subprocess.Popen(
+            ["cargo", "run", "-p", "mailtx"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            cwd=_WORKSPACE_ROOT,
+        )
+    except Exception as e:
+        proc_queue.put(f"Failed to start mailtx: {e}")
+        proc_queue.put("")
+        return
 
-    proc = subprocess.Popen(
-        ["cargo", "run", "-p", "mailtx"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-        cwd=workspace_root,
-    )
-    proc.stdin.write(stdin_payload.encode())
-    proc.stdin.close()
+    # Safely write to stdin if available
+    try:
+        if proc.stdin is not None:
+            proc.stdin.write(stdin_payload)
+            try:
+                proc.stdin.flush()
+            except Exception:
+                pass
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+    except Exception as e:
+        proc_queue.put(f"Error writing to mailtx stdin: {e}")
 
     def drain(stream) -> None:
-        for raw in iter(stream.readline, b""):
-            proc_queue.put(raw.decode("utf-8", errors="replace").rstrip("\n"))
-        stream.close()
+        if stream is None:
+            return
+        try:
+            for raw in iter(stream.readline, b""):
+                try:
+                    proc_queue.put(raw.decode("utf-8", errors="replace").rstrip("\n"))
+                except Exception:
+                    # Fallback: push repr if decoding fails unexpectedly
+                    proc_queue.put(repr(raw))
+        except Exception as e:
+            proc_queue.put(f"Error reading process stream: {e}")
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
 
     threading.Thread(target=drain, args=(proc.stdout,), daemon=True).start()
     threading.Thread(target=drain, args=(proc.stderr,), daemon=True).start()
 
-    proc.wait()
+    try:
+        proc.wait()
+    except Exception as e:
+        proc_queue.put(f"Error waiting for mailtx to exit: {e}")
+
     proc_queue.put("")
     proc_queue.put(
-        f"── mailtx exited (code {proc.returncode}) ──────────────────────────"
+        f"── mailtx exited (code {getattr(proc, 'returncode', 'unknown')}) ──────────────────────────"
     )
 
 
@@ -196,11 +232,25 @@ def run_all_mailtx(config_path: str, api_key: str, eml_paths: list[str]) -> None
     for i, eml_path in enumerate(eml_paths):
         if i > 0:
             proc_queue.put("")
-            proc_queue.put("─" * 60)
+            proc_queue.put(_SEP)
             proc_queue.put("")
         proc_queue.put(f"[{i + 1}/{len(eml_paths)}] {os.path.basename(eml_path)}")
         proc_queue.put("")
         run_mailtx(config_path, api_key, eml_path)
+
+
+# ── TUI helpers ──────────────────────────────────────────────────────────────
+
+
+def _drain_queue(q: queue.Queue, lines: list) -> bool:
+    """Drain all available items from *q* into *lines*. Returns True if any were added."""
+    got = False
+    while True:
+        try:
+            lines.append(q.get_nowait())
+            got = True
+        except queue.Empty:
+            return got
 
 
 # ── TUI ──────────────────────────────────────────────────────────────────────
@@ -213,10 +263,10 @@ def run_tui(stdscr, config_path: str, api_key: str, eml_paths: list[str]) -> Non
     curses.curs_set(0)
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_WHITE, -1)    # inactive pane title
-    curses.init_pair(2, curses.COLOR_CYAN, -1)     # active pane title
-    curses.init_pair(3, curses.COLOR_YELLOW, -1)   # hint bar
-    for _i, _c in enumerate(_ANSI_COLORS):         # ANSI foreground colours
+    curses.init_pair(1, curses.COLOR_WHITE, -1)  # inactive pane title
+    curses.init_pair(2, curses.COLOR_CYAN, -1)  # active pane title
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)  # hint bar
+    for _i, _c in enumerate(_ANSI_COLORS):  # ANSI foreground colours
         curses.init_pair(_ANSI_PAIR_BASE + _i, _c, -1)
 
     stdscr.nodelay(True)
@@ -245,8 +295,8 @@ def run_tui(stdscr, config_path: str, api_key: str, eml_paths: list[str]) -> Non
 
     http_lines: list[str] = []
     proc_lines: list[str] = []
-    http_scroll = 0
-    proc_scroll = 0
+    scrolls = [0, 0]  # [http_scroll, proc_scroll] indexed by active pane
+    page_sizes = [inner_h_top, inner_h_bot]
     active = 1  # 0 = top (HTTP), 1 = bottom (process) — start on process
 
     def draw_frame(win, title: str, is_active: bool) -> None:
@@ -272,11 +322,11 @@ def run_tui(stdscr, config_path: str, api_key: str, eml_paths: list[str]) -> Non
         col_limit = max_col - min_col + 1
         for i, line in enumerate(lines):
             x = 0
-            for text, attr in _parse_ansi(line):
+            for text, text_attr in _parse_ansi(line):
                 if x >= col_limit:
                     break
                 try:
-                    pad.addstr(i, x, text[: col_limit - x], attr)
+                    pad.addstr(i, x, text[: col_limit - x], text_attr)
                 except curses.error:
                     pass
                 x += len(text)
@@ -299,25 +349,10 @@ def run_tui(stdscr, config_path: str, api_key: str, eml_paths: list[str]) -> Non
 
     while True:
         # Drain queues; auto-scroll to bottom when new lines arrive
-        new_http = False
-        new_proc = False
-        while True:
-            try:
-                http_lines.append(http_queue.get_nowait())
-                new_http = True
-            except queue.Empty:
-                break
-        while True:
-            try:
-                proc_lines.append(proc_queue.get_nowait())
-                new_proc = True
-            except queue.Empty:
-                break
-
-        if new_http:
-            http_scroll = max(0, len(http_lines) - inner_h_top)
-        if new_proc:
-            proc_scroll = max(0, len(proc_lines) - inner_h_bot)
+        if _drain_queue(http_queue, http_lines):
+            scrolls[0] = max(0, len(http_lines) - inner_h_top)
+        if _drain_queue(proc_queue, proc_lines):
+            scrolls[1] = max(0, len(proc_lines) - inner_h_bot)
 
         # Handle keyboard input
         key = stdscr.getch()
@@ -326,25 +361,13 @@ def run_tui(stdscr, config_path: str, api_key: str, eml_paths: list[str]) -> Non
         elif key == ord("\t"):
             active = 1 - active
         elif key == curses.KEY_UP:
-            if active == 0:
-                http_scroll = max(0, http_scroll - 1)
-            else:
-                proc_scroll = max(0, proc_scroll - 1)
+            scrolls[active] = max(0, scrolls[active] - 1)
         elif key == curses.KEY_DOWN:
-            if active == 0:
-                http_scroll += 1
-            else:
-                proc_scroll += 1
+            scrolls[active] += 1
         elif key == curses.KEY_PPAGE:
-            if active == 0:
-                http_scroll = max(0, http_scroll - inner_h_top)
-            else:
-                proc_scroll = max(0, proc_scroll - inner_h_bot)
+            scrolls[active] = max(0, scrolls[active] - page_sizes[active])
         elif key == curses.KEY_NPAGE:
-            if active == 0:
-                http_scroll += inner_h_top
-            else:
-                proc_scroll += inner_h_bot
+            scrolls[active] += page_sizes[active]
 
         # Redraw
         draw_frame(top_frame, "HTTP Requests", active == 0)
@@ -352,8 +375,8 @@ def run_tui(stdscr, config_path: str, api_key: str, eml_paths: list[str]) -> Non
         top_frame.noutrefresh()
         bot_frame.noutrefresh()
 
-        http_scroll = render_pad(http_pad, http_lines, http_scroll, http_vp)
-        proc_scroll = render_pad(proc_pad, proc_lines, proc_scroll, proc_vp)
+        scrolls[0] = render_pad(http_pad, http_lines, scrolls[0], http_vp)
+        scrolls[1] = render_pad(proc_pad, proc_lines, scrolls[1], proc_vp)
 
         draw_hint()
         stdscr.noutrefresh()
