@@ -10,10 +10,10 @@ MAILTX_MANIFEST="${REPO_DIR}/mailtx/Cargo.toml"
 mkdir -p "${SCRIPT_DIR}/bin"
 
 cargo build --release --manifest-path "${MAILMUX_MANIFEST}"
-cp "${REPO_DIR}/mailmux/target/release/mailmux" "${SCRIPT_DIR}/bin/mailmux"
+cp "${REPO_DIR}/target/release/mailmux" "${SCRIPT_DIR}/bin/mailmux"
 
 cargo build --release --manifest-path "${MAILTX_MANIFEST}"
-cp "${REPO_DIR}/mailtx/target/release/mailtx" "${SCRIPT_DIR}/bin/mailtx"
+cp "${REPO_DIR}/target/release/mailtx" "${SCRIPT_DIR}/bin/mailtx"
 
 source "${SCRIPT_DIR}/.env"
 
