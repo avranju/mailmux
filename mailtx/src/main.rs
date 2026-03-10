@@ -2,7 +2,7 @@ use std::io::Read;
 
 use crate::matcher::AccountMatcher;
 use anyhow::Result;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 mod config;
 mod email;
@@ -57,7 +57,7 @@ async fn run() -> Result<()> {
 
     let sender = email.sender.as_deref().unwrap_or("");
     if !config.sender_allowed(sender) {
-        debug!(sender, "sender not in allow-list, skipping");
+        info!(sender, "sender not in allow-list, skipping");
         return Ok(());
     }
 
