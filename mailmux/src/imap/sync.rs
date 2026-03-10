@@ -254,16 +254,35 @@ impl MailboxWatcher {
             return Ok(());
         }
 
-        // Step 2: Apply initial_sync_max_messages limit on first sync only.
-        let skip = if last_seen_uid == 0 {
-            self.account
+        // Step 2: Apply initial sync limits (only on first sync).
+        let uids_to_fetch_owned: Vec<u32> = if last_seen_uid == 0 {
+            let mut uids = all_uids;
+
+            // Filter by start date if configured.
+            if let Some(start_date) = self.account.initial_sync_start_date {
+                info!(
+                    account = self.account.id,
+                    mailbox = self.mailbox,
+                    start_date = %start_date,
+                    "applying initial_sync_start_date filter via UID SEARCH SINCE"
+                );
+                rate_limiter.until_ready().await;
+                let since_set: std::collections::HashSet<u32> =
+                    conn.uid_search_since(start_date).await?.into_iter().collect();
+                uids.retain(|uid| since_set.contains(uid));
+            }
+
+            // Apply max-messages cap (keep the most recent N).
+            let skip = self
+                .account
                 .initial_sync_max_messages
-                .map(|max| all_uids.len().saturating_sub(max as usize))
-                .unwrap_or(0)
+                .map(|max| uids.len().saturating_sub(max as usize))
+                .unwrap_or(0);
+            uids[skip..].to_vec()
         } else {
-            0
+            all_uids
         };
-        let uids_to_fetch = &all_uids[skip..];
+        let uids_to_fetch = &uids_to_fetch_owned[..];
 
         debug!(
             account = self.account.id,

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use chrono::NaiveDate;
 use regex::Regex;
 use serde::Deserialize;
 
@@ -78,7 +79,7 @@ pub struct AccountConfig {
     pub max_connections: u32,
     pub mailboxes: Vec<String>,
     pub initial_sync_max_messages: Option<u64>,
-    pub initial_sync_max_age_days: Option<u64>,
+    pub initial_sync_start_date: Option<NaiveDate>,
     #[serde(default = "default_imap_command_timeout")]
     pub imap_command_timeout_secs: u64,
     pub tls_ca_file: Option<String>,

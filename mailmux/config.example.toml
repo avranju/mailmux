@@ -44,7 +44,7 @@ mailboxes = ["INBOX"]
 
 # Limit how far back the very first sync goes (optional)
 initial_sync_max_messages = 1000
-# initial_sync_max_age_days = 90
+# initial_sync_start_date = "2024-01-01"
 
 # Timeout in seconds for individual IMAP command exchanges (greeting, login,
 # select, fetch inactivity, etc.). Default: 60

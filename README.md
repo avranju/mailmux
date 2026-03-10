@@ -212,7 +212,7 @@ env = { NOTIFY_TOKEN = "${NOTIFY_TOKEN}" }
 | `max_connections`           | `2`        | Connection pool size for this account                                                                                     |
 | `mailboxes`                 | _required_ | List of mailbox names to monitor                                                                                          |
 | `initial_sync_max_messages` | unlimited  | Cap on messages during first sync                                                                                         |
-| `initial_sync_max_age_days` | unlimited  | Age limit during first sync                                                                                               |
+| `initial_sync_start_date`   | (none)     | Only download messages on or after this date (e.g. `"2024-01-01"`) during first sync; uses IMAP UID SEARCH SINCE         |
 | `imap_command_timeout_secs` | `60`       | Timeout for individual IMAP command exchanges                                                                             |
 | `tls_ca_file`               | —          | Path to a PEM file with extra CA cert(s) to trust (e.g. for local bridges with self-signed certs). Requires `tls = true`. |
 | `tls_accept_invalid_certs`  | `false`    | Disable TLS certificate verification entirely. Only for local bridges on loopback. Requires `tls = true`.                 |

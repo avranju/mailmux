@@ -4,7 +4,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use imap_next::client::{Client, Event, Options};
 use imap_next::imap_types::command::{Command, CommandBody};
-use imap_next::imap_types::core::Tag;
+use imap_next::imap_types::core::{Tag, Vec1};
+use imap_next::imap_types::search::SearchKey;
 use imap_next::imap_types::fetch::{
     MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName,
 };
@@ -462,6 +463,55 @@ impl ImapConnection {
                 }
             }
         }
+
+        Ok(uids)
+    }
+
+    /// UID SEARCH SINCE <date> — returns UIDs of messages on or after the given date.
+    pub async fn uid_search_since(&mut self, since: chrono::NaiveDate) -> Result<Vec<u32>> {
+        let tag = self.next_tag();
+        let imap_date = imap_next::imap_types::datetime::NaiveDate::try_from(since)
+            .context("converting date for UID SEARCH SINCE")?;
+        let criteria = Vec1::from(SearchKey::Since(imap_date));
+        let cmd = Command {
+            tag,
+            body: CommandBody::search(None, criteria, true),
+        };
+        let _handle = self.client.enqueue_command(cmd);
+
+        let mut uids = Vec::new();
+        let timeout = self.command_timeout;
+        tokio::time::timeout(timeout, async {
+            loop {
+                let event = self
+                    .stream
+                    .next(&mut self.client)
+                    .await
+                    .context("during UID SEARCH SINCE")?;
+                match event {
+                    Event::DataReceived { data } => {
+                        if let Data::Search(results, ..) = data {
+                            for uid in results {
+                                uids.push(uid.get());
+                            }
+                        }
+                    }
+                    Event::StatusReceived { status } => {
+                        check_status(&status, "UID SEARCH SINCE")?;
+                        if matches!(status, Status::Tagged(_)) {
+                            break;
+                        }
+                    }
+                    Event::CommandSent { .. } => {}
+                    other => {
+                        trace!(event = ?other, "ignoring event during UID SEARCH SINCE");
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .unwrap_or_else(|_| bail!("IMAP UID SEARCH SINCE timed out after {}s", timeout.as_secs()))?;
 
         Ok(uids)
     }
