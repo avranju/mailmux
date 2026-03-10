@@ -18,7 +18,9 @@ pub struct ProcessorJob {
 }
 
 /// Create a new processor job (pending).
-pub async fn create_job(pool: &PgPool, event_id: i64, processor_name: &str) -> Result<i64> {
+/// Returns `Some(id)` on success, or `None` if the job already exists
+/// (duplicate dispatch — `ON CONFLICT DO NOTHING`).
+pub async fn create_job(pool: &PgPool, event_id: i64, processor_name: &str) -> Result<Option<i64>> {
     let id = sqlx::query_scalar::<_, i64>(
         r#"
         INSERT INTO processor_jobs (event_id, processor_name, status)
@@ -29,7 +31,7 @@ pub async fn create_job(pool: &PgPool, event_id: i64, processor_name: &str) -> R
     )
     .bind(event_id)
     .bind(processor_name)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
     .context("creating processor job")?;
 

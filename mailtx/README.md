@@ -145,8 +145,8 @@ allowed_senders = ["alerts@mybank.com", "noreply@anotherbank.com"]
 # the name. Default: "claude-haiku-4-5-20251001"
 llm_model = "claude-haiku-4-5-20251001"
 
-# Tag applied to every posted transaction. Default: "mailmux/mailtx"
-# tag = "mailmux/mailtx"
+# Tag applied to every posted transaction. Default: "mailmux-mailtx"
+# tag = "mailmux-mailtx"
 
 [firefly]
 base_url     = "https://firefly.example.com/api"

@@ -246,27 +246,36 @@ Built-in processor types:
 ## mailtx crate notes
 
 `mailtx` is designed to be run from `mailmux`'s built-in `command` processor.
-It reads event/email JSON from stdin, extracts transaction details via an LLM,
-and posts normalized data to Firefly III.
+It reads event/email JSON from stdin, extracts bank transaction details via an
+LLM, and posts the result to Firefly III — tagging every transaction for easy
+identification.
 
 - Crate path: `mailtx/`
 - Detailed docs: `mailtx/README.md`
-- Typical integration in `mailmux` config:
+
+Configuration lives in a TOML file whose path is given by the `MAILTX_CONFIG`
+environment variable. LLM API keys (`ANTHROPIC_API_KEY`, etc.) are read from
+the environment by the `genai` crate. These can be supplied either via
+`config.env` in the processor block (added on top of the inherited environment)
+or by setting them in the environment that starts mailmux (systemd
+`EnvironmentFile`, Docker Compose `environment`, etc.).
+
+Typical integration in `mailmux` config:
 
 ```toml
 [[processors]]
 name = "mailtx"
+enabled = true
 events = ["email_arrived"]
+max_retries = 3
+retry_backoff_secs = [30, 120, 600]
 timeout_secs = 90
 concurrency = 1
 
 [processors.config]
 command = "/usr/local/bin/mailtx"
-env = { ALLOWED_SENDERS = "alerts@mybank.com", FIREFLY_BASE_URL = "${FIREFLY_BASE_URL}", FIREFLY_ASSET_ACCOUNTS_JSON = "${FIREFLY_ASSET_ACCOUNTS_JSON}" }
+env = { MAILTX_CONFIG = "/etc/mailtx/config.toml", ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}" }
 ```
-
-`config.env` is the preferred way to pass processor-specific environment
-variables to `mailtx` when `mailmux` spawns it.
 
 ## Running
 

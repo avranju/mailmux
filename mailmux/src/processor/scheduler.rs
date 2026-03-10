@@ -108,13 +108,19 @@ impl JobScheduler {
                     .unwrap_or(30);
 
                 let job_id = match jobs::create_job(&self.pool, event.id, &processor_name).await {
-                    Ok(id) => id,
+                    Ok(Some(id)) => id,
+                    Ok(None) => {
+                        // Job already exists for this (event, processor) pair — duplicate
+                        // dispatch from the NOTIFY + poll overlap. The first dispatch
+                        // already created the job; nothing to do here.
+                        continue;
+                    }
                     Err(e) => {
-                        debug!(
+                        error!(
                             event_id = event.id,
                             processor = processor_name,
                             error = %e,
-                            "job already exists or create failed"
+                            "failed to create processor job"
                         );
                         continue;
                     }

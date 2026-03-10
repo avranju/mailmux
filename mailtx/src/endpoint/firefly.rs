@@ -42,7 +42,6 @@ impl FireflyEndpoint {
         let occurred_at = tx.occurred_at.to_rfc3339();
         let amount = format!("{:.2}", tx.amount.abs());
         let description = tx.narration.as_str();
-        let counterparty = tx.narration.as_str();
 
         let split = match tx.kind {
             TransactionKind::Withdrawal => TransactionSplitStore {
@@ -53,7 +52,7 @@ impl FireflyEndpoint {
                 source_id: Some(tx.asset_account_id.as_str()),
                 source_name: None,
                 destination_id: None,
-                destination_name: Some(counterparty),
+                destination_name: None,
                 currency_code: self.currency_code.as_deref(),
                 tags: tx.tags.as_slice(),
             },
@@ -63,7 +62,7 @@ impl FireflyEndpoint {
                 amount,
                 description,
                 source_id: None,
-                source_name: Some(counterparty),
+                source_name: None,
                 destination_id: Some(tx.asset_account_id.as_str()),
                 destination_name: None,
                 currency_code: self.currency_code.as_deref(),

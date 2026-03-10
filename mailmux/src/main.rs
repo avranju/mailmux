@@ -256,7 +256,15 @@ async fn cmd_replay(
         info!(processor = proc_name, event_id, "running processor");
 
         // Create a new job for the replay
-        let job_id = db::jobs::create_job(&pool, event_id, &proc_name).await?;
+        let job_id = db::jobs::create_job(&pool, event_id, &proc_name)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "a processor job already exists for event {} / processor '{}'",
+                    event_id,
+                    proc_name
+                )
+            })?;
 
         let timeout_secs = config
             .processors

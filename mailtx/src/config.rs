@@ -10,7 +10,7 @@ pub struct Config {
     /// API key from the environment automatically (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.).
     #[serde(default = "default_llm_model")]
     pub llm_model: String,
-    /// Tag applied to every transaction posted to Firefly. Defaults to "mailmux/mailtx".
+    /// Tag applied to every transaction posted to Firefly. Defaults to "mailmux-mailtx".
     #[serde(default = "default_tag")]
     pub tag: String,
     pub firefly: FireflyConfig,
@@ -21,7 +21,7 @@ fn default_llm_model() -> String {
 }
 
 fn default_tag() -> String {
-    "mailmux/mailtx".to_string()
+    "mailmux-mailtx".to_string()
 }
 
 #[derive(Debug, Deserialize)]
