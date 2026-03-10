@@ -55,6 +55,7 @@ impl FireflyEndpoint {
                 destination_id: None,
                 destination_name: Some(counterparty),
                 currency_code: self.currency_code.as_deref(),
+                tags: tx.tags.as_slice(),
             },
             TransactionKind::Deposit => TransactionSplitStore {
                 tx_type: "deposit",
@@ -66,6 +67,7 @@ impl FireflyEndpoint {
                 destination_id: Some(tx.asset_account_id.as_str()),
                 destination_name: None,
                 currency_code: self.currency_code.as_deref(),
+                tags: tx.tags.as_slice(),
             },
         };
 
@@ -141,6 +143,8 @@ struct TransactionSplitStore<'a> {
     destination_name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     currency_code: Option<&'a str>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    tags: &'a [String],
 }
 
 #[derive(Deserialize)]

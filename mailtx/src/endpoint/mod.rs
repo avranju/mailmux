@@ -20,6 +20,7 @@ pub struct CanonicalTransaction {
     pub narration: String,
     pub occurred_at: DateTime<Utc>,
     pub asset_account_id: String,
+    pub tags: Vec<String>,
 }
 
 pub struct PostReceipt {
@@ -43,6 +44,7 @@ pub fn build_endpoint(config: &Config) -> Box<dyn TransactionEndpoint> {
 pub fn canonical_from_llm(
     data: &TransactionData,
     asset_account_id: String,
+    tag: String,
 ) -> Result<CanonicalTransaction> {
     if data.status != "found" {
         anyhow::bail!("LLM status must be 'found' before posting");
@@ -77,6 +79,7 @@ pub fn canonical_from_llm(
         narration,
         occurred_at,
         asset_account_id,
+        tags: vec![tag],
     })
 }
 

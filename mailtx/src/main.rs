@@ -77,7 +77,7 @@ async fn run() -> Result<()> {
     }
 
     let resolved = account_matcher.resolve_asset_account(subject, &body)?;
-    let canonical_tx = endpoint::canonical_from_llm(&tx, resolved.firefly_account_id.clone())?;
+    let canonical_tx = endpoint::canonical_from_llm(&tx, resolved.firefly_account_id.clone(), config.tag.clone())?;
     let receipt = endpoint
         .post_transaction(&http_client, &canonical_tx)
         .await?;
