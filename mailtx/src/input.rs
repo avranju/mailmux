@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 /// The JSON payload written to stdin by mailmux's command processor.
@@ -17,5 +18,6 @@ pub struct Event {
 pub struct EmailRecord {
     pub subject: Option<String>,
     pub sender: Option<String>,
+    pub date: Option<DateTime<Utc>>,
     pub raw_message_path: String,
 }

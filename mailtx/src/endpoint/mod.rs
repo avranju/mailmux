@@ -45,6 +45,7 @@ pub fn canonical_from_llm(
     data: &TransactionData,
     asset_account_id: String,
     tag: String,
+    email_date: Option<DateTime<Utc>>,
 ) -> Result<CanonicalTransaction> {
     if data.status != "found" {
         anyhow::bail!("LLM status must be 'found' before posting");
@@ -71,7 +72,7 @@ pub fn canonical_from_llm(
         .filter(|s| !s.is_empty())
         .unwrap_or("Bank transaction")
         .to_string();
-    let occurred_at = parse_transaction_datetime(data.transaction_date.as_deref());
+    let occurred_at = parse_transaction_datetime(data.transaction_date.as_deref(), email_date);
 
     Ok(CanonicalTransaction {
         amount,
@@ -83,9 +84,9 @@ pub fn canonical_from_llm(
     })
 }
 
-fn parse_transaction_datetime(raw: Option<&str>) -> DateTime<Utc> {
+fn parse_transaction_datetime(raw: Option<&str>, fallback: Option<DateTime<Utc>>) -> DateTime<Utc> {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Utc::now();
+        return fallback.unwrap_or_else(Utc::now);
     };
 
     if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
@@ -98,5 +99,5 @@ fn parse_transaction_datetime(raw: Option<&str>) -> DateTime<Utc> {
         return DateTime::<Utc>::from_naive_utc_and_offset(naive_dt, Utc);
     }
 
-    Utc::now()
+    fallback.unwrap_or_else(Utc::now)
 }
