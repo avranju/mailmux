@@ -420,7 +420,7 @@ impl MailboxWatcher {
         };
 
         match crate::db::events::insert_email_with_event(&self.pool, &new_email, &new_event).await {
-            Ok((email_id, event_id)) => {
+            Ok(Some((email_id, event_id))) => {
                 debug!(
                     account = self.account.id,
                     mailbox = self.mailbox,
@@ -432,6 +432,15 @@ impl MailboxWatcher {
                 crate::metrics::inc_messages_ingested(&self.account.id, &self.mailbox);
                 crate::metrics::inc_events_created("email_arrived");
                 Ok(1)
+            }
+            Ok(None) => {
+                debug!(
+                    account = self.account.id,
+                    mailbox = self.mailbox,
+                    uid,
+                    "skipping already-ingested message"
+                );
+                Ok(0)
             }
             Err(e) => {
                 warn!(

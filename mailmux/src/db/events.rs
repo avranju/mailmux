@@ -28,19 +28,25 @@ pub struct NewEvent {
 
 /// Insert an email and its corresponding event atomically in a single transaction.
 /// Also sends a NOTIFY to the mailmux_events channel.
-/// Returns (email_id, event_id).
+///
+/// Returns `Some((email_id, event_id))` when the email is newly inserted.
+/// Returns `None` when the email already exists (duplicate UID — no event is
+/// created, preventing the processor pipeline from re-firing for an email that
+/// has already been handled).
 pub async fn insert_email_with_event(
     pool: &PgPool,
     email: &super::emails::NewEmail,
     event: &NewEvent,
-) -> Result<(i64, i64)> {
+) -> Result<Option<(i64, i64)>> {
     let mut tx = pool.begin().await.context("beginning transaction")?;
 
+    // ON CONFLICT DO NOTHING so that a duplicate UID returns no row, letting
+    // us distinguish a fresh insert from a re-fetch of an existing message.
     let email_id = sqlx::query_scalar::<_, i64>(
         r#"
         INSERT INTO emails (account_id, mailbox_name, uid, message_id, subject, sender, recipients, date, flags, raw_message_path, size_bytes)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-        ON CONFLICT (account_id, mailbox_name, uid) DO UPDATE SET updated_at = now()
+        ON CONFLICT (account_id, mailbox_name, uid) DO NOTHING
         RETURNING id
         "#,
     )
@@ -55,9 +61,16 @@ pub async fn insert_email_with_event(
     .bind(&email.flags)
     .bind(&email.raw_message_path)
     .bind(email.size_bytes)
-    .fetch_one(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await
     .context("inserting email in transaction")?;
+
+    let Some(email_id) = email_id else {
+        // Email already exists — silently skip event creation so the processor
+        // pipeline does not re-fire for an already-ingested message.
+        tx.rollback().await.context("rolling back duplicate email transaction")?;
+        return Ok(None);
+    };
 
     let event_id = sqlx::query_scalar::<_, i64>(
         r#"
@@ -84,7 +97,7 @@ pub async fn insert_email_with_event(
 
     tx.commit().await.context("committing transaction")?;
 
-    Ok((email_id, event_id))
+    Ok(Some((email_id, event_id)))
 }
 
 /// Fetch unprocessed events (events that have no corresponding processor_jobs).

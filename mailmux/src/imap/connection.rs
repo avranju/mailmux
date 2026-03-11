@@ -394,6 +394,9 @@ impl ImapConnection {
     /// UID FETCH a range returning only UIDs — no message bodies.
     /// Used for the initial sync scan so we can find the right starting UID
     /// without downloading the full body of every message in the mailbox.
+    /// UIDs below `uid_start` are filtered out defensively: some servers
+    /// normalise an inverted range (e.g. `101:*` when `*`=100) and return
+    /// the last message even though it is below the requested start.
     pub async fn uid_fetch_uid_list(&mut self, uid_start: u32) -> Result<Vec<u32>> {
         let range = format!("{uid_start}:*");
         let tag = self.next_tag();
@@ -463,6 +466,10 @@ impl ImapConnection {
                 }
             }
         }
+
+        // Guard against servers that normalise an inverted range (e.g. `101:*`
+        // when `*`=100) and return UIDs below the requested start.
+        uids.retain(|&uid| uid >= uid_start);
 
         Ok(uids)
     }
