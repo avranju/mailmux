@@ -2,8 +2,9 @@ FROM rust:1.94-bookworm AS builder
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-COPY migrations ./migrations
+COPY mailmux ./mailmux
+COPY mailmux/migrations ./mailmux/migrations
+COPY mailtx ./mailtx
 
 RUN cargo build --release
 
@@ -14,6 +15,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/mailmux /usr/local/bin/mailmux
+COPY --from=builder /build/target/release/mailtx /usr/local/bin/mailtx
 
 RUN mkdir -p /etc/mailmux /var/lib/mailmux
 
