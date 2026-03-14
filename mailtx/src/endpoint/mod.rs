@@ -21,6 +21,7 @@ pub struct CanonicalTransaction {
     pub occurred_at: DateTime<Utc>,
     pub asset_account_id: String,
     pub tags: Vec<String>,
+    pub category_name: Option<String>,
 }
 
 pub struct PostReceipt {
@@ -35,6 +36,13 @@ pub trait TransactionEndpoint: Send + Sync {
         client: &reqwest::Client,
         tx: &CanonicalTransaction,
     ) -> Result<PostReceipt>;
+
+    /// Fetch the list of existing category names from the endpoint.
+    /// Returns an empty vec by default for endpoints that don't support categories.
+    async fn fetch_categories(&self, client: &reqwest::Client) -> Result<Vec<String>> {
+        let _ = client;
+        Ok(vec![])
+    }
 }
 
 pub fn build_endpoint(config: &Config) -> Box<dyn TransactionEndpoint> {
@@ -46,6 +54,7 @@ pub fn canonical_from_llm(
     asset_account_id: String,
     tag: String,
     email_date: Option<DateTime<Utc>>,
+    category_name: Option<String>,
 ) -> Result<CanonicalTransaction> {
     if data.status != "found" {
         anyhow::bail!("LLM status must be 'found' before posting");
@@ -81,6 +90,7 @@ pub fn canonical_from_llm(
         occurred_at,
         asset_account_id,
         tags: vec![tag],
+        category_name,
     })
 }
 

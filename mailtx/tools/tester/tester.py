@@ -98,7 +98,23 @@ proc_queue: queue.Queue[str] = queue.Queue()
 # ── mock HTTP server ─────────────────────────────────────────────────────────
 
 
+_CATEGORIES_JSON = (Path(__file__).resolve().parent / "categories.json").read_bytes()
+
+
 class MockFireflyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith("/v1/categories"):
+            http_queue.put("── Incoming GET /v1/categories─────────────────────")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(_CATEGORIES_JSON)))
+            self.end_headers()
+            self.wfile.write(_CATEGORIES_JSON)
+        else:
+            http_queue.put(f"── Incoming GET {self.path}─────────────────────")
+            self.send_response(404)
+            self.end_headers()
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)

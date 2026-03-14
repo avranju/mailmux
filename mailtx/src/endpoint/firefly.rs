@@ -55,6 +55,7 @@ impl FireflyEndpoint {
                 destination_name: None,
                 currency_code: self.currency_code.as_deref(),
                 tags: tx.tags.as_slice(),
+                category_name: tx.category_name.as_deref(),
             },
             TransactionKind::Deposit => TransactionSplitStore {
                 tx_type: "deposit",
@@ -67,6 +68,7 @@ impl FireflyEndpoint {
                 destination_name: None,
                 currency_code: self.currency_code.as_deref(),
                 tags: tx.tags.as_slice(),
+                category_name: tx.category_name.as_deref(),
             },
         };
 
@@ -83,6 +85,45 @@ impl FireflyEndpoint {
 impl TransactionEndpoint for FireflyEndpoint {
     fn name(&self) -> &'static str {
         "firefly"
+    }
+
+    async fn fetch_categories(&self, client: &reqwest::Client) -> Result<Vec<String>> {
+        let mut categories = Vec::new();
+        let mut page = 1u32;
+
+        loop {
+            let url = format!("{}/v1/categories?page={page}", self.base_url);
+            let response = client
+                .get(&url)
+                .header("Authorization", self.authorization_header_value())
+                .header("Accept", "application/vnd.api+json")
+                .send()
+                .await
+                .context("fetching categories from Firefly")?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                anyhow::bail!("firefly categories endpoint returned {status}: {body}");
+            }
+
+            let data: FireflyCategoryList = response
+                .json()
+                .await
+                .context("parsing Firefly categories response")?;
+
+            for item in &data.data {
+                categories.push(item.attributes.name.clone());
+            }
+
+            // Stop when we've fetched all pages.
+            if data.meta.pagination.current_page >= data.meta.pagination.total_pages {
+                break;
+            }
+            page += 1;
+        }
+
+        Ok(categories)
     }
 
     async fn post_transaction(
@@ -144,6 +185,8 @@ struct TransactionSplitStore<'a> {
     currency_code: Option<&'a str>,
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     tags: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category_name: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -154,4 +197,31 @@ struct FireflyTransactionSingle {
 #[derive(Deserialize)]
 struct FireflyTransactionRead {
     id: String,
+}
+
+#[derive(Deserialize)]
+struct FireflyCategoryList {
+    data: Vec<FireflyCategoryRead>,
+    meta: FireflyMeta,
+}
+
+#[derive(Deserialize)]
+struct FireflyCategoryRead {
+    attributes: FireflyCategoryAttributes,
+}
+
+#[derive(Deserialize)]
+struct FireflyCategoryAttributes {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct FireflyMeta {
+    pagination: FireflyPagination,
+}
+
+#[derive(Deserialize)]
+struct FireflyPagination {
+    current_page: u32,
+    total_pages: u32,
 }

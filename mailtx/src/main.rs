@@ -69,15 +69,34 @@ async fn run() -> Result<()> {
     let llm_client = genai::Client::default();
     let http_client = reqwest::Client::new();
 
-    let tx = llm::extract_transaction(&llm_client, &config.llm_model, subject, &body).await?;
+    // Fetch existing categories from Firefly so the LLM can reuse them.
+    let categories = endpoint.fetch_categories(&http_client).await?;
+    info!(count = categories.len(), "cached Firefly categories");
+
+    let tx =
+        llm::extract_transaction(&llm_client, &config.llm_model, subject, &body, &categories)
+            .await?;
 
     if tx.status != "found" {
         info!("LLM did not find transaction data in email, skipping");
         return Ok(());
     }
 
+    let category_name = tx
+        .category
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
     let resolved = account_matcher.resolve_asset_account(subject, &body)?;
-    let canonical_tx = endpoint::canonical_from_llm(&tx, resolved.firefly_account_id.clone(), config.tag.clone(), email.date)?;
+    let canonical_tx = endpoint::canonical_from_llm(
+        &tx,
+        resolved.firefly_account_id.clone(),
+        config.tag.clone(),
+        email.date,
+        category_name,
+    )?;
     let receipt = endpoint
         .post_transaction(&http_client, &canonical_tx)
         .await?;
@@ -95,6 +114,7 @@ async fn run() -> Result<()> {
         account_match_method = resolved.method,
         account_match_value = resolved.matched_value.as_deref(),
         narration = canonical_tx.narration.as_str(),
+        category = canonical_tx.category_name.as_deref().unwrap_or("(none)"),
         "transaction posted successfully"
     );
 

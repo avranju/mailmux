@@ -14,6 +14,8 @@ pub struct TransactionData {
     pub narration: Option<String>,
     /// Transaction date/time from the email, preferably RFC3339. Can be date-only (YYYY-MM-DD).
     pub transaction_date: Option<String>,
+    /// Spending category for the transaction (e.g. "Groceries", "Dining", "Utilities").
+    pub category: Option<String>,
 }
 
 const PROMPT_TEMPLATE: &str = "\
@@ -22,17 +24,36 @@ Extract bank transaction information from the following email.
 Subject: {subject}
 
 Body:
-{body}";
+{body}
+
+{categories_section}";
 
 pub async fn extract_transaction(
     client: &Client,
     model: &str,
     subject: &str,
     body: &str,
+    existing_categories: &[String],
 ) -> Result<TransactionData> {
+    let categories_section = if existing_categories.is_empty() {
+        "Infer an appropriate spending category for this transaction (e.g. \"Groceries\", \"Dining\", \"Utilities\", \"Transport\").".to_string()
+    } else {
+        format!(
+            "Assign a spending category for this transaction. \
+             Prefer one of the following existing categories if applicable:\n{}\n\
+             If none of the existing categories fit, suggest a new short category name.",
+            existing_categories
+                .iter()
+                .map(|c| format!("- {c}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+
     let prompt = PROMPT_TEMPLATE
         .replace("{subject}", subject)
-        .replace("{body}", body);
+        .replace("{body}", body)
+        .replace("{categories_section}", &categories_section);
 
     let schema = serde_json::json!({
         "type": "object",
@@ -57,6 +78,10 @@ pub async fn extract_transaction(
             "transaction_date": {
                 "type": "string",
                 "description": "Transaction timestamp from the email. Prefer RFC3339 (e.g. 2026-02-26T13:45:00+05:30). If only date is available, return YYYY-MM-DD."
+            },
+            "category": {
+                "type": "string",
+                "description": "Spending category for the transaction. Use an existing category if applicable, otherwise suggest a concise new one."
             }
         },
         "required": ["status"]
@@ -66,7 +91,8 @@ pub async fn extract_transaction(
         ChatMessage::system(
             "You extract structured bank transaction data from notification emails. \
              Return only the JSON object, with no additional text. \
-             If transaction date/time is present, extract it into transaction_date.",
+             If transaction date/time is present, extract it into transaction_date. \
+             Always assign a spending category for the transaction.",
         ),
         ChatMessage::user(prompt),
     ]);
