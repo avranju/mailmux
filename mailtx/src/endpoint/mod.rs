@@ -7,10 +7,13 @@ use crate::llm::TransactionData;
 
 pub mod firefly;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionKind {
     Withdrawal,
     Deposit,
+    /// An inter-account transfer. `asset_account_id` is the source; the
+    /// destination is in `transfer_destination_account_id`.
+    Transfer,
 }
 
 #[derive(Debug, Clone)]
@@ -19,7 +22,11 @@ pub struct CanonicalTransaction {
     pub kind: TransactionKind,
     pub narration: String,
     pub occurred_at: DateTime<Utc>,
+    /// For Withdrawal/Transfer: the source asset account Firefly ID.
+    /// For Deposit: the destination asset account Firefly ID.
     pub asset_account_id: String,
+    /// Firefly account ID of the transfer destination. Only set when `kind == Transfer`.
+    pub transfer_destination_account_id: Option<String>,
     pub tags: Vec<String>,
     pub category_name: Option<String>,
 }
@@ -89,12 +96,13 @@ pub fn canonical_from_llm(
         narration,
         occurred_at,
         asset_account_id,
+        transfer_destination_account_id: None,
         tags: vec![tag],
         category_name,
     })
 }
 
-fn parse_transaction_datetime(raw: Option<&str>, fallback: Option<DateTime<Utc>>) -> DateTime<Utc> {
+pub fn parse_transaction_datetime(raw: Option<&str>, fallback: Option<DateTime<Utc>>) -> DateTime<Utc> {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return fallback.unwrap_or_else(Utc::now);
     };

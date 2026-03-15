@@ -146,8 +146,11 @@ environment that starts mailmux (systemd `EnvironmentFile`, Docker Compose
   triggers mailmux retry.
 - **Retries replay the full pipeline.** The LLM call is repeated on retry, so
   the downstream endpoint must be idempotent.
-- **The binary has no database access.** All state comes from stdin and env
-  vars. Do not add sqlx or any direct database dependency.
+- **State is mostly stateless.** Normal transaction processing uses only stdin
+  and env vars. When `transfer_rules` are configured, a local SQLite database
+  (`state_db` in TOML) is used to persist pending transfer legs between
+  invocations via `rusqlite` (bundled — no system library required). Do not add
+  `sqlx` or any server-backed database dependency.
 - **HTML-to-text conversion uses `html2text`** (`src/email.rs`), which is built
   on `html5ever` (the Servo HTML parser). It handles malformed HTML gracefully
   and is spec-compliant. The `width` parameter (120) controls line wrapping and

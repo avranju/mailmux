@@ -14,6 +14,34 @@ pub struct Config {
     #[serde(default = "default_tag")]
     pub tag: String,
     pub firefly: FireflyConfig,
+
+    /// Path to the SQLite database used to hold pending transfer legs.
+    /// Required when any transfer_rules are defined.
+    pub state_db: Option<String>,
+    /// How long to wait (in hours) for the counterpart leg before expiring.
+    #[serde(default = "default_transfer_match_window_hours")]
+    pub transfer_match_window_hours: u64,
+    /// Directional transfer rules used to coalesce two-leg bank transfers into
+    /// a single Firefly III "transfer" transaction.
+    #[serde(default)]
+    pub transfer_rules: Vec<TransferRule>,
+}
+
+/// A directional rule describing one transfer route between two asset accounts.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransferRule {
+    /// Local `id` of the asset account money leaves from.
+    pub source_account: String,
+    /// Local `id` of the asset account money arrives in.
+    pub destination_account: String,
+    /// All of these substrings must appear (case-insensitive) in the LLM-extracted
+    /// description of the withdrawal email for this rule to match.
+    #[serde(default)]
+    pub withdrawal_keywords: Vec<String>,
+    /// All of these substrings must appear (case-insensitive) in the LLM-extracted
+    /// description of the deposit email for this rule to match.
+    #[serde(default)]
+    pub deposit_keywords: Vec<String>,
 }
 
 fn default_llm_model() -> String {
@@ -22,6 +50,10 @@ fn default_llm_model() -> String {
 
 fn default_tag() -> String {
     "mailmux-mailtx".to_string()
+}
+
+fn default_transfer_match_window_hours() -> u64 {
+    48
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +120,13 @@ impl Config {
 
         if config.firefly.asset_accounts.is_empty() {
             anyhow::bail!("firefly.asset_accounts must contain at least one entry");
+        }
+
+        if !config.transfer_rules.is_empty() && config.state_db.is_none() {
+            anyhow::bail!(
+                "transfer_rules are configured but state_db is not set; \
+                 set state_db to a writable file path for the pending transfer store"
+            );
         }
 
         Ok(config)

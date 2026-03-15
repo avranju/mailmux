@@ -38,7 +38,10 @@ impl FireflyEndpoint {
         }
     }
 
-    fn request_payload<'a>(&'a self, tx: &'a CanonicalTransaction) -> TransactionStore<'a> {
+    fn request_payload<'a>(
+        &'a self,
+        tx: &'a CanonicalTransaction,
+    ) -> Result<TransactionStore<'a>> {
         let occurred_at = tx.occurred_at.to_rfc3339();
         let amount = format!("{:.2}", tx.amount.abs());
         let description = tx.narration.as_str();
@@ -46,7 +49,7 @@ impl FireflyEndpoint {
         let split = match tx.kind {
             TransactionKind::Withdrawal => TransactionSplitStore {
                 tx_type: "withdrawal",
-                date: occurred_at.clone(),
+                date: occurred_at,
                 amount,
                 description,
                 source_id: Some(tx.asset_account_id.as_str()),
@@ -70,14 +73,37 @@ impl FireflyEndpoint {
                 tags: tx.tags.as_slice(),
                 category_name: tx.category_name.as_deref(),
             },
+            TransactionKind::Transfer => {
+                let destination_id = tx
+                    .transfer_destination_account_id
+                    .as_deref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Transfer transaction is missing transfer_destination_account_id"
+                        )
+                    })?;
+                TransactionSplitStore {
+                    tx_type: "transfer",
+                    date: occurred_at,
+                    amount,
+                    description,
+                    source_id: Some(tx.asset_account_id.as_str()),
+                    source_name: None,
+                    destination_id: Some(destination_id),
+                    destination_name: None,
+                    currency_code: self.currency_code.as_deref(),
+                    tags: tx.tags.as_slice(),
+                    category_name: tx.category_name.as_deref(),
+                }
+            }
         };
 
-        TransactionStore {
+        Ok(TransactionStore {
             error_if_duplicate_hash: self.error_if_duplicate_hash,
             apply_rules: self.apply_rules,
             fire_webhooks: self.fire_webhooks,
             transactions: vec![split],
-        }
+        })
     }
 }
 
@@ -131,7 +157,7 @@ impl TransactionEndpoint for FireflyEndpoint {
         client: &reqwest::Client,
         tx: &CanonicalTransaction,
     ) -> Result<PostReceipt> {
-        let payload = self.request_payload(tx);
+        let payload = self.request_payload(tx)?;
         let response = client
             .post(self.url())
             .header("Authorization", self.authorization_header_value())
