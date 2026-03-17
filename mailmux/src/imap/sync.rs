@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::AccountConfig;
 use crate::db::emails::NewEmail;
 use crate::db::events::NewEvent;
-use crate::imap::connection::{FetchedMessage, ImapConnection};
+use crate::imap::connection::{FetchedMessage, IdleOutcome, ImapConnection};
 use crate::store::MessageStore;
 
 const FETCH_BATCH_SIZE: usize = 500;
@@ -121,6 +121,11 @@ impl MailboxWatcher {
         let mut conn = ImapConnection::connect(&self.account).await?;
         let (uid_validity, _exists) = conn.select(&self.mailbox).await?;
 
+        let heartbeat_interval = self
+            .account
+            .idle_heartbeat_interval_secs
+            .map(Duration::from_secs);
+
         // Initial sync
         self.do_incremental_sync(&mut conn, uid_validity, rate_limiter)
             .await?;
@@ -132,9 +137,8 @@ impl MailboxWatcher {
                 return Ok(());
             }
 
-            match conn.idle(&self.token).await {
-                Ok(true) => {
-                    // Got an update, do incremental sync
+            match conn.idle(&self.token, heartbeat_interval).await {
+                Ok(IdleOutcome::Update) => {
                     debug!(
                         account = self.account.id,
                         mailbox = self.mailbox,
@@ -143,8 +147,30 @@ impl MailboxWatcher {
                     self.do_incremental_sync(&mut conn, uid_validity, rate_limiter)
                         .await?;
                 }
-                Ok(false) => {
-                    // Cancelled
+                Ok(IdleOutcome::Heartbeat) => {
+                    debug!(
+                        account = self.account.id,
+                        mailbox = self.mailbox,
+                        "IDLE heartbeat fired, syncing"
+                    );
+                    let ingested = self
+                        .do_incremental_sync(&mut conn, uid_validity, rate_limiter)
+                        .await?;
+                    if ingested > 0 {
+                        warn!(
+                            account = self.account.id,
+                            mailbox = self.mailbox,
+                            ingested,
+                            "heartbeat sync found messages that IDLE missed"
+                        );
+                        crate::metrics::add_idle_heartbeat_catches(
+                            &self.account.id,
+                            &self.mailbox,
+                            ingested,
+                        );
+                    }
+                }
+                Ok(IdleOutcome::Shutdown) => {
                     let _ = conn.logout().await;
                     return Ok(());
                 }
@@ -185,6 +211,7 @@ impl MailboxWatcher {
             .await?;
         let _ = conn.logout().await;
 
+
         // Wait for next poll
         tokio::select! {
             _ = tokio::time::sleep(poll_interval) => {}
@@ -198,6 +225,7 @@ impl MailboxWatcher {
     /// Uses a UID-only scan first to avoid downloading large mailboxes in one
     /// shot, then fetches bodies in batches of FETCH_BATCH_SIZE, checkpointing
     /// after each batch so progress is not lost on interruption.
+    /// Returns the number of newly ingested messages.
     async fn do_incremental_sync(
         &self,
         conn: &mut ImapConnection,
@@ -209,7 +237,7 @@ impl MailboxWatcher {
                 governor::clock::DefaultClock,
             >,
         >,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let stored_state =
             crate::db::emails::get_mailbox_state(&self.pool, &self.account.id, &self.mailbox)
                 .await?;
@@ -251,7 +279,7 @@ impl MailboxWatcher {
                 last_seen_uid as i64,
             )
             .await?;
-            return Ok(());
+            return Ok(0);
         }
 
         // Step 2: Apply initial sync limits (only on first sync).
@@ -341,7 +369,7 @@ impl MailboxWatcher {
             "sync complete"
         );
 
-        Ok(())
+        Ok(total_ingested)
     }
 
     /// Parse and persist a single fetched message. Returns 1 on success, 0 on
