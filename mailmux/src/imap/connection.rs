@@ -534,9 +534,16 @@ impl ImapConnection {
         };
         let _handle = self.client.enqueue_command(cmd);
 
-        // Wait for IDLE to be accepted
+        // Wait for IDLE to be accepted, collecting any mailbox updates that
+        // arrive before the server sends the continuation response.  This
+        // closes the race where a new message is delivered during the ~500 ms
+        // window between the previous sync completing and IDLE being accepted:
+        // without this, the server's EXISTS notification would be silently
+        // discarded and the message would go undetected until the next
+        // unrelated IDLE wake-up.
         let timeout = self.command_timeout;
-        tokio::time::timeout(timeout, async {
+        let got_update_during_setup: bool = tokio::time::timeout(timeout, async {
+            let mut saw_update = false;
             loop {
                 let event = self
                     .stream
@@ -549,11 +556,20 @@ impl ImapConnection {
                     }
                     Event::IdleAccepted { .. } => {
                         debug!("IDLE accepted, waiting for updates");
-                        return Ok(());
+                        return Ok::<bool, anyhow::Error>(saw_update);
                     }
                     Event::IdleRejected { .. } => {
                         bail!("IDLE rejected by server");
                     }
+                    Event::DataReceived { data } => match data {
+                        Data::Exists(_) | Data::Expunge(_) | Data::Recent(_) => {
+                            debug!(data = ?data, "IDLE received mailbox update during setup");
+                            saw_update = true;
+                        }
+                        _ => {
+                            trace!(data = ?data, "ignoring non-update data during IDLE setup");
+                        }
+                    },
                     Event::StatusReceived { status } => {
                         check_status(&status, "IDLE")?;
                     }
@@ -565,6 +581,23 @@ impl ImapConnection {
         })
         .await
         .unwrap_or_else(|_| bail!("IMAP IDLE setup timed out after {}s", timeout.as_secs()))?;
+
+        // If a mailbox update arrived before IDLE was accepted, exit IDLE
+        // immediately so the caller can run an incremental sync.
+        if got_update_during_setup {
+            self.client.set_idle_done();
+            let _ = tokio::time::timeout(IDLE_DRAIN_TIMEOUT, async {
+                loop {
+                    match self.stream.next(&mut self.client).await {
+                        Ok(Event::StatusReceived { .. }) => break,
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+            })
+            .await;
+            return Ok(true);
+        }
 
         // Now in IDLE mode — wait for updates or cancellation
         let got_update = loop {
