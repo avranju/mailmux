@@ -85,6 +85,11 @@ pub struct AccountConfig {
     pub tls_ca_file: Option<String>,
     #[serde(default)]
     pub tls_accept_invalid_certs: bool,
+    /// If set, a sync is forced after this many seconds even when IDLE is
+    /// active and no server notification has arrived.  Useful as a safety
+    /// net to catch messages that IDLE silently missed.  Should be larger
+    /// than `poll_interval_secs`.  Omit or set to null to disable.
+    pub idle_heartbeat_interval_secs: Option<u64>,
 }
 
 fn default_imap_port() -> u16 {

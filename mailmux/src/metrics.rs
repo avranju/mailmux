@@ -40,6 +40,10 @@ fn describe_all() {
         "mailmux_mailboxes_monitored",
         "Number of mailboxes being monitored"
     );
+    describe_counter!(
+        "mailmux_idle_heartbeat_catches_total",
+        "Messages found by the periodic heartbeat sync that IDLE failed to deliver"
+    );
 }
 
 // --- Convenience functions for recording metrics ---
@@ -60,4 +64,9 @@ pub fn inc_processor_runs(processor: &str, status: &str) {
 
 pub fn set_mailboxes_monitored(account: &str, count: f64) {
     gauge!("mailmux_mailboxes_monitored", "account" => account.to_owned()).set(count);
+}
+
+pub fn add_idle_heartbeat_catches(account: &str, mailbox: &str, count: u64) {
+    counter!("mailmux_idle_heartbeat_catches_total", "account" => account.to_owned(), "mailbox" => mailbox.to_owned())
+        .increment(count);
 }

@@ -160,6 +160,7 @@ rate_limit_per_second = 5
 max_connections = 2
 mailboxes = ["INBOX"]
 initial_sync_max_messages = 1000
+idle_heartbeat_interval_secs = 600  # optional safety net; omit to disable
 
 [[accounts]]
 id = "work"
@@ -216,6 +217,7 @@ env = { NOTIFY_TOKEN = "${NOTIFY_TOKEN}" }
 | `imap_command_timeout_secs` | `60`       | Timeout for individual IMAP command exchanges                                                                             |
 | `tls_ca_file`               | —          | Path to a PEM file with extra CA cert(s) to trust (e.g. for local bridges with self-signed certs). Requires `tls = true`. |
 | `tls_accept_invalid_certs`  | `false`    | Disable TLS certificate verification entirely. Only for local bridges on loopback. Requires `tls = true`.                 |
+| `idle_heartbeat_interval_secs` | (none) | When IDLE is active, force a sync after this many seconds even if no server notification has arrived. Acts as a safety net for missed IDLE notifications. Should be larger than `poll_interval_secs`. Omit or set to null to disable. |
 
 > **TLS mode note:** mailmux supports **implicit TLS** only (`tls = true` wraps
 > the connection in TLS before any IMAP traffic, typically port 993). **STARTTLS**
@@ -419,6 +421,7 @@ Exported metrics:
 | `mailmux_processor_runs_total`    | counter | processor, status |
 | `mailmux_active_connections`      | gauge   | account           |
 | `mailmux_mailboxes_monitored`     | gauge   | account           |
+| `mailmux_idle_heartbeat_catches_total` | counter | account, mailbox |
 
 ## License
 

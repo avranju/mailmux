@@ -24,6 +24,17 @@ use crate::config::AccountConfig;
 
 const IDLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Outcome of an IDLE wait.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IdleOutcome {
+    /// The server sent an EXISTS/EXPUNGE/RECENT notification.
+    Update,
+    /// The heartbeat timer fired before any server notification arrived.
+    Heartbeat,
+    /// A shutdown was requested via the cancellation token.
+    Shutdown,
+}
+
 /// How long to wait for trailing FETCH responses after a tagged OK.
 /// Proton Mail Bridge sends the tagged completion before the message data;
 /// this grace period lets those responses arrive before we return.
@@ -524,9 +535,14 @@ impl ImapConnection {
     }
 
     /// Enter IMAP IDLE mode. Returns when the server sends an update
-    /// (EXISTS, EXPUNGE, etc.) or the token is cancelled.
-    /// Returns `true` if an update was received, `false` if cancelled.
-    pub async fn idle(&mut self, token: &CancellationToken) -> Result<bool> {
+    /// (EXISTS, EXPUNGE, etc.), the heartbeat timer fires, or the token
+    /// is cancelled.  If `heartbeat_interval` is `Some`, the heartbeat
+    /// branch fires after that duration with no server notification.
+    pub async fn idle(
+        &mut self,
+        token: &CancellationToken,
+        heartbeat_interval: Option<Duration>,
+    ) -> Result<IdleOutcome> {
         let tag = self.next_tag();
         let cmd = Command {
             tag,
@@ -596,18 +612,24 @@ impl ImapConnection {
                 }
             })
             .await;
-            return Ok(true);
+            return Ok(IdleOutcome::Update);
         }
 
-        // Now in IDLE mode — wait for updates or cancellation.
+        // Now in IDLE mode — wait for updates, heartbeat, or cancellation.
         // IMPORTANT: when an update arrives we queue DONE but must keep
         // looping until the server's tagged OK is received.  Breaking
         // immediately after set_idle_done() leaves the DONE acknowledgment
         // unread; the next command's response loop then consumes it and
         // returns early with an empty result, causing every post-IDLE sync
         // to report "no new messages" even when new mail is present.
+        let mut heartbeat: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            match heartbeat_interval {
+                Some(d) => Box::pin(tokio::time::sleep(d)),
+                None => Box::pin(std::future::pending()),
+            };
+
         let mut saw_update = false;
-        let got_update = loop {
+        let outcome = loop {
             tokio::select! {
                 event = self.stream.next(&mut self.client) => {
                     match event.context("during IDLE")? {
@@ -634,13 +656,31 @@ impl ImapConnection {
                             // keepalives can arrive at any time and must not
                             // cause an early exit.
                             if matches!(status, Status::Tagged(_)) {
-                                break saw_update;
+                                break IdleOutcome::Update;
                             }
                         }
                         other => {
                             trace!(event = ?other, "ignoring event during IDLE");
                         }
                     }
+                }
+                _ = &mut heartbeat => {
+                    debug!("IDLE heartbeat fired, exiting IDLE for periodic sync");
+                    if !saw_update {
+                        self.client.set_idle_done();
+                    }
+                    let _ = tokio::time::timeout(IDLE_DRAIN_TIMEOUT, async {
+                        loop {
+                            match self.stream.next(&mut self.client).await {
+                                Ok(Event::StatusReceived { .. }) => break,
+                                Ok(Event::IdleDoneSent { .. }) => continue,
+                                Ok(_) => continue,
+                                Err(_) => break,
+                            }
+                        }
+                    })
+                    .await;
+                    break IdleOutcome::Heartbeat;
                 }
                 _ = token.cancelled() => {
                     debug!("IDLE cancelled by shutdown");
@@ -659,12 +699,12 @@ impl ImapConnection {
                             }
                         }
                     }).await;
-                    break false;
+                    break IdleOutcome::Shutdown;
                 }
             }
         };
 
-        Ok(got_update)
+        Ok(outcome)
     }
 
     /// Send LOGOUT.
