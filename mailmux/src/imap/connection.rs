@@ -599,7 +599,14 @@ impl ImapConnection {
             return Ok(true);
         }
 
-        // Now in IDLE mode — wait for updates or cancellation
+        // Now in IDLE mode — wait for updates or cancellation.
+        // IMPORTANT: when an update arrives we queue DONE but must keep
+        // looping until the server's tagged OK is received.  Breaking
+        // immediately after set_idle_done() leaves the DONE acknowledgment
+        // unread; the next command's response loop then consumes it and
+        // returns early with an empty result, causing every post-IDLE sync
+        // to report "no new messages" even when new mail is present.
+        let mut saw_update = false;
         let got_update = loop {
             tokio::select! {
                 event = self.stream.next(&mut self.client) => {
@@ -608,9 +615,11 @@ impl ImapConnection {
                             match data {
                                 Data::Exists(_) | Data::Expunge(_) | Data::Recent(_) => {
                                     debug!(data = ?data, "IDLE received mailbox update");
-                                    // Send DONE to exit IDLE
-                                    self.client.set_idle_done();
-                                    break true;
+                                    if !saw_update {
+                                        self.client.set_idle_done();
+                                        saw_update = true;
+                                    }
+                                    // Keep looping to drain the DONE acknowledgment.
                                 }
                                 _ => {
                                     trace!(data = ?data, "IDLE received non-update data");
@@ -620,9 +629,13 @@ impl ImapConnection {
                         Event::IdleDoneSent { .. } => {
                             debug!("IDLE DONE sent");
                         }
-                        Event::StatusReceived { .. } => {
-                            // Tagged OK after DONE
-                            break true;
+                        Event::StatusReceived { status } => {
+                            // Only the tagged OK terminates IDLE; untagged * OK
+                            // keepalives can arrive at any time and must not
+                            // cause an early exit.
+                            if matches!(status, Status::Tagged(_)) {
+                                break saw_update;
+                            }
                         }
                         other => {
                             trace!(event = ?other, "ignoring event during IDLE");
@@ -631,7 +644,9 @@ impl ImapConnection {
                 }
                 _ = token.cancelled() => {
                     debug!("IDLE cancelled by shutdown");
-                    self.client.set_idle_done();
+                    if !saw_update {
+                        self.client.set_idle_done();
+                    }
                     // Drain until we get the tagged response, with a short timeout
                     // to avoid blocking shutdown indefinitely.
                     let _ = tokio::time::timeout(IDLE_DRAIN_TIMEOUT, async {
