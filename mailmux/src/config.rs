@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
 use regex::Regex;
 use serde::Deserialize;
+use tracing::warn;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -202,6 +203,18 @@ impl Config {
                     "account '{}': tls_accept_invalid_certs requires tls = true",
                     account.id
                 );
+            }
+            if let Some(heartbeat) = account.idle_heartbeat_interval_secs {
+                if heartbeat <= account.poll_interval_secs {
+                    warn!(
+                        account = account.id,
+                        heartbeat_secs = heartbeat,
+                        poll_interval_secs = account.poll_interval_secs,
+                        "idle_heartbeat_interval_secs is <= poll_interval_secs; \
+                         the heartbeat will fire more often than the polling fallback, \
+                         which is probably not what you want"
+                    );
+                }
             }
         }
 
