@@ -121,6 +121,11 @@ impl Processor for CommandProcessor {
                 stdout = %stdout,
                 "command completed successfully"
             );
+            // Try to parse stdout as a structured ProcessorOutput so the command can
+            // emit metrics. Fall back to treating stdout as a plain message string.
+            if let Ok(parsed) = serde_json::from_str::<ProcessorOutput>(stdout.as_ref()) {
+                return Ok(parsed);
+            }
             Ok(ProcessorOutput {
                 success: true,
                 message: if stdout.is_empty() {
@@ -129,6 +134,7 @@ impl Processor for CommandProcessor {
                     Some(stdout.into_owned())
                 },
                 metadata: None,
+                metrics: vec![],
             })
         } else {
             let code = output.status.code().unwrap_or(-1);
@@ -149,6 +155,7 @@ impl Processor for CommandProcessor {
                     }
                 )),
                 metadata: None,
+                metrics: vec![],
             })
         }
     }

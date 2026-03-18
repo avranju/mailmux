@@ -51,6 +51,7 @@ impl Processor for LoggerProcessor {
             success: true,
             message: Some("logged".to_string()),
             metadata: None,
+            metrics: vec![],
         })
     }
 }
