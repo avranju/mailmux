@@ -187,6 +187,9 @@ impl JobScheduler {
                 let _ = jobs::update_job_status(&self.pool, job_id, "completed", None, None, false)
                     .await;
                 crate::metrics::inc_processor_runs(processor_name, "success");
+                if !output.metrics.is_empty() {
+                    crate::metrics::record_processor_metrics(processor_name, &output.metrics);
+                }
             }
             Ok(Ok(output)) => {
                 let msg = output.message.unwrap_or_default();

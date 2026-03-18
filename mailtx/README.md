@@ -100,6 +100,64 @@ monetary amount, `"not_found"` otherwise. Processing stops without error when
 Posted to `POST /v1/transactions` under your Firefly API base URL with
 `Authorization: Bearer <token>`.
 
+## Metrics
+
+mailtx emits Prometheus metrics via mailmux's command processor stdout protocol.
+Each invocation writes a `ProcessorOutput` JSON object to stdout; mailmux reads
+it and registers the metrics under the `mailmux_proc_mailtx_` namespace in its
+`/metrics` endpoint.
+
+### Metric reference
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `mailmux_proc_mailtx_emails_processed_total` | counter | `result` | One increment per invocation, labelled with the terminal outcome |
+| `mailmux_proc_mailtx_llm_calls_total` | counter | `result` | LLM API calls attempted |
+| `mailmux_proc_mailtx_firefly_requests_total` | counter | `operation`, `result` | Firefly HTTP requests made |
+| `mailmux_proc_mailtx_account_match_total` | counter | `method` | Account-resolution attempts and the method used |
+| `mailmux_proc_mailtx_transfer_legs_stored_total` | counter | — | Transfer legs stored pending a counterpart |
+| `mailmux_proc_mailtx_transfer_coalesced_total` | counter | — | Transfers successfully coalesced from two legs |
+| `mailmux_proc_mailtx_transfer_expired_total` | counter | — | Expired transfer legs flushed as unmatched transactions |
+
+### Label values
+
+**`emails_processed_total{result=…}`**
+
+| Value | Meaning |
+|---|---|
+| `skipped_sender` | Sender not in allow-list, or no email record attached |
+| `no_transaction` | LLM returned `status=not_found` |
+| `posted` | Regular transaction posted to Firefly |
+| `transfer_stored` | First leg of a transfer stored; waiting for counterpart |
+| `transfer_coalesced` | Both transfer legs matched; transfer posted to Firefly |
+| `error` | Invocation failed (non-zero exit) |
+
+**`llm_calls_total{result=…}`**
+
+| Value | Meaning |
+|---|---|
+| `success` | LLM responded and JSON was parsed successfully |
+| `error` | API call failed or JSON parse of the response failed |
+
+**`firefly_requests_total{operation=…, result=…}`**
+
+| `operation` | Meaning |
+|---|---|
+| `get_categories` | `GET /v1/categories` (fetched once per eligible email) |
+| `post_transaction` | `POST /v1/transactions` (regular, transfer, or expired-leg flush) |
+
+`result` is `success` or `error`.
+
+**`account_match_total{method=…}`**
+
+| Value | Matching strategy used |
+|---|---|
+| `debit_card_last4` | Card number last-4 digits found in email |
+| `account_suffix` | Account suffix found in email |
+| `alias` | Alias substring match |
+| `default_fallback` | `default_asset_account_id` used |
+| `failed` | No account could be resolved (invocation errors out) |
+
 ## Prerequisites
 
 - Rust 1.80+ (edition 2024) — for `std::sync::LazyLock`

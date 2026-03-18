@@ -70,3 +70,34 @@ pub fn add_idle_heartbeat_catches(account: &str, mailbox: &str, count: u64) {
     counter!("mailmux_idle_heartbeat_catches_total", "account" => account.to_owned(), "mailbox" => mailbox.to_owned())
         .increment(count);
 }
+
+/// Record metrics emitted by a processor in its `ProcessorOutput`.
+/// Each metric is namespaced as `mailmux_proc_{processor_name}_{metric_name}`.
+pub fn record_processor_metrics(
+    processor_name: &str,
+    metrics: &[crate::processor::ProcessorMetric],
+) {
+    use crate::processor::MetricKind;
+
+    for m in metrics {
+        let full_name = format!("mailmux_proc_{}_{}", processor_name, m.name);
+        let labels: Vec<(&'static str, String)> = m
+            .labels
+            .iter()
+            .map(|(k, v)| {
+                // Leak the key string so we get a `&'static str` required by the metrics macros.
+                let key: &'static str = Box::leak(k.clone().into_boxed_str());
+                (key, v.clone())
+            })
+            .collect();
+
+        match m.kind {
+            MetricKind::Counter => {
+                counter!(full_name, &labels).increment(m.value as u64);
+            }
+            MetricKind::Gauge => {
+                gauge!(full_name, &labels).set(m.value);
+            }
+        }
+    }
+}
