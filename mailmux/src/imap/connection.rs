@@ -24,6 +24,13 @@ use crate::config::AccountConfig;
 
 const IDLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum time to sit in IDLE without any server activity before forcing a
+/// reconnect.  Acts as a safety net when no heartbeat is configured: if the
+/// TCP connection silently dies (NAT timeout, network outage, etc.) and the
+/// OS never surfaces a read error, `stream.next()` blocks forever.  This
+/// ceiling ensures we always break out and re-establish a fresh connection.
+const IDLE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// Outcome of an IDLE wait.
 #[derive(Debug, PartialEq, Eq)]
 pub enum IdleOutcome {
@@ -622,11 +629,20 @@ impl ImapConnection {
         // unread; the next command's response loop then consumes it and
         // returns early with an empty result, causing every post-IDLE sync
         // to report "no new messages" even when new mail is present.
+        let effective_heartbeat = match heartbeat_interval {
+            Some(d) if d > IDLE_INACTIVITY_TIMEOUT => {
+                tracing::warn!(
+                    requested_secs = d.as_secs(),
+                    max_secs = IDLE_INACTIVITY_TIMEOUT.as_secs(),
+                    "heartbeat interval exceeds maximum IDLE inactivity timeout, clamping"
+                );
+                IDLE_INACTIVITY_TIMEOUT
+            }
+            Some(d) => d,
+            None => IDLE_INACTIVITY_TIMEOUT,
+        };
         let mut heartbeat: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
-            match heartbeat_interval {
-                Some(d) => Box::pin(tokio::time::sleep(d)),
-                None => Box::pin(std::future::pending()),
-            };
+            Box::pin(tokio::time::sleep(effective_heartbeat));
 
         let mut saw_update = false;
         let outcome = loop {
