@@ -110,68 +110,73 @@ impl ImapConnection {
     /// Connect to an IMAP server, wait for greeting, and login.
     pub async fn connect(config: &AccountConfig) -> Result<Self> {
         let addr = format!("{}:{}", config.imap_host, config.imap_port);
+        let connect_timeout = Duration::from_secs(config.imap_command_timeout_secs);
         debug!(host = %config.imap_host, port = config.imap_port, tls = config.tls, "connecting to IMAP server");
 
-        let tcp = TcpStream::connect(&addr)
-            .await
-            .with_context(|| format!("connecting to {addr}"))?;
-
-        let stream = if config.tls {
-            let server_name: ServerName<'_> =
-                config.imap_host.clone().try_into().map_err(|e| {
-                    anyhow::anyhow!("invalid server name '{}': {e}", config.imap_host)
-                })?;
-
-            let tls_config = if config.tls_accept_invalid_certs {
-                tracing::warn!(
-                    account = %config.id,
-                    host = %config.imap_host,
-                    "TLS certificate verification is disabled — only use for local bridges on loopback"
-                );
-                Arc::new(
-                    rustls::ClientConfig::builder()
-                        .dangerous()
-                        .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
-                        .with_no_client_auth(),
-                )
-            } else {
-                let mut root_store = rustls::RootCertStore::empty();
-                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-                if let Some(ca_file) = &config.tls_ca_file {
-                    let pem = std::fs::read(ca_file)
-                        .with_context(|| format!("reading TLS CA file '{ca_file}'"))?;
-                    let certs: Vec<CertificateDer<'static>> =
-                        rustls_pemfile::certs(&mut pem.as_slice())
-                            .collect::<Result<_, _>>()
-                            .with_context(|| format!("parsing TLS CA file '{ca_file}'"))?;
-                    if certs.is_empty() {
-                        bail!("TLS CA file '{ca_file}' contains no certificates");
-                    }
-                    for cert in certs {
-                        root_store.add(cert).with_context(|| {
-                            format!("adding certificate from '{ca_file}' to trust store")
-                        })?;
-                    }
-                    debug!(account = %config.id, ca_file, "loaded custom TLS CA certificate(s)");
-                }
-
-                Arc::new(
-                    rustls::ClientConfig::builder()
-                        .with_root_certificates(root_store)
-                        .with_no_client_auth(),
-                )
-            };
-
-            let connector = tokio_rustls::TlsConnector::from(tls_config);
-            let tls_stream = connector
-                .connect(server_name.to_owned(), tcp)
+        let stream = tokio::time::timeout(connect_timeout, async {
+            let tcp = TcpStream::connect(&addr)
                 .await
-                .map_err(|e| anyhow::anyhow!(format!("TLS handshake failed: {e}")))?;
-            Stream::tls(tls_stream.into())
-        } else {
-            Stream::insecure(tcp)
-        };
+                .with_context(|| format!("connecting to {addr}"))?;
+
+            if config.tls {
+                let server_name: ServerName<'_> =
+                    config.imap_host.clone().try_into().map_err(|e| {
+                        anyhow::anyhow!("invalid server name '{}': {e}", config.imap_host)
+                    })?;
+
+                let tls_config = if config.tls_accept_invalid_certs {
+                    tracing::warn!(
+                        account = %config.id,
+                        host = %config.imap_host,
+                        "TLS certificate verification is disabled — only use for local bridges on loopback"
+                    );
+                    Arc::new(
+                        rustls::ClientConfig::builder()
+                            .dangerous()
+                            .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
+                            .with_no_client_auth(),
+                    )
+                } else {
+                    let mut root_store = rustls::RootCertStore::empty();
+                    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+                    if let Some(ca_file) = &config.tls_ca_file {
+                        let pem = std::fs::read(ca_file)
+                            .with_context(|| format!("reading TLS CA file '{ca_file}'"))?;
+                        let certs: Vec<CertificateDer<'static>> =
+                            rustls_pemfile::certs(&mut pem.as_slice())
+                                .collect::<Result<_, _>>()
+                                .with_context(|| format!("parsing TLS CA file '{ca_file}'"))?;
+                        if certs.is_empty() {
+                            bail!("TLS CA file '{ca_file}' contains no certificates");
+                        }
+                        for cert in certs {
+                            root_store.add(cert).with_context(|| {
+                                format!("adding certificate from '{ca_file}' to trust store")
+                            })?;
+                        }
+                        debug!(account = %config.id, ca_file, "loaded custom TLS CA certificate(s)");
+                    }
+
+                    Arc::new(
+                        rustls::ClientConfig::builder()
+                            .with_root_certificates(root_store)
+                            .with_no_client_auth(),
+                    )
+                };
+
+                let connector = tokio_rustls::TlsConnector::from(tls_config);
+                let tls_stream = connector
+                    .connect(server_name.to_owned(), tcp)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(format!("TLS handshake failed: {e}")))?;
+                Ok::<_, anyhow::Error>(Stream::tls(tls_stream.into()))
+            } else {
+                Ok(Stream::insecure(tcp))
+            }
+        })
+        .await
+        .unwrap_or_else(|_| bail!("IMAP connection timed out after {}s", connect_timeout.as_secs()))?;
 
         let client = Client::new(Options::default());
         let command_timeout = Duration::from_secs(config.imap_command_timeout_secs);
