@@ -7,6 +7,9 @@ use regex::Regex;
 use serde::Deserialize;
 use tracing::warn;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub general: GeneralConfig,
@@ -151,17 +154,67 @@ fn default_concurrency() -> u32 {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
+        Self::check_file_permissions(path);
+
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file: {}", path.display()))?;
 
-        let content = substitute_env_vars(&content);
-
-        let config: Config = toml::from_str(&content)
+        let mut config: Config = toml::from_str(&content)
             .with_context(|| format!("parsing config file: {}", path.display()))?;
 
         config.validate()?;
+        config.resolve_env_vars();
 
         Ok(config)
+    }
+
+    /// Warn if the config file is world-readable, since it may reference
+    /// secrets via environment variable names.
+    fn check_file_permissions(path: &Path) {
+        #[cfg(unix)]
+        {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                let mode = metadata.permissions().mode();
+                if mode & 0o004 != 0 {
+                    warn!(
+                        path = %path.display(),
+                        mode = format!("{mode:04o}"),
+                        "config file is world-readable — consider restricting \
+                         permissions to 0600 or 0640"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Substitute `${VAR}` environment variable references in all string
+    /// fields. Called after `validate()` so all values are structurally sound.
+    fn resolve_env_vars(&mut self) {
+        // General
+        substitute_env_vars(&mut self.general.data_dir);
+        substitute_env_vars(&mut self.general.log_level);
+        substitute_env_vars(&mut self.general.log_format);
+
+        // Database
+        substitute_env_vars(&mut self.database.url);
+
+        // Accounts
+        for account in &mut self.accounts {
+            substitute_env_vars(&mut account.id);
+            substitute_env_vars(&mut account.imap_host);
+            substitute_env_vars(&mut account.username);
+            substitute_env_vars(&mut account.password);
+
+            if let Some(ca_file) = &mut account.tls_ca_file {
+                substitute_env_vars(ca_file);
+            }
+        }
+
+        // Processors
+        for processor in &mut self.processors {
+            substitute_env_vars(&mut processor.name);
+            substitute_toml_value_env_vars(&mut processor.config);
+        }
     }
 
     fn validate(&self) -> Result<()> {
@@ -183,6 +236,14 @@ impl Config {
             }
             if account.username.is_empty() {
                 bail!("account '{}': username must not be empty", account.id);
+            }
+            if !is_env_var_reference(&account.password) {
+                bail!(
+                    "account '{}': password must be an environment variable \
+                     reference (e.g. password = \"${{MY_PASSWORD}}\"). \
+                     Literal passwords in config files are not allowed.",
+                    account.id
+                );
             }
             if account.mailboxes.is_empty() {
                 bail!(
@@ -257,6 +318,12 @@ impl Config {
     }
 }
 
+/// Returns `true` if the value is a `${VAR}` environment variable reference.
+fn is_env_var_reference(value: &str) -> bool {
+    let re = Regex::new(r"^\$\{[^}]+\}$").expect("valid regex");
+    re.is_match(value)
+}
+
 /// Returns `true` if the given host is a loopback address (localhost, 127.0.0.1, or [::1]).
 fn is_loopback_host(host: &str) -> bool {
     matches!(
@@ -265,15 +332,42 @@ fn is_loopback_host(host: &str) -> bool {
     )
 }
 
-/// Substitute `${VAR}` patterns with environment variable values.
-/// If the variable is not set, leave the pattern as-is.
-fn substitute_env_vars(input: &str) -> String {
+/// Substitute `${VAR}` patterns in a string with environment variable values.
+/// If the variable is not set, the pattern is left as-is.
+fn substitute_env_vars(value: &mut String) {
     let re = Regex::new(r"\$\{([^}]+)\}").expect("valid regex");
-    re.replace_all(input, |caps: &regex::Captures| {
-        let var_name = &caps[1];
-        std::env::var(var_name).unwrap_or_else(|_| caps[0].to_string())
-    })
-    .into_owned()
+    let replaced = re
+        .replace_all(value, |caps: &regex::Captures| {
+            let var_name = &caps[1];
+            std::env::var(var_name).unwrap_or_else(|_| caps[0].to_string())
+        })
+        .into_owned();
+    *value = replaced;
+}
+
+/// Recursively substitute `${VAR}` patterns in all string values within a
+/// TOML value map (used for processor config).
+fn substitute_toml_value_env_vars(map: &mut HashMap<String, toml::Value>) {
+    for value in map.values_mut() {
+        substitute_toml_value(value);
+    }
+}
+
+fn substitute_toml_value(value: &mut toml::Value) {
+    match value {
+        toml::Value::String(s) => substitute_env_vars(s),
+        toml::Value::Array(arr) => {
+            for item in arr {
+                substitute_toml_value(item);
+            }
+        }
+        toml::Value::Table(table) => {
+            for (_, v) in table.iter_mut() {
+                substitute_toml_value(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -301,7 +395,7 @@ imap_host = "imap.example.com"
 imap_port = 993
 tls = true
 username = "user@example.com"
-password = "secret"
+password = "${TEST_SECRET}"
 poll_interval_secs = 60
 mailboxes = ["INBOX"]
 
@@ -347,7 +441,7 @@ url = "postgres://localhost/mailmux"
 id = "test"
 imap_host = "imap.example.com"
 username = "a"
-password = "b"
+password = "${TEST_PASS}"
 mailboxes = ["INBOX"]
 "#;
         let f = write_temp_config(toml);
@@ -369,7 +463,7 @@ id = "test"
 enabled = false
 imap_host = "imap.example.com"
 username = "a"
-password = "b"
+password = "${TEST_PASS}"
 mailboxes = ["INBOX"]
 "#;
         let f = write_temp_config(toml);
@@ -414,14 +508,14 @@ url = "postgres://localhost/mailmux"
 id = "dup"
 imap_host = "imap.example.com"
 username = "a"
-password = "b"
+password = "${TEST_PASS}"
 mailboxes = ["INBOX"]
 
 [[accounts]]
 id = "dup"
 imap_host = "imap.example.com"
 username = "c"
-password = "d"
+password = "${TEST_PASS}"
 mailboxes = ["INBOX"]
 "#;
         let f = write_temp_config(toml);
@@ -442,7 +536,7 @@ url = "postgres://localhost/mailmux"
 id = "test"
 imap_host = "imap.example.com"
 username = "a"
-password = "b"
+password = "${TEST_PASS}"
 mailboxes = []
 "#;
         let f = write_temp_config(toml);
@@ -463,7 +557,7 @@ url = "postgres://localhost/mailmux"
 id = "test"
 imap_host = "imap.example.com"
 username = "a"
-password = "b"
+password = "${TEST_PASS}"
 mailboxes = ["INBOX"]
 
 [[processors]]
@@ -505,7 +599,7 @@ imap_host = "imap.example.com"
 tls = true
 tls_accept_invalid_certs = true
 username = "a"
-password = "b"
+password = "${TEST_PASS}"
 mailboxes = ["INBOX"]
 "#;
         let f = write_temp_config(toml);
@@ -532,7 +626,7 @@ imap_host = "localhost"
 tls = true
 tls_accept_invalid_certs = true
 username = "a"
-password = "b"
+password = "${TEST_PASS}"
 mailboxes = ["INBOX"]
 "#;
         let f = write_temp_config(toml);
@@ -555,11 +649,85 @@ imap_host = "127.0.0.1"
 tls = true
 tls_accept_invalid_certs = true
 username = "a"
-password = "b"
+password = "${TEST_PASS}"
 mailboxes = ["INBOX"]
 "#;
         let f = write_temp_config(toml);
         let config = Config::load(f.path()).unwrap();
         assert!(config.accounts[0].tls_accept_invalid_certs);
+    }
+
+    #[test]
+    fn test_literal_password_rejected() {
+        let toml = r#"
+[general]
+data_dir = "/tmp/mailmux"
+
+[database]
+url = "postgres://localhost/mailmux"
+
+[[accounts]]
+id = "test"
+imap_host = "imap.example.com"
+username = "a"
+password = "plaintext_secret"
+mailboxes = ["INBOX"]
+"#;
+        let f = write_temp_config(toml);
+        let err = Config::load(f.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must be an environment variable reference"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_env_var_password_accepted() {
+        let toml = r#"
+[general]
+data_dir = "/tmp/mailmux"
+
+[database]
+url = "postgres://localhost/mailmux"
+
+[[accounts]]
+id = "test"
+imap_host = "imap.example.com"
+username = "a"
+password = "${SOME_PASSWORD}"
+mailboxes = ["INBOX"]
+"#;
+        let f = write_temp_config(toml);
+        let config = Config::load(f.path()).unwrap();
+        assert_eq!(config.accounts[0].id, "test");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_world_readable_config_warns() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let toml = r#"
+[general]
+data_dir = "/tmp/mailmux"
+
+[database]
+url = "postgres://localhost/mailmux"
+
+[[accounts]]
+id = "test"
+imap_host = "imap.example.com"
+username = "a"
+password = "${TEST_PASS}"
+mailboxes = ["INBOX"]
+"#;
+        let f = write_temp_config(toml);
+        // Make the file world-readable
+        std::fs::set_permissions(f.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Should succeed but emit a warning (we just verify it doesn't error)
+        let config = Config::load(f.path()).unwrap();
+        assert_eq!(config.accounts[0].id, "test");
     }
 }
