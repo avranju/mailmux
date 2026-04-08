@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tracing::debug;
 
 /// Filesystem-backed store for raw RFC 5322 email messages.
@@ -24,10 +24,27 @@ impl MessageStore {
         uid: u32,
         raw_bytes: &[u8],
     ) -> Result<PathBuf> {
-        let dir = self.data_dir.join(account_id).join(sanitize_path(mailbox));
+        let safe_account = sanitize_filename::sanitize(account_id);
+        let safe_mailbox = sanitize_filename::sanitize(mailbox);
+        let dir = self.data_dir.join(&safe_account).join(&safe_mailbox);
+
         tokio::fs::create_dir_all(&dir)
             .await
             .with_context(|| format!("creating directory: {}", dir.display()))?;
+
+        // Verify the resolved path is still under data_dir. This catches
+        // symlink-based escapes that sanitization alone cannot prevent.
+        let canonical_dir = dir.canonicalize()
+            .with_context(|| format!("canonicalizing directory: {}", dir.display()))?;
+        let canonical_data_dir = self.data_dir.canonicalize()
+            .with_context(|| format!("canonicalizing data_dir: {}", self.data_dir.display()))?;
+        if !canonical_dir.starts_with(&canonical_data_dir) {
+            bail!(
+                "directory {} escapes data_dir {}",
+                canonical_dir.display(),
+                canonical_data_dir.display()
+            );
+        }
 
         let path = dir.join(format!("{uid}.eml"));
         tokio::fs::write(&path, raw_bytes)
@@ -53,12 +70,6 @@ impl MessageStore {
             .await
             .with_context(|| format!("deleting message: {}", path.display()))
     }
-}
-
-/// Sanitize a mailbox name for use as a directory name.
-/// Replaces `/` and other problematic characters with `_`.
-fn sanitize_path(mailbox: &str) -> String {
-    mailbox.replace(['/', '\\', '\0'], "_")
 }
 
 #[cfg(test)]
@@ -94,9 +105,28 @@ mod tests {
         assert!(!path.exists());
     }
 
-    #[test]
-    fn test_sanitize_path() {
-        assert_eq!(sanitize_path("INBOX"), "INBOX");
-        assert_eq!(sanitize_path("Folder/Sub"), "Folder_Sub");
+    #[tokio::test]
+    async fn test_malicious_mailbox_name_sanitized() {
+        let dir = TempDir::new().unwrap();
+        let store = MessageStore::new(dir.path().to_str().unwrap());
+
+        let raw = b"test message";
+        let path = store.save("acct1", "../../etc", 1, raw).await.unwrap();
+
+        // sanitize-filename replaces ".." so the path stays under data_dir
+        assert!(path.starts_with(dir.path()));
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_slash_in_mailbox_name_sanitized() {
+        let dir = TempDir::new().unwrap();
+        let store = MessageStore::new(dir.path().to_str().unwrap());
+
+        let raw = b"test message";
+        let path = store.save("acct1", "Folder/Sub", 1, raw).await.unwrap();
+
+        assert!(path.starts_with(dir.path()));
+        assert!(path.exists());
     }
 }
