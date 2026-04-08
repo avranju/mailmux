@@ -204,6 +204,14 @@ impl Config {
                     account.id
                 );
             }
+            if account.tls_accept_invalid_certs && !is_loopback_host(&account.imap_host) {
+                bail!(
+                    "account '{}': tls_accept_invalid_certs is only allowed for loopback addresses \
+                     (localhost, 127.0.0.1, [::1]). Disabling certificate verification for \
+                     remote hosts exposes the connection to man-in-the-middle attacks.",
+                    account.id
+                );
+            }
             if let Some(heartbeat) = account.idle_heartbeat_interval_secs {
                 if heartbeat <= account.poll_interval_secs {
                     warn!(
@@ -247,6 +255,14 @@ impl Config {
 
         Ok(())
     }
+}
+
+/// Returns `true` if the given host is a loopback address (localhost, 127.0.0.1, or [::1]).
+fn is_loopback_host(host: &str) -> bool {
+    matches!(
+        host,
+        "localhost" | "127.0.0.1" | "::1" | "[::1]"
+    )
 }
 
 /// Substitute `${VAR}` patterns with environment variable values.
@@ -472,5 +488,78 @@ url = "postgres://localhost/mailmux"
         let f = write_temp_config(toml);
         let err = Config::load(f.path()).unwrap_err();
         assert!(err.to_string().contains("at least one account"));
+    }
+
+    #[test]
+    fn test_tls_accept_invalid_certs_rejected_for_remote_host() {
+        let toml = r#"
+[general]
+data_dir = "/tmp/mailmux"
+
+[database]
+url = "postgres://localhost/mailmux"
+
+[[accounts]]
+id = "test"
+imap_host = "imap.example.com"
+tls = true
+tls_accept_invalid_certs = true
+username = "a"
+password = "b"
+mailboxes = ["INBOX"]
+"#;
+        let f = write_temp_config(toml);
+        let err = Config::load(f.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only allowed for loopback addresses"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_tls_accept_invalid_certs_allowed_for_localhost() {
+        let toml = r#"
+[general]
+data_dir = "/tmp/mailmux"
+
+[database]
+url = "postgres://localhost/mailmux"
+
+[[accounts]]
+id = "test"
+imap_host = "localhost"
+tls = true
+tls_accept_invalid_certs = true
+username = "a"
+password = "b"
+mailboxes = ["INBOX"]
+"#;
+        let f = write_temp_config(toml);
+        let config = Config::load(f.path()).unwrap();
+        assert!(config.accounts[0].tls_accept_invalid_certs);
+    }
+
+    #[test]
+    fn test_tls_accept_invalid_certs_allowed_for_127_0_0_1() {
+        let toml = r#"
+[general]
+data_dir = "/tmp/mailmux"
+
+[database]
+url = "postgres://localhost/mailmux"
+
+[[accounts]]
+id = "test"
+imap_host = "127.0.0.1"
+tls = true
+tls_accept_invalid_certs = true
+username = "a"
+password = "b"
+mailboxes = ["INBOX"]
+"#;
+        let f = write_temp_config(toml);
+        let config = Config::load(f.path()).unwrap();
+        assert!(config.accounts[0].tls_accept_invalid_certs);
     }
 }
