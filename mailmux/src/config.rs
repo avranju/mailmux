@@ -473,9 +473,8 @@ mailboxes = ["INBOX"]
 
     #[test]
     fn test_env_var_substitution() {
-        // SAFETY: This test runs serially and no other thread reads this env var.
-        unsafe { std::env::set_var("TEST_MAILMUX_PASS", "my_secret") };
-        let toml = r#"
+        temp_env::with_var("TEST_MAILMUX_PASS", Some("my_secret"), || {
+            let toml = r#"
 [general]
 data_dir = "/tmp/mailmux"
 
@@ -489,10 +488,10 @@ username = "user@example.com"
 password = "${TEST_MAILMUX_PASS}"
 mailboxes = ["INBOX"]
 "#;
-        let f = write_temp_config(toml);
-        let config = Config::load(f.path()).unwrap();
-        assert_eq!(config.accounts[0].password, "my_secret");
-        unsafe { std::env::remove_var("TEST_MAILMUX_PASS") };
+            let f = write_temp_config(toml);
+            let config = Config::load(f.path()).unwrap();
+            assert_eq!(config.accounts[0].password, "my_secret");
+        });
     }
 
     #[test]
