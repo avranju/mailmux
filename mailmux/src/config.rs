@@ -159,14 +159,11 @@ impl Config {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file: {}", path.display()))?;
 
-        Self::check_raw_passwords(&content)?;
-
-        let content = substitute_env_vars(&content);
-
-        let config: Config = toml::from_str(&content)
+        let mut config: Config = toml::from_str(&content)
             .with_context(|| format!("parsing config file: {}", path.display()))?;
 
         config.validate()?;
+        config.resolve_env_vars()?;
 
         Ok(config)
     }
@@ -190,30 +187,45 @@ impl Config {
         }
     }
 
-    /// Verify that all account passwords use environment variable references
-    /// (`${VAR}`) rather than literal values in the config file.
-    fn check_raw_passwords(raw_content: &str) -> Result<()> {
-        let raw: toml::Value = toml::from_str(raw_content)
-            .context("pre-parsing config for password check")?;
-
+    /// Substitute `${VAR}` environment variable references in all string
+    /// fields.  Account passwords are required to use env var references;
+    /// literal passwords are rejected.
+    fn resolve_env_vars(&mut self) -> Result<()> {
         let env_var_re = Regex::new(r"^\$\{[^}]+\}$").expect("valid regex");
 
-        if let Some(accounts) = raw.get("accounts").and_then(|v| v.as_array()) {
-            for account in accounts {
-                let id = account
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<unknown>");
-                if let Some(password) = account.get("password").and_then(|v| v.as_str()) {
-                    if !env_var_re.is_match(password) {
-                        bail!(
-                            "account '{id}': password must be an environment variable \
-                             reference (e.g. password = \"${{MY_PASSWORD}}\"). \
-                             Literal passwords in config files are not allowed."
-                        );
-                    }
-                }
+        // General
+        substitute_env_vars(&mut self.general.data_dir);
+        substitute_env_vars(&mut self.general.log_level);
+        substitute_env_vars(&mut self.general.log_format);
+
+        // Database
+        substitute_env_vars(&mut self.database.url);
+
+        // Accounts
+        for account in &mut self.accounts {
+            substitute_env_vars(&mut account.id);
+            substitute_env_vars(&mut account.imap_host);
+            substitute_env_vars(&mut account.username);
+
+            if !env_var_re.is_match(&account.password) {
+                bail!(
+                    "account '{}': password must be an environment variable \
+                     reference (e.g. password = \"${{MY_PASSWORD}}\"). \
+                     Literal passwords in config files are not allowed.",
+                    account.id
+                );
             }
+            substitute_env_vars(&mut account.password);
+
+            if let Some(ca_file) = &mut account.tls_ca_file {
+                substitute_env_vars(ca_file);
+            }
+        }
+
+        // Processors
+        for processor in &mut self.processors {
+            substitute_env_vars(&mut processor.name);
+            substitute_toml_value_env_vars(&mut processor.config);
         }
 
         Ok(())
@@ -320,15 +332,42 @@ fn is_loopback_host(host: &str) -> bool {
     )
 }
 
-/// Substitute `${VAR}` patterns with environment variable values.
-/// If the variable is not set, leave the pattern as-is.
-fn substitute_env_vars(input: &str) -> String {
+/// Substitute `${VAR}` patterns in a string with environment variable values.
+/// If the variable is not set, the pattern is left as-is.
+fn substitute_env_vars(value: &mut String) {
     let re = Regex::new(r"\$\{([^}]+)\}").expect("valid regex");
-    re.replace_all(input, |caps: &regex::Captures| {
-        let var_name = &caps[1];
-        std::env::var(var_name).unwrap_or_else(|_| caps[0].to_string())
-    })
-    .into_owned()
+    let replaced = re
+        .replace_all(value, |caps: &regex::Captures| {
+            let var_name = &caps[1];
+            std::env::var(var_name).unwrap_or_else(|_| caps[0].to_string())
+        })
+        .into_owned();
+    *value = replaced;
+}
+
+/// Recursively substitute `${VAR}` patterns in all string values within a
+/// TOML value map (used for processor config).
+fn substitute_toml_value_env_vars(map: &mut HashMap<String, toml::Value>) {
+    for value in map.values_mut() {
+        substitute_toml_value(value);
+    }
+}
+
+fn substitute_toml_value(value: &mut toml::Value) {
+    match value {
+        toml::Value::String(s) => substitute_env_vars(s),
+        toml::Value::Array(arr) => {
+            for item in arr {
+                substitute_toml_value(item);
+            }
+        }
+        toml::Value::Table(table) => {
+            for (_, v) in table.iter_mut() {
+                substitute_toml_value(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
