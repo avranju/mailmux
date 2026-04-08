@@ -7,6 +7,9 @@ use regex::Regex;
 use serde::Deserialize;
 use tracing::warn;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub general: GeneralConfig,
@@ -151,8 +154,12 @@ fn default_concurrency() -> u32 {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
+        Self::check_file_permissions(path);
+
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file: {}", path.display()))?;
+
+        Self::check_raw_passwords(&content)?;
 
         let content = substitute_env_vars(&content);
 
@@ -162,6 +169,54 @@ impl Config {
         config.validate()?;
 
         Ok(config)
+    }
+
+    /// Warn if the config file is world-readable, since it may reference
+    /// secrets via environment variable names.
+    fn check_file_permissions(path: &Path) {
+        #[cfg(unix)]
+        {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                let mode = metadata.permissions().mode();
+                if mode & 0o004 != 0 {
+                    warn!(
+                        path = %path.display(),
+                        mode = format!("{mode:04o}"),
+                        "config file is world-readable — consider restricting \
+                         permissions to 0600 or 0640"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Verify that all account passwords use environment variable references
+    /// (`${VAR}`) rather than literal values in the config file.
+    fn check_raw_passwords(raw_content: &str) -> Result<()> {
+        let raw: toml::Value = toml::from_str(raw_content)
+            .context("pre-parsing config for password check")?;
+
+        let env_var_re = Regex::new(r"^\$\{[^}]+\}$").expect("valid regex");
+
+        if let Some(accounts) = raw.get("accounts").and_then(|v| v.as_array()) {
+            for account in accounts {
+                let id = account
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<unknown>");
+                if let Some(password) = account.get("password").and_then(|v| v.as_str()) {
+                    if !env_var_re.is_match(password) {
+                        bail!(
+                            "account '{id}': password must be an environment variable \
+                             reference (e.g. password = \"${{MY_PASSWORD}}\"). \
+                             Literal passwords in config files are not allowed."
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn validate(&self) -> Result<()> {
@@ -301,7 +356,7 @@ imap_host = "imap.example.com"
 imap_port = 993
 tls = true
 username = "user@example.com"
-password = "secret"
+password = "${TEST_SECRET}"
 poll_interval_secs = 60
 mailboxes = ["INBOX"]
 
@@ -347,7 +402,7 @@ url = "postgres://localhost/mailmux"
 id = "test"
 imap_host = "imap.example.com"
 username = "a"
-password = "b"
+password = "${TEST_PASS}"
 mailboxes = ["INBOX"]
 "#;
         let f = write_temp_config(toml);
@@ -369,7 +424,7 @@ id = "test"
 enabled = false
 imap_host = "imap.example.com"
 username = "a"
-password = "b"
+password = "${TEST_PASS}"
 mailboxes = ["INBOX"]
 "#;
         let f = write_temp_config(toml);
@@ -414,14 +469,14 @@ url = "postgres://localhost/mailmux"
 id = "dup"
 imap_host = "imap.example.com"
 username = "a"
-password = "b"
+password = "${TEST_PASS}"
 mailboxes = ["INBOX"]
 
 [[accounts]]
 id = "dup"
 imap_host = "imap.example.com"
 username = "c"
-password = "d"
+password = "${TEST_PASS}"
 mailboxes = ["INBOX"]
 "#;
         let f = write_temp_config(toml);
@@ -442,7 +497,7 @@ url = "postgres://localhost/mailmux"
 id = "test"
 imap_host = "imap.example.com"
 username = "a"
-password = "b"
+password = "${TEST_PASS}"
 mailboxes = []
 "#;
         let f = write_temp_config(toml);
@@ -463,7 +518,7 @@ url = "postgres://localhost/mailmux"
 id = "test"
 imap_host = "imap.example.com"
 username = "a"
-password = "b"
+password = "${TEST_PASS}"
 mailboxes = ["INBOX"]
 
 [[processors]]
@@ -505,7 +560,7 @@ imap_host = "imap.example.com"
 tls = true
 tls_accept_invalid_certs = true
 username = "a"
-password = "b"
+password = "${TEST_PASS}"
 mailboxes = ["INBOX"]
 "#;
         let f = write_temp_config(toml);
@@ -532,7 +587,7 @@ imap_host = "localhost"
 tls = true
 tls_accept_invalid_certs = true
 username = "a"
-password = "b"
+password = "${TEST_PASS}"
 mailboxes = ["INBOX"]
 "#;
         let f = write_temp_config(toml);
@@ -555,11 +610,85 @@ imap_host = "127.0.0.1"
 tls = true
 tls_accept_invalid_certs = true
 username = "a"
-password = "b"
+password = "${TEST_PASS}"
 mailboxes = ["INBOX"]
 "#;
         let f = write_temp_config(toml);
         let config = Config::load(f.path()).unwrap();
         assert!(config.accounts[0].tls_accept_invalid_certs);
+    }
+
+    #[test]
+    fn test_literal_password_rejected() {
+        let toml = r#"
+[general]
+data_dir = "/tmp/mailmux"
+
+[database]
+url = "postgres://localhost/mailmux"
+
+[[accounts]]
+id = "test"
+imap_host = "imap.example.com"
+username = "a"
+password = "plaintext_secret"
+mailboxes = ["INBOX"]
+"#;
+        let f = write_temp_config(toml);
+        let err = Config::load(f.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must be an environment variable reference"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_env_var_password_accepted() {
+        let toml = r#"
+[general]
+data_dir = "/tmp/mailmux"
+
+[database]
+url = "postgres://localhost/mailmux"
+
+[[accounts]]
+id = "test"
+imap_host = "imap.example.com"
+username = "a"
+password = "${SOME_PASSWORD}"
+mailboxes = ["INBOX"]
+"#;
+        let f = write_temp_config(toml);
+        let config = Config::load(f.path()).unwrap();
+        assert_eq!(config.accounts[0].id, "test");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_world_readable_config_warns() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let toml = r#"
+[general]
+data_dir = "/tmp/mailmux"
+
+[database]
+url = "postgres://localhost/mailmux"
+
+[[accounts]]
+id = "test"
+imap_host = "imap.example.com"
+username = "a"
+password = "${TEST_PASS}"
+mailboxes = ["INBOX"]
+"#;
+        let f = write_temp_config(toml);
+        // Make the file world-readable
+        std::fs::set_permissions(f.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Should succeed but emit a warning (we just verify it doesn't error)
+        let config = Config::load(f.path()).unwrap();
+        assert_eq!(config.accounts[0].id, "test");
     }
 }

@@ -1,6 +1,10 @@
 # Mailmux example configuration
 # Copy this file to config.toml and edit to suit your environment.
 # Values wrapped in ${VAR} are substituted from environment variables.
+#
+# SECURITY: Account passwords MUST use ${VAR} environment variable references.
+# Literal passwords in the config file are rejected at startup.
+# Recommended file permissions: 0600 (owner-only) or 0640 (owner + group).
 
 [general]
 # Directory where raw .eml message files are stored
