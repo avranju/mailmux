@@ -163,7 +163,7 @@ impl Config {
             .with_context(|| format!("parsing config file: {}", path.display()))?;
 
         config.validate()?;
-        config.resolve_env_vars()?;
+        config.resolve_env_vars();
 
         Ok(config)
     }
@@ -188,11 +188,8 @@ impl Config {
     }
 
     /// Substitute `${VAR}` environment variable references in all string
-    /// fields.  Account passwords are required to use env var references;
-    /// literal passwords are rejected.
-    fn resolve_env_vars(&mut self) -> Result<()> {
-        let env_var_re = Regex::new(r"^\$\{[^}]+\}$").expect("valid regex");
-
+    /// fields. Called after `validate()` so all values are structurally sound.
+    fn resolve_env_vars(&mut self) {
         // General
         substitute_env_vars(&mut self.general.data_dir);
         substitute_env_vars(&mut self.general.log_level);
@@ -206,15 +203,6 @@ impl Config {
             substitute_env_vars(&mut account.id);
             substitute_env_vars(&mut account.imap_host);
             substitute_env_vars(&mut account.username);
-
-            if !env_var_re.is_match(&account.password) {
-                bail!(
-                    "account '{}': password must be an environment variable \
-                     reference (e.g. password = \"${{MY_PASSWORD}}\"). \
-                     Literal passwords in config files are not allowed.",
-                    account.id
-                );
-            }
             substitute_env_vars(&mut account.password);
 
             if let Some(ca_file) = &mut account.tls_ca_file {
@@ -227,8 +215,6 @@ impl Config {
             substitute_env_vars(&mut processor.name);
             substitute_toml_value_env_vars(&mut processor.config);
         }
-
-        Ok(())
     }
 
     fn validate(&self) -> Result<()> {
@@ -250,6 +236,14 @@ impl Config {
             }
             if account.username.is_empty() {
                 bail!("account '{}': username must not be empty", account.id);
+            }
+            if !is_env_var_reference(&account.password) {
+                bail!(
+                    "account '{}': password must be an environment variable \
+                     reference (e.g. password = \"${{MY_PASSWORD}}\"). \
+                     Literal passwords in config files are not allowed.",
+                    account.id
+                );
             }
             if account.mailboxes.is_empty() {
                 bail!(
@@ -322,6 +316,12 @@ impl Config {
 
         Ok(())
     }
+}
+
+/// Returns `true` if the value is a `${VAR}` environment variable reference.
+fn is_env_var_reference(value: &str) -> bool {
+    let re = Regex::new(r"^\$\{[^}]+\}$").expect("valid regex");
+    re.is_match(value)
 }
 
 /// Returns `true` if the given host is a loopback address (localhost, 127.0.0.1, or [::1]).
