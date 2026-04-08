@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
     // providers are present in the dependency graph.
     rustls::crypto::ring::default_provider()
         .install_default()
-        .expect("failed to install rustls crypto provider");
+        .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
 
     let cli = cli::Cli::parse();
 

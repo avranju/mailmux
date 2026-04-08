@@ -198,9 +198,10 @@ impl ImapConnection {
         Ok(conn)
     }
 
-    fn next_tag(&mut self) -> Tag<'static> {
+    fn next_tag(&mut self) -> Result<Tag<'static>> {
         self.tag_counter += 1;
-        Tag::try_from(format!("M{}", self.tag_counter)).expect("valid tag")
+        Tag::try_from(format!("M{}", self.tag_counter))
+            .map_err(|e| anyhow::anyhow!("invalid IMAP tag 'M{}': {e}", self.tag_counter))
     }
 
     async fn wait_for_greeting(&mut self) -> Result<()> {
@@ -228,7 +229,7 @@ impl ImapConnection {
     }
 
     async fn login(&mut self, username: &str, password: &str) -> Result<()> {
-        let tag = self.next_tag();
+        let tag = self.next_tag()?;
         // Clone into owned strings so the Command is 'static
         let cmd = Command {
             tag,
@@ -265,7 +266,7 @@ impl ImapConnection {
 
     /// SELECT a mailbox. Returns (uid_validity, exists_count).
     pub async fn select(&mut self, mailbox: &str) -> Result<(u32, u32)> {
-        let tag = self.next_tag();
+        let tag = self.next_tag()?;
         let cmd = Command {
             tag,
             body: CommandBody::select(mailbox.to_owned()).context("building SELECT command")?,
@@ -330,7 +331,7 @@ impl ImapConnection {
             None => format!("{uid_start}:*"),
         };
 
-        let tag = self.next_tag();
+        let tag = self.next_tag()?;
         let sequence_set: SequenceSet = range
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid UID range: {range}"))?;
@@ -422,7 +423,7 @@ impl ImapConnection {
     /// the last message even though it is below the requested start.
     pub async fn uid_fetch_uid_list(&mut self, uid_start: u32) -> Result<Vec<u32>> {
         let range = format!("{uid_start}:*");
-        let tag = self.next_tag();
+        let tag = self.next_tag()?;
         let sequence_set: SequenceSet = range
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid UID range: {range}"))?;
@@ -499,7 +500,7 @@ impl ImapConnection {
 
     /// UID SEARCH SINCE <date> — returns UIDs of messages on or after the given date.
     pub async fn uid_search_since(&mut self, since: chrono::NaiveDate) -> Result<Vec<u32>> {
-        let tag = self.next_tag();
+        let tag = self.next_tag()?;
         let imap_date = imap_next::imap_types::datetime::NaiveDate::try_from(since)
             .context("converting date for UID SEARCH SINCE")?;
         let criteria = Vec1::from(SearchKey::Since(imap_date));
@@ -555,7 +556,7 @@ impl ImapConnection {
         token: &CancellationToken,
         heartbeat_interval: Option<Duration>,
     ) -> Result<IdleOutcome> {
-        let tag = self.next_tag();
+        let tag = self.next_tag()?;
         let cmd = Command {
             tag,
             body: CommandBody::Idle,
@@ -730,7 +731,7 @@ impl ImapConnection {
 
     /// Send LOGOUT.
     pub async fn logout(&mut self) -> Result<()> {
-        let tag = self.next_tag();
+        let tag = self.next_tag()?;
         let cmd = Command {
             tag,
             body: CommandBody::Logout,
