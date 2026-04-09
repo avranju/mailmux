@@ -141,8 +141,37 @@ impl ImapConnection {
                     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
                     if let Some(ca_file) = &config.tls_ca_file {
-                        let pem = std::fs::read(ca_file)
-                            .with_context(|| format!("reading TLS CA file '{ca_file}'"))?;
+                        let ca_path = std::path::Path::new(ca_file)
+                            .canonicalize()
+                            .with_context(|| format!("resolving TLS CA file path '{ca_file}'"))?;
+                        if !ca_path.is_file() {
+                            bail!("TLS CA path '{}' is not a regular file", ca_path.display());
+                        }
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let mode = std::fs::metadata(&ca_path)
+                                .with_context(|| {
+                                    format!(
+                                        "reading metadata for TLS CA file '{}'",
+                                        ca_path.display()
+                                    )
+                                })?
+                                .permissions()
+                                .mode();
+                            if mode & 0o002 != 0 {
+                                bail!(
+                                    "TLS CA file '{}' is world-writable (mode {:o}); \
+                                     fix permissions before use",
+                                    ca_path.display(),
+                                    mode & 0o777,
+                                );
+                            }
+                        }
+                        let pem = std::fs::read(&ca_path)
+                            .with_context(|| {
+                                format!("reading TLS CA file '{}'", ca_path.display())
+                            })?;
                         let certs: Vec<CertificateDer<'static>> =
                             rustls_pemfile::certs(&mut pem.as_slice())
                                 .collect::<Result<_, _>>()
