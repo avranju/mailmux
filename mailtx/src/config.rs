@@ -3,7 +3,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    /// Lowercase email addresses (or substrings) that are accepted as bank senders.
+    /// Lowercase email addresses that are accepted as bank senders.
     pub allowed_senders: Vec<String>,
     /// Model name passed to genai, e.g. "claude-haiku-4-5-20251001" or "gpt-4o-mini".
     /// genai infers the provider from the model name and reads the corresponding
@@ -109,14 +109,15 @@ impl Config {
             .context("MAILTX_CONFIG env var required (path to TOML config file)")?;
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading config file: {path}"))?;
-        let mut config: Self = toml::from_str(&content)
-            .with_context(|| format!("parsing config file: {path}"))?;
+        let mut config: Self =
+            toml::from_str(&content).with_context(|| format!("parsing config file: {path}"))?;
 
-        // Normalise allowed_senders to lowercase and drop empty entries.
-        for s in &mut config.allowed_senders {
-            *s = s.trim().to_lowercase();
-        }
-        config.allowed_senders.retain(|s| !s.is_empty());
+        // Normalise allowed_senders to lowercase mailbox addresses and drop invalid entries.
+        config.allowed_senders = config
+            .allowed_senders
+            .into_iter()
+            .filter_map(|s| normalize_sender_address(&s))
+            .collect();
 
         if config.firefly.asset_accounts.is_empty() {
             anyhow::bail!("firefly.asset_accounts must contain at least one entry");
@@ -132,12 +133,126 @@ impl Config {
         Ok(config)
     }
 
-    /// Returns true if the sender (which may be in "Display Name <email>" format)
-    /// matches any entry in the allow-list.
+    /// Returns true if the sender's parsed mailbox address exactly matches an
+    /// entry in the allow-list. Display names and malformed sender strings are
+    /// never used for matching.
     pub fn sender_allowed(&self, sender: &str) -> bool {
-        let sender_lower = sender.to_lowercase();
+        let Some(sender_address) = normalize_sender_address(sender) else {
+            return false;
+        };
+
         self.allowed_senders
             .iter()
-            .any(|allowed| sender_lower.contains(allowed.as_str()))
+            .any(|allowed| sender_address == allowed.as_str())
+    }
+}
+
+fn normalize_sender_address(sender: &str) -> Option<String> {
+    let sender = sender.trim();
+    if sender.is_empty() {
+        return None;
+    }
+
+    let address = if let Some(start) = sender.find('<') {
+        let end = sender[start + 1..].find('>')? + start + 1;
+        // Reject malformed strings rather than falling back to display-name text.
+        if sender[end + 1..].trim().is_empty() && sender[start + 1..end].find('<').is_none() {
+            &sender[start + 1..end]
+        } else {
+            return None;
+        }
+    } else {
+        sender
+    }
+    .trim()
+    .to_lowercase();
+
+    if is_valid_mailbox_address(&address) {
+        Some(address)
+    } else {
+        None
+    }
+}
+
+fn is_valid_mailbox_address(address: &str) -> bool {
+    let Some((local, domain)) = address.split_once('@') else {
+        return false;
+    };
+
+    !local.is_empty()
+        && !domain.is_empty()
+        && domain.contains('.')
+        && !address
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '<' | '>' | '"'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, FireflyConfig, normalize_sender_address};
+
+    #[test]
+    fn normalizes_exact_mailbox_addresses() {
+        assert_eq!(
+            normalize_sender_address("Alerts <ALERTS@bank.example>"),
+            Some("alerts@bank.example".to_string())
+        );
+        assert_eq!(
+            normalize_sender_address(" alerts@bank.example "),
+            Some("alerts@bank.example".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_display_name_when_extracting_sender() {
+        assert_eq!(
+            normalize_sender_address("\"alerts@bank.example support\" <evil@attacker.example>"),
+            Some("evil@attacker.example".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_sender_strings() {
+        assert_eq!(
+            normalize_sender_address("alerts@bank.example support"),
+            None
+        );
+        assert_eq!(normalize_sender_address("Alerts Only"), None);
+        assert_eq!(normalize_sender_address("Alerts <not-an-address>"), None);
+        assert_eq!(
+            normalize_sender_address("Alerts <a@b.example> trailing"),
+            None
+        );
+    }
+
+    #[test]
+    fn sender_allowed_requires_exact_mailbox_match() {
+        let config = test_config(vec!["alerts@bank.example".to_string()]);
+
+        assert!(config.sender_allowed("Alerts <alerts@bank.example>"));
+        assert!(!config.sender_allowed("\"alerts@bank.example support\" <evil@attacker.example>"));
+        assert!(!config.sender_allowed("fraud-alerts@bank.example"));
+        assert!(!config.sender_allowed("alerts@bank.example.evil.example"));
+    }
+
+    fn test_config(allowed_senders: Vec<String>) -> Config {
+        Config {
+            allowed_senders,
+            llm_model: "test-model".to_string(),
+            tag: "test-tag".to_string(),
+            firefly: FireflyConfig {
+                base_url: "https://firefly.example/api".to_string(),
+                access_token: "token".to_string(),
+                asset_accounts: vec![],
+                default_asset_account_id: None,
+                currency_code: None,
+                apply_rules: false,
+                fire_webhooks: true,
+                error_if_duplicate_hash: false,
+            },
+            state_db: None,
+            transfer_match_window_hours: 48,
+            transfer_rules: vec![],
+        }
     }
 }

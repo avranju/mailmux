@@ -384,12 +384,11 @@ impl MailboxWatcher {
                 let message_id = parsed.message_id().map(|s| s.to_string());
                 let subject = parsed.subject().map(|s| s.to_string());
                 let sender = parsed.from().and_then(|addrs| {
-                    addrs.first().map(|a| match (&a.name, &a.address) {
-                        (Some(name), Some(addr)) => format!("{name} <{addr}>"),
-                        (None, Some(addr)) => addr.to_string(),
-                        (Some(name), None) => name.to_string(),
-                        (None, None) => String::new(),
-                    })
+                    addrs
+                        .first()
+                        .and_then(|a| a.address.as_deref())
+                        .map(|addr| addr.trim().to_lowercase())
+                        .filter(|addr| !addr.is_empty())
                 });
                 let recipients = parsed.to().map(|addrs| {
                     let list: Vec<String> = addrs
