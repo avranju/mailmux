@@ -102,7 +102,10 @@ pub fn canonical_from_llm(
     })
 }
 
-pub fn parse_transaction_datetime(raw: Option<&str>, fallback: Option<DateTime<Utc>>) -> DateTime<Utc> {
+pub fn parse_transaction_datetime(
+    raw: Option<&str>,
+    fallback: Option<DateTime<Utc>>,
+) -> DateTime<Utc> {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return fallback.unwrap_or_else(Utc::now);
     };

@@ -148,8 +148,8 @@ pub struct PendingStore {
 
 impl PendingStore {
     pub fn open(path: &str, window_hours: u64) -> Result<Self> {
-        let conn = Connection::open(path)
-            .with_context(|| format!("opening transfer state DB: {path}"))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("opening transfer state DB: {path}"))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS pending_transfers (
                 id                     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -206,8 +206,17 @@ impl PendingStore {
             .context("querying expired pending transfers")?;
 
         let mut out = Vec::new();
-        for (id, leg_str, amount_units, narration, category, src, dst, occurred_at_str, tags_json)
-            in rows
+        for (
+            id,
+            leg_str,
+            amount_units,
+            narration,
+            category,
+            src,
+            dst,
+            occurred_at_str,
+            tags_json,
+        ) in rows
         {
             let leg = if leg_str == "withdrawal" {
                 Leg::Withdrawal

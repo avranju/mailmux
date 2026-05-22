@@ -314,8 +314,15 @@ async fn cmd_replay(
 
         let timeout = std::time::Duration::from_secs(timeout_secs);
 
-        if let Err(e) =
-            db::jobs::update_job_status(&pool, job_id, "in_progress", None, None, db::jobs::AttemptsUpdate::Increment).await
+        if let Err(e) = db::jobs::update_job_status(
+            &pool,
+            job_id,
+            "in_progress",
+            None,
+            None,
+            db::jobs::AttemptsUpdate::Increment,
+        )
+        .await
         {
             error!(job_id, error = %e, "failed to update job status");
             continue;
@@ -325,8 +332,15 @@ async fn cmd_replay(
             Ok(Ok(output)) if output.success => {
                 info!(processor = proc_name, "replay completed successfully");
                 let msg = output.message.as_deref();
-                let _ =
-                    db::jobs::update_job_status(&pool, job_id, "completed", msg, None, db::jobs::AttemptsUpdate::None).await;
+                let _ = db::jobs::update_job_status(
+                    &pool,
+                    job_id,
+                    "completed",
+                    msg,
+                    None,
+                    db::jobs::AttemptsUpdate::None,
+                )
+                .await;
             }
             Ok(Ok(output)) => {
                 let msg = output.message.unwrap_or_default();
@@ -335,9 +349,15 @@ async fn cmd_replay(
                     message = msg,
                     "replay completed with failure"
                 );
-                let _ =
-                    db::jobs::update_job_status(&pool, job_id, "failed", Some(&msg), None, db::jobs::AttemptsUpdate::None)
-                        .await;
+                let _ = db::jobs::update_job_status(
+                    &pool,
+                    job_id,
+                    "failed",
+                    Some(&msg),
+                    None,
+                    db::jobs::AttemptsUpdate::None,
+                )
+                .await;
             }
             Ok(Err(e)) => {
                 error!(processor = proc_name, error = %e, "replay failed with error");

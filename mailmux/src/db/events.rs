@@ -68,7 +68,9 @@ pub async fn insert_email_with_event(
     let Some(email_id) = email_id else {
         // Email already exists — silently skip event creation so the processor
         // pipeline does not re-fire for an already-ingested message.
-        tx.rollback().await.context("rolling back duplicate email transaction")?;
+        tx.rollback()
+            .await
+            .context("rolling back duplicate email transaction")?;
         return Ok(None);
     };
 

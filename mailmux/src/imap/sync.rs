@@ -214,7 +214,6 @@ impl MailboxWatcher {
             .await?;
         let _ = conn.logout().await;
 
-
         // Wait for next poll
         tokio::select! {
             _ = tokio::time::sleep(poll_interval) => {}
@@ -298,8 +297,11 @@ impl MailboxWatcher {
                     "applying initial_sync_start_date filter via UID SEARCH SINCE"
                 );
                 rate_limiter.until_ready().await;
-                let since_set: std::collections::HashSet<u32> =
-                    conn.uid_search_since(start_date).await?.into_iter().collect();
+                let since_set: std::collections::HashSet<u32> = conn
+                    .uid_search_since(start_date)
+                    .await?
+                    .into_iter()
+                    .collect();
                 uids.retain(|uid| since_set.contains(uid));
             }
 

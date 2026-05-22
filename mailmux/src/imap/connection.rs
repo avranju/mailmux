@@ -5,12 +5,12 @@ use anyhow::{Context, Result, bail};
 use imap_next::client::{Client, Event, Options};
 use imap_next::imap_types::command::{Command, CommandBody};
 use imap_next::imap_types::core::{Tag, Vec1};
-use imap_next::imap_types::search::SearchKey;
 use imap_next::imap_types::fetch::{
     MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName,
 };
 use imap_next::imap_types::flag::{Flag, FlagFetch};
 use imap_next::imap_types::response::{Code, Data, Status, StatusKind};
+use imap_next::imap_types::search::SearchKey;
 use imap_next::imap_types::sequence::SequenceSet;
 use imap_next::stream::Stream;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -571,7 +571,12 @@ impl ImapConnection {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .unwrap_or_else(|_| bail!("IMAP UID SEARCH SINCE timed out after {}s", timeout.as_secs()))?;
+        .unwrap_or_else(|_| {
+            bail!(
+                "IMAP UID SEARCH SINCE timed out after {}s",
+                timeout.as_secs()
+            )
+        })?;
 
         Ok(uids)
     }

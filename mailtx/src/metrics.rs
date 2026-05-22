@@ -53,7 +53,11 @@ impl Metrics {
         let mut metrics: Vec<ProcessorMetric> = Vec::new();
 
         if let Some(result) = self.result {
-            metrics.push(counter("emails_processed_total", 1.0, &[("result", result)]));
+            metrics.push(counter(
+                "emails_processed_total",
+                1.0,
+                &[("result", result)],
+            ));
         }
 
         if let Some(result) = self.llm_result {

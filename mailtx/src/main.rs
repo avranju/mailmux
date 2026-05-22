@@ -218,8 +218,12 @@ async fn run(m: &mut Metrics) -> Result<()> {
     // Check whether this transaction is a leg of a configured transfer route.
     let tx_type = tx.transaction_type.as_deref().unwrap_or("");
     if let Some(leg) = transfer::leg_from_tx_type(tx_type)
-        && let Some(rule_match) =
-            transfer::detect_transfer_rule(&config, &resolved.account_id, &leg, &canonical_tx.narration)
+        && let Some(rule_match) = transfer::detect_transfer_rule(
+            &config,
+            &resolved.account_id,
+            &leg,
+            &canonical_tx.narration,
+        )
     {
         let store = pending_store.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
@@ -237,9 +241,7 @@ async fn run(m: &mut Metrics) -> Result<()> {
             let transfer_tx = endpoint::CanonicalTransaction {
                 kind: endpoint::TransactionKind::Transfer,
                 asset_account_id: rule_match.source_firefly_id.clone(),
-                transfer_destination_account_id: Some(
-                    rule_match.destination_firefly_id.clone(),
-                ),
+                transfer_destination_account_id: Some(rule_match.destination_firefly_id.clone()),
                 ..canonical_tx
             };
             match endpoint.post_transaction(&http_client, &transfer_tx).await {

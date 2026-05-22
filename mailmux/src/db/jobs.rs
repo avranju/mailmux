@@ -69,7 +69,8 @@ pub async fn update_job_status(
                     attempts = attempts,
                     updated_at = now()
                 WHERE id = $1
-                "#.to_string();
+                "#
+            .to_string();
             sqlx::query(&sql)
                 .bind(job_id)
                 .bind(status)
@@ -86,7 +87,8 @@ pub async fn update_job_status(
                     attempts = attempts + 1,
                     updated_at = now()
                 WHERE id = $1
-                "#.to_string();
+                "#
+            .to_string();
             sqlx::query(&sql)
                 .bind(job_id)
                 .bind(status)

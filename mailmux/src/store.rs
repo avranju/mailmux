@@ -31,7 +31,9 @@ impl MessageStore {
         // Pre-creation check: verify the logical path stays under data_dir.
         // sanitize_filename strips "..", "/" etc., so this catches anything
         // that would escape via path components alone.
-        let canonical_data_dir = self.data_dir.canonicalize()
+        let canonical_data_dir = self
+            .data_dir
+            .canonicalize()
             .with_context(|| format!("canonicalizing data_dir: {}", self.data_dir.display()))?;
         if !dir.starts_with(&self.data_dir) {
             bail!(
@@ -47,7 +49,8 @@ impl MessageStore {
 
         // Post-creation check: canonicalize to resolve symlinks and verify
         // the real path is still under data_dir.
-        let canonical_dir = dir.canonicalize()
+        let canonical_dir = dir
+            .canonicalize()
             .with_context(|| format!("canonicalizing directory: {}", dir.display()))?;
         if !canonical_dir.starts_with(&canonical_data_dir) {
             // Clean up the directory we just created before bailing.

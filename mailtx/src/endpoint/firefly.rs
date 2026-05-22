@@ -38,10 +38,7 @@ impl FireflyEndpoint {
         }
     }
 
-    fn request_payload<'a>(
-        &'a self,
-        tx: &'a CanonicalTransaction,
-    ) -> Result<TransactionStore<'a>> {
+    fn request_payload<'a>(&'a self, tx: &'a CanonicalTransaction) -> Result<TransactionStore<'a>> {
         let occurred_at = tx.occurred_at.to_rfc3339();
         let amount = format!("{:.2}", tx.amount.abs());
         let description = tx.narration.as_str();
@@ -74,14 +71,14 @@ impl FireflyEndpoint {
                 category_name: tx.category_name.as_deref(),
             },
             TransactionKind::Transfer => {
-                let destination_id = tx
-                    .transfer_destination_account_id
-                    .as_deref()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Transfer transaction is missing transfer_destination_account_id"
-                        )
-                    })?;
+                let destination_id =
+                    tx.transfer_destination_account_id
+                        .as_deref()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Transfer transaction is missing transfer_destination_account_id"
+                            )
+                        })?;
                 TransactionSplitStore {
                     tx_type: "transfer",
                     date: occurred_at,

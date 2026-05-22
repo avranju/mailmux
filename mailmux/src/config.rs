@@ -326,10 +326,7 @@ fn is_env_var_reference(value: &str) -> bool {
 
 /// Returns `true` if the given host is a loopback address (localhost, 127.0.0.1, or [::1]).
 fn is_loopback_host(host: &str) -> bool {
-    matches!(
-        host,
-        "localhost" | "127.0.0.1" | "::1" | "[::1]"
-    )
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
 }
 
 /// Substitute `${VAR}` patterns in a string with environment variable values.

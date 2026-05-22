@@ -146,8 +146,15 @@ impl JobScheduler {
         email: Option<&crate::db::emails::EmailRecord>,
         timeout_secs: u64,
     ) {
-        if let Err(e) =
-            jobs::update_job_status(&self.pool, job_id, "in_progress", None, None, jobs::AttemptsUpdate::Increment).await
+        if let Err(e) = jobs::update_job_status(
+            &self.pool,
+            job_id,
+            "in_progress",
+            None,
+            None,
+            jobs::AttemptsUpdate::Increment,
+        )
+        .await
         {
             error!(job_id, error = %e, "failed to update job status to in_progress");
             return;
@@ -184,8 +191,15 @@ impl JobScheduler {
                     event_id = event.id,
                     "processor completed"
                 );
-                let _ = jobs::update_job_status(&self.pool, job_id, "completed", None, None, jobs::AttemptsUpdate::None)
-                    .await;
+                let _ = jobs::update_job_status(
+                    &self.pool,
+                    job_id,
+                    "completed",
+                    None,
+                    None,
+                    jobs::AttemptsUpdate::None,
+                )
+                .await;
                 crate::metrics::inc_processor_runs(processor_name, "success");
                 if !output.metrics.is_empty() {
                     crate::metrics::record_processor_metrics(processor_name, &output.metrics);
