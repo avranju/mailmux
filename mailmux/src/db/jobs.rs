@@ -3,6 +3,17 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 
+/// Controls how the `attempts` column is updated when changing a job's status.
+#[derive(Debug, Clone, Copy)]
+pub enum AttemptsUpdate {
+    /// Leave the attempts count unchanged.
+    None,
+    /// Increment the current attempts count by one.
+    Increment,
+    /// Set the attempts count to the given value.
+    Set(i32),
+}
+
 /// A processor job tracking the state of processing an event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessorJob {
@@ -38,34 +49,73 @@ pub async fn create_job(pool: &PgPool, event_id: i64, processor_name: &str) -> R
     Ok(id)
 }
 
-/// Update a job's status. Pass `increment_attempts = true` only when the job
-/// is transitioning to `in_progress` so that each dispatch cycle counts as
-/// exactly one attempt.
+/// Update a job's status. Use `AttemptsUpdate::Increment` when transitioning
+/// to `in_progress` so that each dispatch cycle counts as exactly one attempt.
+/// Use `AttemptsUpdate::Set(n)` to overwrite the attempt count (e.g. resetting
+/// to zero before a replay), and `AttemptsUpdate::None` to leave it unchanged.
 pub async fn update_job_status(
     pool: &PgPool,
     job_id: i64,
     status: &str,
     error: Option<&str>,
     next_retry_at: Option<DateTime<Utc>>,
-    increment_attempts: bool,
+    attempts_update: AttemptsUpdate,
 ) -> Result<()> {
-    sqlx::query(
-        r#"
-        UPDATE processor_jobs
-        SET status = $2, last_error = $3, next_retry_at = $4,
-            attempts = CASE WHEN $5 THEN attempts + 1 ELSE attempts END,
-            updated_at = now()
-        WHERE id = $1
-        "#,
-    )
-    .bind(job_id)
-    .bind(status)
-    .bind(error)
-    .bind(next_retry_at)
-    .bind(increment_attempts)
-    .execute(pool)
-    .await
-    .context("updating job status")?;
+    match attempts_update {
+        AttemptsUpdate::None => {
+            let sql = r#"
+                UPDATE processor_jobs
+                SET status = $2, last_error = $3, next_retry_at = $4,
+                    attempts = attempts,
+                    updated_at = now()
+                WHERE id = $1
+                "#.to_string();
+            sqlx::query(&sql)
+                .bind(job_id)
+                .bind(status)
+                .bind(error)
+                .bind(next_retry_at)
+                .execute(pool)
+                .await
+                .context("updating job status")?;
+        }
+        AttemptsUpdate::Increment => {
+            let sql = r#"
+                UPDATE processor_jobs
+                SET status = $2, last_error = $3, next_retry_at = $4,
+                    attempts = attempts + 1,
+                    updated_at = now()
+                WHERE id = $1
+                "#.to_string();
+            sqlx::query(&sql)
+                .bind(job_id)
+                .bind(status)
+                .bind(error)
+                .bind(next_retry_at)
+                .execute(pool)
+                .await
+                .context("updating job status")?;
+        }
+        AttemptsUpdate::Set(n) => {
+            sqlx::query(
+                r#"
+                UPDATE processor_jobs
+                SET status = $2, last_error = $3, next_retry_at = $4,
+                    attempts = $5,
+                    updated_at = now()
+                WHERE id = $1
+                "#,
+            )
+            .bind(job_id)
+            .bind(status)
+            .bind(error)
+            .bind(next_retry_at)
+            .bind(n)
+            .execute(pool)
+            .await
+            .context("updating job status")?;
+        }
+    }
 
     Ok(())
 }
@@ -84,6 +134,29 @@ pub async fn get_job_by_id(pool: &PgPool, job_id: i64) -> Result<Option<Processo
     .fetch_optional(pool)
     .await
     .context("fetching job by id")?;
+
+    Ok(row.map(row_to_job))
+}
+
+/// Get a job by event_id and processor_name.
+pub async fn get_job_by_event_and_processor(
+    pool: &PgPool,
+    event_id: i64,
+    processor_name: &str,
+) -> Result<Option<ProcessorJob>> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, event_id, processor_name, status, attempts, last_error,
+               next_retry_at, created_at, updated_at
+        FROM processor_jobs
+        WHERE event_id = $1 AND processor_name = $2
+        "#,
+    )
+    .bind(event_id)
+    .bind(processor_name)
+    .fetch_optional(pool)
+    .await
+    .context("fetching job by event and processor")?;
 
     Ok(row.map(row_to_job))
 }

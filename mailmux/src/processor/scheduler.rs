@@ -147,7 +147,7 @@ impl JobScheduler {
         timeout_secs: u64,
     ) {
         if let Err(e) =
-            jobs::update_job_status(&self.pool, job_id, "in_progress", None, None, true).await
+            jobs::update_job_status(&self.pool, job_id, "in_progress", None, None, jobs::AttemptsUpdate::Increment).await
         {
             error!(job_id, error = %e, "failed to update job status to in_progress");
             return;
@@ -184,7 +184,7 @@ impl JobScheduler {
                     event_id = event.id,
                     "processor completed"
                 );
-                let _ = jobs::update_job_status(&self.pool, job_id, "completed", None, None, false)
+                let _ = jobs::update_job_status(&self.pool, job_id, "completed", None, None, jobs::AttemptsUpdate::None)
                     .await;
                 crate::metrics::inc_processor_runs(processor_name, "success");
                 if !output.metrics.is_empty() {
@@ -240,7 +240,7 @@ impl JobScheduler {
                 "abandoned",
                 Some(error_msg),
                 None,
-                false,
+                jobs::AttemptsUpdate::None,
             )
             .await;
         } else {
@@ -271,7 +271,7 @@ impl JobScheduler {
                 "failed",
                 Some(error_msg),
                 Some(next_retry),
-                false,
+                jobs::AttemptsUpdate::None,
             )
             .await;
         }

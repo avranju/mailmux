@@ -253,18 +253,57 @@ async fn cmd_replay(
         }
 
         let proc_name = proc.name().to_string();
-        info!(processor = proc_name, event_id, "running processor");
+        info!(processor = proc_name, event_id, "replaying processor");
 
-        // Create a new job for the replay
-        let job_id = db::jobs::create_job(&pool, event_id, &proc_name)
+        // Reuse any existing job for this event/processor, or create a new one.
+        // This allows replaying events even if they were previously processed.
+        let job_id = match db::jobs::get_job_by_event_and_processor(&pool, event_id, &proc_name)
             .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "a processor job already exists for event {} / processor '{}'",
-                    event_id,
-                    proc_name
+        {
+            Some(existing) => {
+                // Reset the existing job to pending and zero attempts so it
+                // gets a fresh set of retries (not limited by the old count).
+                db::jobs::update_job_status(
+                    &pool,
+                    existing.id,
+                    "pending",
+                    None,
+                    None,
+                    db::jobs::AttemptsUpdate::Set(0),
                 )
-            })?;
+                .await?;
+                existing.id
+            }
+            None => {
+                // Create a new job. If another process beat us to it (race),
+                // create_job returns None — in that case refetch and reset.
+                match db::jobs::create_job(&pool, event_id, &proc_name).await? {
+                    Some(id) => id,
+                    None => {
+                        let existing = db::jobs::get_job_by_event_and_processor(
+                            &pool, event_id, &proc_name,
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "job for event {} / processor '{}' vanished after create_job returned None",
+                                event_id, proc_name
+                            )
+                        })?;
+                        db::jobs::update_job_status(
+                            &pool,
+                            existing.id,
+                            "pending",
+                            None,
+                            None,
+                            db::jobs::AttemptsUpdate::Set(0),
+                        )
+                        .await?;
+                        existing.id
+                    }
+                }
+            }
+        };
 
         let timeout_secs = config
             .processors
@@ -276,7 +315,7 @@ async fn cmd_replay(
         let timeout = std::time::Duration::from_secs(timeout_secs);
 
         if let Err(e) =
-            db::jobs::update_job_status(&pool, job_id, "in_progress", None, None, true).await
+            db::jobs::update_job_status(&pool, job_id, "in_progress", None, None, db::jobs::AttemptsUpdate::Increment).await
         {
             error!(job_id, error = %e, "failed to update job status");
             continue;
@@ -287,7 +326,7 @@ async fn cmd_replay(
                 info!(processor = proc_name, "replay completed successfully");
                 let msg = output.message.as_deref();
                 let _ =
-                    db::jobs::update_job_status(&pool, job_id, "completed", msg, None, false).await;
+                    db::jobs::update_job_status(&pool, job_id, "completed", msg, None, db::jobs::AttemptsUpdate::None).await;
             }
             Ok(Ok(output)) => {
                 let msg = output.message.unwrap_or_default();
@@ -297,7 +336,7 @@ async fn cmd_replay(
                     "replay completed with failure"
                 );
                 let _ =
-                    db::jobs::update_job_status(&pool, job_id, "failed", Some(&msg), None, false)
+                    db::jobs::update_job_status(&pool, job_id, "failed", Some(&msg), None, db::jobs::AttemptsUpdate::None)
                         .await;
             }
             Ok(Err(e)) => {
@@ -308,7 +347,7 @@ async fn cmd_replay(
                     "failed",
                     Some(&e.to_string()),
                     None,
-                    false,
+                    db::jobs::AttemptsUpdate::None,
                 )
                 .await;
             }
@@ -320,7 +359,7 @@ async fn cmd_replay(
                     "failed",
                     Some("timed out"),
                     None,
-                    false,
+                    db::jobs::AttemptsUpdate::None,
                 )
                 .await;
             }
