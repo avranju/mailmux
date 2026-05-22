@@ -44,6 +44,10 @@ fn describe_all() {
         "mailmux_idle_heartbeat_catches_total",
         "Messages found by the periodic heartbeat sync that IDLE failed to deliver"
     );
+    describe_counter!(
+        "mailmux_sync_failures_total",
+        "Total number of sync cycle failures, categorized by error type"
+    );
 }
 
 // --- Convenience functions for recording metrics ---
@@ -69,6 +73,30 @@ pub fn set_mailboxes_monitored(account: &str, count: f64) {
 pub fn add_idle_heartbeat_catches(account: &str, mailbox: &str, count: u64) {
     counter!("mailmux_idle_heartbeat_catches_total", "account" => account.to_owned(), "mailbox" => mailbox.to_owned())
         .increment(count);
+}
+
+/// Categorize an error into a human-readable error type for metric labels.
+/// Authentication failures are handled separately (the watcher logs an error
+/// and exits immediately), so they are intentionally excluded here.
+pub fn classify_error(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("timed out") {
+        "connection_timeout"
+    } else if lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("network unreachable")
+        || lower.contains("no such host")
+        || lower.contains("tls")
+    {
+        "network"
+    } else {
+        "other"
+    }
+}
+
+pub fn inc_sync_failures(account: &str, mailbox: &str, error_type: &str) {
+    counter!("mailmux_sync_failures_total", "account" => account.to_owned(), "mailbox" => mailbox.to_owned(), "error_type" => error_type.to_owned())
+        .increment(1);
 }
 
 /// Record metrics emitted by a processor in its `ProcessorOutput`.

@@ -80,11 +80,14 @@ impl MailboxWatcher {
                     }
 
                     retry_attempt += 1;
+                    let error_type = crate::metrics::classify_error(&err_str);
+                    crate::metrics::inc_sync_failures(&self.account.id, &self.mailbox, error_type);
                     let delay = super::retry_delay(retry_attempt, 1000, 300_000);
                     warn!(
                         account = self.account.id,
                         mailbox = self.mailbox,
                         error = %e,
+                        error_type,
                         retry_attempt,
                         delay_ms = delay.as_millis() as u64,
                         "sync cycle failed, will retry"
