@@ -36,6 +36,12 @@ uv run tester.py <config.toml> <xai-api-key> <email.eml> [<email2.eml> ...]
    { "data": { "id": "481923" } }
    ```
 
+   > **Note:** Because the tester uses plaintext HTTP on localhost, your
+   > config file **must** include
+   > `allow_insecure_http = true` under `[firefly]`.  This override is accepted
+   > only for loopback hosts (localhost, 127.0.0.0/8, ::1) and must never be
+   > used for real Firefly servers.
+
 2. **Parses each `.eml` file** to extract the `Subject` and `From` headers.
 
 3. **Builds the stdin payload** that mailtx expects from mailmux — a JSON

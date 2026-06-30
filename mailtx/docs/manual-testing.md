@@ -41,6 +41,7 @@ default_asset_account_id = "1"
 apply_rules = false
 fire_webhooks = false
 error_if_duplicate_hash = false
+allow_insecure_http = true  # Only safe for the local mock server below
 
 [[firefly.asset_accounts]]
 id = "hdfc_savings"

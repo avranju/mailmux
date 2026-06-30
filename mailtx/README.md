@@ -98,7 +98,8 @@ monetary amount, `"not_found"` otherwise. Processing stops without error when
 ```
 
 Posted to `POST /v1/transactions` under your Firefly API base URL with
-`Authorization: Bearer <token>`.
+`Authorization: Bearer <token>`.  The base URL **must use HTTPS** — the
+`allow_insecure_http` loopback override exists only for local development.
 
 ## Metrics
 
@@ -216,7 +217,17 @@ access_token = "eyJ..."
 # apply_rules              = false
 # fire_webhooks            = true
 # error_if_duplicate_hash  = false
+# allow_insecure_http      = false
+```
 
+> **Security note:** The `Authorization: Bearer` header and all transaction
+> payloads are sent to `base_url`.  They **must never** be transmitted over
+> plaintext HTTP.  `allow_insecure_http = true` is provided only for local
+> development with `http://localhost`, `http://127.0.0.1`, or
+> `http://[::1]`.  Private/internal plaintext URLs (e.g. `http://firefly.lan`)
+> are always rejected — configure HTTPS instead.
+
+```toml
 [[firefly.asset_accounts]]
 id                 = "hdfc_9772"
 firefly_account_id = "12"

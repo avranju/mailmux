@@ -101,7 +101,15 @@ access_token = "eyJ..."
 # apply_rules              = false
 # fire_webhooks            = true
 # error_if_duplicate_hash  = false
+# allow_insecure_http      = false
+```
 
+> **Warning:** Firefly access tokens and transaction data must never be sent
+> over plaintext HTTP transport.  `allow_insecure_http = true` is provided only
+> for loopback-only local testing (localhost, 127.0.0.0/8, ::1).  Real Firefly
+> servers must use HTTPS.
+
+```toml
 [[firefly.asset_accounts]]
 id                 = "hdfc_9772"
 firefly_account_id = "12"
