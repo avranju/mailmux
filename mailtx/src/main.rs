@@ -250,6 +250,7 @@ async fn run(m: &mut Metrics) -> Result<()> {
                     m.firefly_requests.push(("post_transaction", "success"));
                     m.transfers_coalesced += 1;
                     m.result = Some("transfer_coalesced");
+                    m.firefly_transaction_id = receipt.id.clone();
                     info!(
                         endpoint_transaction_id = receipt.id.as_deref(),
                         amount = transfer_tx.amount,
@@ -297,6 +298,7 @@ async fn run(m: &mut Metrics) -> Result<()> {
         Ok(receipt) => {
             m.firefly_requests.push(("post_transaction", "success"));
             m.result = Some("posted");
+            m.firefly_transaction_id = receipt.id.clone();
             info!(
                 endpoint = endpoint.name(),
                 endpoint_transaction_id = receipt.id.as_deref(),

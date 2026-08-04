@@ -146,10 +146,13 @@ impl JobScheduler {
         email: Option<&crate::db::emails::EmailRecord>,
         timeout_secs: u64,
     ) {
+        // Clear previous output when entering in_progress so a retry/replay
+        // cannot leave a stale result visible on timeout or error.
         if let Err(e) = jobs::update_job_status(
             &self.pool,
             job_id,
             "in_progress",
+            None,
             None,
             None,
             jobs::AttemptsUpdate::Increment,
@@ -191,39 +194,88 @@ impl JobScheduler {
                     event_id = event.id,
                     "processor completed"
                 );
-                let _ = jobs::update_job_status(
+
+                // Serialize output before consuming any borrowed fields.
+                let serialized = match serde_json::to_value(&output) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!(job_id, error = %e, "failed to serialize ProcessorOutput");
+                        let _ = jobs::update_job_status(
+                            &self.pool,
+                            job_id,
+                            "completed",
+                            None,
+                            None,
+                            None,
+                            jobs::AttemptsUpdate::None,
+                        )
+                        .await;
+                        crate::metrics::inc_processor_runs(processor_name, "success");
+                        return;
+                    }
+                };
+
+                if let Err(e) = jobs::update_job_status(
                     &self.pool,
                     job_id,
                     "completed",
                     None,
                     None,
+                    Some(&serialized),
                     jobs::AttemptsUpdate::None,
                 )
-                .await;
+                .await
+                {
+                    error!(job_id, error = %e, "failed to persist completed job output");
+                }
+
                 crate::metrics::inc_processor_runs(processor_name, "success");
                 if !output.metrics.is_empty() {
                     crate::metrics::record_processor_metrics(processor_name, &output.metrics);
                 }
             }
             Ok(Ok(output)) => {
+                // success == false — persist the output alongside the failure state.
+                let serialized = match serde_json::to_value(&output) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!(job_id, error = %e, "failed to serialize ProcessorOutput");
+                        self.handle_failure(
+                            job_id,
+                            processor_name,
+                            &output.message.unwrap_or_default(),
+                            None,
+                        )
+                        .await;
+                        crate::metrics::inc_processor_runs(processor_name, "failure");
+                        return;
+                    }
+                };
                 let msg = output.message.unwrap_or_default();
-                self.handle_failure(job_id, processor_name, &msg).await;
+                self.handle_failure(job_id, processor_name, &msg, Some(&serialized))
+                    .await;
                 crate::metrics::inc_processor_runs(processor_name, "failure");
             }
             Ok(Err(e)) => {
-                self.handle_failure(job_id, processor_name, &e.to_string())
+                self.handle_failure(job_id, processor_name, &e.to_string(), None)
                     .await;
                 crate::metrics::inc_processor_runs(processor_name, "error");
             }
             Err(_) => {
-                self.handle_failure(job_id, processor_name, "execution timed out")
+                self.handle_failure(job_id, processor_name, "execution timed out", None)
                     .await;
                 crate::metrics::inc_processor_runs(processor_name, "timeout");
             }
         }
     }
 
-    async fn handle_failure(&self, job_id: i64, processor_name: &str, error_msg: &str) {
+    async fn handle_failure(
+        &self,
+        job_id: i64,
+        processor_name: &str,
+        error_msg: &str,
+        output: Option<&serde_json::Value>,
+    ) {
         let config = self.processor_configs.get(processor_name);
         let max_retries = config.map(|c| c.max_retries).unwrap_or(0);
         let backoff_secs = config.map(|c| &c.retry_backoff_secs[..]).unwrap_or(&[]);
@@ -248,15 +300,19 @@ impl JobScheduler {
                 error = error_msg,
                 "processor failed, marking as abandoned (max retries exceeded)"
             );
-            let _ = jobs::update_job_status(
+            if let Err(e) = jobs::update_job_status(
                 &self.pool,
                 job_id,
                 "abandoned",
                 Some(error_msg),
                 None,
+                output,
                 jobs::AttemptsUpdate::None,
             )
-            .await;
+            .await
+            {
+                error!(job_id, error = %e, "failed to persist abandoned job state");
+            }
         } else {
             // Map attempts → backoff schedule index. `attempts` is already 1 on the
             // first failure (incremented when transitioning to in_progress), so subtract
@@ -279,15 +335,19 @@ impl JobScheduler {
                 next_retry_secs = delay_secs,
                 "processor failed, scheduling retry"
             );
-            let _ = jobs::update_job_status(
+            if let Err(e) = jobs::update_job_status(
                 &self.pool,
                 job_id,
                 "failed",
                 Some(error_msg),
                 Some(next_retry),
+                output,
                 jobs::AttemptsUpdate::None,
             )
-            .await;
+            .await
+            {
+                error!(job_id, error = %e, "failed to persist failed job state");
+            }
         }
     }
 
@@ -345,5 +405,471 @@ impl JobScheduler {
             )
             .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::emails::EmailRecord;
+    use crate::db::events::Event;
+    use crate::processor::Processor;
+    use crate::processor::ProcessorOutput;
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+
+    /// A minimal test processor that returns a fixed ProcessorOutput.
+    struct TestProcessor {
+        name: String,
+        events: Vec<String>,
+        output: ProcessorOutput,
+    }
+
+    #[async_trait]
+    impl Processor for TestProcessor {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn subscribed_events(&self) -> &[String] {
+            &self.events
+        }
+
+        async fn process(
+            &self,
+            _event: &Event,
+            _email: Option<&EmailRecord>,
+        ) -> Result<ProcessorOutput> {
+            Ok(self.output.clone())
+        }
+    }
+
+    fn test_processor_config(name: &str, max_retries: u32, backoff: Vec<u64>) -> ProcessorConfig {
+        ProcessorConfig {
+            name: name.into(),
+            enabled: true,
+            events: vec!["email_arrived".into()],
+            max_retries,
+            retry_backoff_secs: backoff,
+            timeout_secs: 30,
+            concurrency: 1,
+            config: HashMap::new(),
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn test_scheduler_persists_posted_output(pool: PgPool) {
+        let output = ProcessorOutput {
+            success: true,
+            message: Some("posted".into()),
+            metadata: Some(serde_json::json!({
+                "outcome": "posted",
+                "firefly_transaction_id": "tx-123"
+            })),
+            metrics: vec![],
+        };
+
+        let proc = Box::new(TestProcessor {
+            name: "test_mailtx".into(),
+            events: vec!["email_arrived".into()],
+            output: output.clone(),
+        });
+
+        let registry = Arc::new(ProcessorRegistry::for_tests(vec![proc]));
+
+        // Seed event + email so the processor can run.
+        let event_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO events (event_type, account_id, mailbox_name, payload)
+            VALUES ('email_arrived', 'test', 'INBOX', '{}'::jsonb)
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("create event");
+
+        let scheduler = JobScheduler::new(
+            pool.clone(),
+            registry,
+            tokio::sync::mpsc::channel(16).1,
+            CancellationToken::new(),
+            vec![test_processor_config("test_mailtx", 0, vec![])],
+        );
+
+        let event = Event {
+            id: event_id,
+            event_type: "email_arrived".into(),
+            account_id: "test".into(),
+            mailbox_name: "INBOX".into(),
+            email_id: None,
+            payload: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        scheduler.process_events(vec![event]).await;
+
+        let job = jobs::get_job_by_event_and_processor(&pool, event_id, "test_mailtx")
+            .await
+            .expect("fetch job")
+            .expect("job should exist");
+
+        assert_eq!(job.status, "completed");
+        assert_eq!(job.output, Some(serde_json::to_value(&output).unwrap()));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn test_scheduler_persists_no_transaction_output(pool: PgPool) {
+        let output = ProcessorOutput {
+            success: true,
+            message: Some("no transaction found".into()),
+            metadata: Some(serde_json::json!({
+                "outcome": "no_transaction"
+            })),
+            metrics: vec![],
+        };
+
+        let proc = Box::new(TestProcessor {
+            name: "test_mailtx".into(),
+            events: vec!["email_arrived".into()],
+            output: output.clone(),
+        });
+
+        let registry = Arc::new(ProcessorRegistry::for_tests(vec![proc]));
+
+        let event_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO events (event_type, account_id, mailbox_name, payload)
+            VALUES ('email_arrived', 'test', 'INBOX', '{}'::jsonb)
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("create event");
+
+        let scheduler = JobScheduler::new(
+            pool.clone(),
+            registry,
+            tokio::sync::mpsc::channel(16).1,
+            CancellationToken::new(),
+            vec![test_processor_config("test_mailtx", 0, vec![])],
+        );
+
+        let event = Event {
+            id: event_id,
+            event_type: "email_arrived".into(),
+            account_id: "test".into(),
+            mailbox_name: "INBOX".into(),
+            email_id: None,
+            payload: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        scheduler.process_events(vec![event]).await;
+
+        let job = jobs::get_job_by_event_and_processor(&pool, event_id, "test_mailtx")
+            .await
+            .expect("fetch job")
+            .expect("job should exist");
+
+        assert_eq!(job.status, "completed");
+        // Assert the complete serialized output matches exactly.
+        assert_eq!(job.output, Some(serde_json::to_value(&output).unwrap()));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn test_scheduler_persists_failure_output(pool: PgPool) {
+        let output = ProcessorOutput {
+            success: false,
+            message: Some("firefly returned 500".into()),
+            metadata: Some(serde_json::json!({
+                "outcome": "error"
+            })),
+            metrics: vec![],
+        };
+
+        let proc = Box::new(TestProcessor {
+            name: "test_mailtx".into(),
+            events: vec!["email_arrived".into()],
+            output: output.clone(),
+        });
+
+        let registry = Arc::new(ProcessorRegistry::for_tests(vec![proc]));
+
+        let event_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO events (event_type, account_id, mailbox_name, payload)
+            VALUES ('email_arrived', 'test', 'INBOX', '{}'::jsonb)
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("create event");
+
+        let scheduler = JobScheduler::new(
+            pool.clone(),
+            registry,
+            tokio::sync::mpsc::channel(16).1,
+            CancellationToken::new(),
+            vec![test_processor_config("test_mailtx", 0, vec![])],
+        );
+
+        let event = Event {
+            id: event_id,
+            event_type: "email_arrived".into(),
+            account_id: "test".into(),
+            mailbox_name: "INBOX".into(),
+            email_id: None,
+            payload: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        scheduler.process_events(vec![event]).await;
+
+        let job = jobs::get_job_by_event_and_processor(&pool, event_id, "test_mailtx")
+            .await
+            .expect("fetch job")
+            .expect("job should exist");
+
+        assert_eq!(job.status, "abandoned");
+        assert!(job.last_error.is_some());
+        // Assert the complete serialized output matches exactly.
+        assert_eq!(job.output, Some(serde_json::to_value(&output).unwrap()));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn test_scheduler_retry_clears_old_output(pool: PgPool) {
+        // First run: produce an output and mark as failed (with retry configured).
+        let mut output = ProcessorOutput {
+            success: false,
+            message: Some("first attempt failed".into()),
+            metadata: Some(serde_json::json!({
+                "outcome": "error",
+                "attempt": 1
+            })),
+            metrics: vec![],
+        };
+
+        let proc = Box::new(TestProcessor {
+            name: "test_mailtx".into(),
+            events: vec!["email_arrived".into()],
+            output: output.clone(),
+        });
+
+        let registry = Arc::new(ProcessorRegistry::for_tests(vec![proc]));
+
+        let event_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO events (event_type, account_id, mailbox_name, payload)
+            VALUES ('email_arrived', 'test', 'INBOX', '{}'::jsonb)
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("create event");
+
+        let scheduler = JobScheduler::new(
+            pool.clone(),
+            registry,
+            tokio::sync::mpsc::channel(16).1,
+            CancellationToken::new(),
+            vec![test_processor_config("test_mailtx", 2, vec![0])],
+        );
+
+        let event = Event {
+            id: event_id,
+            event_type: "email_arrived".into(),
+            account_id: "test".into(),
+            mailbox_name: "INBOX".into(),
+            email_id: None,
+            payload: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        scheduler.process_events(vec![event]).await;
+
+        let job = jobs::get_job_by_event_and_processor(&pool, event_id, "test_mailtx")
+            .await
+            .expect("fetch job")
+            .expect("job should exist");
+
+        assert_eq!(job.status, "failed");
+        assert!(job.output.is_some());
+
+        // Now simulate a retry sweep — the second attempt should clear the old output
+        // before running. We'll manually trigger a retry by setting next_retry_at in the past.
+        sqlx::query(
+            "UPDATE processor_jobs SET next_retry_at = now() - interval '1 second' WHERE id = $1",
+        )
+        .bind(job.id)
+        .execute(&pool)
+        .await
+        .expect("set retry time");
+
+        // Second attempt: succeed
+        output.success = true;
+        output.message = Some("second attempt succeeded".into());
+        output.metadata = Some(serde_json::json!({
+            "outcome": "posted",
+            "attempt": 2
+        }));
+
+        // Re-register with the new output
+        let proc2 = Box::new(TestProcessor {
+            name: "test_mailtx".into(),
+            events: vec!["email_arrived".into()],
+            output: output.clone(),
+        });
+        let registry2 = Arc::new(ProcessorRegistry::for_tests(vec![proc2]));
+
+        let scheduler2 = JobScheduler::new(
+            pool.clone(),
+            registry2,
+            tokio::sync::mpsc::channel(16).1,
+            CancellationToken::new(),
+            vec![test_processor_config("test_mailtx", 2, vec![0])],
+        );
+
+        scheduler2.retry_sweep().await;
+
+        let job = jobs::get_job_by_event_and_processor(&pool, event_id, "test_mailtx")
+            .await
+            .expect("fetch job")
+            .expect("job should exist");
+
+        assert_eq!(job.status, "completed");
+        let persisted = job.output.expect("output should be persisted");
+        // Should be the second attempt's output, not the first.
+        assert_eq!(
+            persisted
+                .get("metadata")
+                .and_then(|m| m.get("attempt"))
+                .and_then(|a| a.as_i64()),
+            Some(2)
+        );
+    }
+
+    /// End-to-end regression: a CommandProcessor whose script emits structured
+    /// ProcessorOutput JSON on stdout and exits non-zero should have the full
+    /// output (metadata + metrics) persisted by the scheduler, not a synthesized
+    /// fallback.
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn test_scheduler_command_processor_structured_failure_output(pool: PgPool) {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Script emits structured ProcessorOutput and exits 1.
+        let script_content = r#"#!/bin/sh
+printf '{"success":false,"message":"firefly 500","metadata":{"outcome":"error","detail":"upstream unavailable"},"metrics":[{"name":"firefly_requests_total","kind":"counter","value":1.0,"labels":{"operation":"post_transaction","result":"error"}}]}'
+exit 1
+"#;
+        let mut script_file = NamedTempFile::new().expect("create temp script");
+        write!(script_file, "{script_content}").expect("write script");
+        let script_path = script_file.path().to_string_lossy().to_string();
+
+        // Build a command processor config pointing at the script.
+        let mut config_map: HashMap<String, toml::Value> = HashMap::new();
+        config_map.insert("command".to_string(), toml::Value::String("sh".to_string()));
+        config_map.insert(
+            "args".to_string(),
+            toml::Value::Array(vec![toml::Value::String(script_path.clone())]),
+        );
+        let cmd_config = ProcessorConfig {
+            name: "test_cmd".into(),
+            enabled: true,
+            events: vec!["email_arrived".into()],
+            max_retries: 0,
+            retry_backoff_secs: vec![],
+            timeout_secs: 10,
+            concurrency: 1,
+            config: config_map,
+        };
+
+        let cmd_proc = Box::new(crate::processor::builtin::command::CommandProcessor::new(
+            &cmd_config,
+        ));
+        let registry = Arc::new(ProcessorRegistry::for_tests(vec![cmd_proc]));
+
+        let event_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO events (event_type, account_id, mailbox_name, payload)
+            VALUES ('email_arrived', 'test', 'INBOX', '{}'::jsonb)
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("create event");
+
+        let scheduler = JobScheduler::new(
+            pool.clone(),
+            registry,
+            tokio::sync::mpsc::channel(16).1,
+            CancellationToken::new(),
+            vec![cmd_config],
+        );
+
+        let event = Event {
+            id: event_id,
+            event_type: "email_arrived".into(),
+            account_id: "test".into(),
+            mailbox_name: "INBOX".into(),
+            email_id: None,
+            payload: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        scheduler.process_events(vec![event]).await;
+
+        let job = jobs::get_job_by_event_and_processor(&pool, event_id, "test_cmd")
+            .await
+            .expect("fetch job")
+            .expect("job should exist");
+
+        // Job should be abandoned (max_retries=0) with the structured output
+        // persisted in full.
+        assert_eq!(job.status, "abandoned");
+        let output = job.output.expect("output should be persisted");
+
+        // Verify the full structured output survived unchanged.
+        assert_eq!(output.get("success").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            output.get("message").and_then(|v| v.as_str()),
+            Some("firefly 500")
+        );
+        assert_eq!(
+            output
+                .get("metadata")
+                .and_then(|m| m.get("outcome"))
+                .and_then(|v| v.as_str()),
+            Some("error")
+        );
+        assert_eq!(
+            output
+                .get("metadata")
+                .and_then(|m| m.get("detail"))
+                .and_then(|v| v.as_str()),
+            Some("upstream unavailable")
+        );
+
+        // Verify metrics survived unchanged.
+        let metrics = output.get("metrics").and_then(|v| v.as_array());
+        assert!(metrics.is_some(), "metrics should be present in output");
+        let metrics = metrics.unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(
+            metrics[0].get("name").and_then(|v| v.as_str()),
+            Some("firefly_requests_total")
+        );
+        assert_eq!(
+            metrics[0]
+                .get("labels")
+                .and_then(|l| l.get("operation"))
+                .and_then(|v| v.as_str()),
+            Some("post_transaction")
+        );
     }
 }

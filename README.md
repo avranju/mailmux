@@ -121,7 +121,7 @@ Migrations run automatically on startup. The schema creates four tables:
 | `mailbox_states` | Tracks sync state per mailbox (uid_validity, last_seen_uid) |
 | `emails`         | Email metadata with path to raw message on disk             |
 | `events`         | Append-only event log (email_arrived, etc.)                 |
-| `processor_jobs` | Processing state per event/processor pair                   |
+| `processor_jobs` | Processing state per event/processor pair; includes nullable `output` JSONB column persisting the complete ProcessorOutput from each execution. Replays clear stale output before re-executing. |
 
 ## mailmux configuration
 

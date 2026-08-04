@@ -12,7 +12,7 @@ use crate::db::emails::EmailRecord;
 use crate::db::events::Event;
 
 /// The kind of metric a processor wants to emit.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetricKind {
     Counter,
@@ -20,7 +20,7 @@ pub enum MetricKind {
 }
 
 /// A single metric emitted by a processor as part of its output.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessorMetric {
     /// Metric name, e.g. `"notifications_sent"`. Will be namespaced by the scheduler.
     pub name: String,
@@ -31,7 +31,7 @@ pub struct ProcessorMetric {
 }
 
 /// Output from a processor execution.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessorOutput {
     pub success: bool,
     pub message: Option<String>,

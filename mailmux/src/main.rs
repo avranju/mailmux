@@ -263,15 +263,8 @@ async fn cmd_replay(
             Some(existing) => {
                 // Reset the existing job to pending and zero attempts so it
                 // gets a fresh set of retries (not limited by the old count).
-                db::jobs::update_job_status(
-                    &pool,
-                    existing.id,
-                    "pending",
-                    None,
-                    None,
-                    db::jobs::AttemptsUpdate::Set(0),
-                )
-                .await?;
+                // This also clears any stale output from a previous run.
+                db::jobs::reset_job_for_replay(&pool, existing.id).await?;
                 existing.id
             }
             None => {
@@ -290,15 +283,7 @@ async fn cmd_replay(
                                 event_id, proc_name
                             )
                         })?;
-                        db::jobs::update_job_status(
-                            &pool,
-                            existing.id,
-                            "pending",
-                            None,
-                            None,
-                            db::jobs::AttemptsUpdate::Set(0),
-                        )
-                        .await?;
+                        db::jobs::reset_job_for_replay(&pool, existing.id).await?;
                         existing.id
                     }
                 }
@@ -314,10 +299,13 @@ async fn cmd_replay(
 
         let timeout = std::time::Duration::from_secs(timeout_secs);
 
+        // Clear previous output when entering in_progress so every replay
+        // attempt begins without a stale result.
         if let Err(e) = db::jobs::update_job_status(
             &pool,
             job_id,
             "in_progress",
+            None,
             None,
             None,
             db::jobs::AttemptsUpdate::Increment,
@@ -331,33 +319,74 @@ async fn cmd_replay(
         match tokio::time::timeout(timeout, proc.process(&event, email.as_ref())).await {
             Ok(Ok(output)) if output.success => {
                 info!(processor = proc_name, "replay completed successfully");
-                let msg = output.message.as_deref();
-                let _ = db::jobs::update_job_status(
+                let serialized = match serde_json::to_value(&output) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!(job_id, error = %e, "failed to serialize replay output");
+                        let _ = db::jobs::update_job_status(
+                            &pool,
+                            job_id,
+                            "completed",
+                            output.message.as_deref(),
+                            None,
+                            None,
+                            db::jobs::AttemptsUpdate::None,
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                if let Err(e) = db::jobs::update_job_status(
                     &pool,
                     job_id,
                     "completed",
-                    msg,
+                    output.message.as_deref(),
                     None,
+                    Some(&serialized),
                     db::jobs::AttemptsUpdate::None,
                 )
-                .await;
+                .await
+                {
+                    error!(job_id, error = %e, "failed to persist replay completed output");
+                }
             }
             Ok(Ok(output)) => {
-                let msg = output.message.unwrap_or_default();
+                let msg = output.message.clone().unwrap_or_default();
                 warn!(
                     processor = proc_name,
                     message = msg,
                     "replay completed with failure"
                 );
-                let _ = db::jobs::update_job_status(
+                let serialized = match serde_json::to_value(&output) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!(job_id, error = %e, "failed to serialize replay failure output");
+                        let _ = db::jobs::update_job_status(
+                            &pool,
+                            job_id,
+                            "failed",
+                            Some(&msg),
+                            None,
+                            None,
+                            db::jobs::AttemptsUpdate::None,
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                if let Err(e) = db::jobs::update_job_status(
                     &pool,
                     job_id,
                     "failed",
                     Some(&msg),
                     None,
+                    Some(&serialized),
                     db::jobs::AttemptsUpdate::None,
                 )
-                .await;
+                .await
+                {
+                    error!(job_id, error = %e, "failed to persist replay failure output");
+                }
             }
             Ok(Err(e)) => {
                 error!(processor = proc_name, error = %e, "replay failed with error");
@@ -366,6 +395,7 @@ async fn cmd_replay(
                     job_id,
                     "failed",
                     Some(&e.to_string()),
+                    None,
                     None,
                     db::jobs::AttemptsUpdate::None,
                 )
@@ -378,6 +408,7 @@ async fn cmd_replay(
                     job_id,
                     "failed",
                     Some("timed out"),
+                    None,
                     None,
                     db::jobs::AttemptsUpdate::None,
                 )

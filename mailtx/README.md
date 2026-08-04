@@ -106,7 +106,9 @@ Posted to `POST /v1/transactions` under your Firefly API base URL with
 mailtx emits Prometheus metrics via mailmux's command processor stdout protocol.
 Each invocation writes a `ProcessorOutput` JSON object to stdout; mailmux reads
 it and registers the metrics under the `mailmux_proc_mailtx_` namespace in its
-`/metrics` endpoint.
+`/metrics` endpoint.  The complete structured output is also persisted in the
+`processor_jobs.output` column, providing an authoritative per-email outcome
+record beyond aggregate metrics.
 
 ### Metric reference
 
@@ -132,6 +134,18 @@ it and registers the metrics under the `mailmux_proc_mailtx_` namespace in its
 | `transfer_stored` | First leg of a transfer stored; waiting for counterpart |
 | `transfer_coalesced` | Both transfer legs matched; transfer posted to Firefly |
 | `error` | Invocation failed (non-zero exit) |
+
+### ProcessorOutput metadata
+
+In addition to the metrics counters above, mailtx embeds outcome metadata
+inside the `ProcessorOutput.metadata` object. This metadata is persisted in
+the `processor_jobs.output` column by mailmux and serves as the authoritative
+per-email/per-processor outcome record.
+
+| Field | Type | Description |
+|---|---|---|
+| `metadata.outcome` | string | One of `posted`, `no_transaction`, `skipped_sender`, `transfer_stored`, `transfer_coalesced`, or `error` |
+| `metadata.firefly_transaction_id` | string (optional) | Firefly transaction ID when a transaction was successfully posted (regular or coalesced transfer). Absent for non-posting outcomes. |
 
 **`llm_calls_total{result=…}`**
 

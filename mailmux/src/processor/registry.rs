@@ -59,4 +59,9 @@ impl ProcessorRegistry {
             .map(|p| p.as_ref())
             .collect()
     }
+
+    #[cfg(test)]
+    pub fn for_tests(processors: Vec<Box<dyn Processor>>) -> Self {
+        Self { processors }
+    }
 }
