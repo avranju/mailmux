@@ -29,6 +29,8 @@ pub struct CanonicalTransaction {
     pub transfer_destination_account_id: Option<String>,
     pub tags: Vec<String>,
     pub category_name: Option<String>,
+    /// Stable identity of the mailmux event that caused this write.
+    pub external_id: Option<String>,
 }
 
 pub struct PostReceipt {
@@ -62,6 +64,7 @@ pub fn canonical_from_llm(
     tag: String,
     email_date: Option<DateTime<Utc>>,
     category_name: Option<String>,
+    external_id: Option<String>,
 ) -> Result<CanonicalTransaction> {
     if data.status != "found" {
         anyhow::bail!("LLM status must be 'found' before posting");
@@ -99,6 +102,7 @@ pub fn canonical_from_llm(
         transfer_destination_account_id: None,
         tags: vec![tag],
         category_name,
+        external_id,
     })
 }
 

@@ -100,7 +100,7 @@ access_token = "eyJ..."
 # currency_code            = "USD"
 # apply_rules              = false
 # fire_webhooks            = true
-# error_if_duplicate_hash  = false
+# error_if_duplicate_hash  = true
 # allow_insecure_http      = false
 ```
 

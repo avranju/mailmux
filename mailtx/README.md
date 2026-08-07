@@ -83,7 +83,7 @@ monetary amount, `"not_found"` otherwise. Processing stops without error when
 {
   "apply_rules": false,
   "fire_webhooks": true,
-  "error_if_duplicate_hash": false,
+  "error_if_duplicate_hash": true,
   "transactions": [
     {
       "type": "withdrawal",
@@ -230,7 +230,7 @@ access_token = "eyJ..."
 # currency_code            = "USD"
 # apply_rules              = false
 # fire_webhooks            = true
-# error_if_duplicate_hash  = false
+# error_if_duplicate_hash  = true
 # allow_insecure_http      = false
 ```
 
@@ -386,9 +386,10 @@ mailmux replay --event-id <id> --processor mailtx
 ## Retry behaviour
 
 mailmux retries the entire invocation on non-zero exit. This means a retry
-re-runs the LLM call even if it succeeded the first time. Firefly processing
-should therefore be configured to tolerate retries (for example by enabling
-`error_if_duplicate_hash = true` in the TOML config when duplicate hashes are available).
+re-runs the LLM call even if it succeeded the first time. Firefly writes carry a
+stable mailmux event ID as Firefly's `external_id`. On a retry, mailtx checks
+that ID before posting and treats an existing transaction as success.
+`error_if_duplicate_hash` also defaults to `true` as a backstop.
 
 ## Logging
 

@@ -89,6 +89,7 @@ async fn run(m: &mut Metrics) -> Result<()> {
                 transfer_destination_account_id: None,
                 tags,
                 category_name: expired.category.clone(),
+                external_id: expired.external_id.clone(),
             };
             match endpoint.post_transaction(&http_client, &fallback).await {
                 Ok(receipt) => {
@@ -126,6 +127,9 @@ async fn run(m: &mut Metrics) -> Result<()> {
 
     let input: input::Input =
         serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("parsing stdin JSON: {e}"))?;
+    // `events.id` is a database-global, stable identity. It survives command
+    // retries and replay, unlike any LLM-derived transaction fields.
+    let external_id = format!("mailmux:event:{}", input.event.id);
 
     let email = match &input.email {
         Some(e) => e,
@@ -212,6 +216,7 @@ async fn run(m: &mut Metrics) -> Result<()> {
         config.tag.clone(),
         email.date,
         category_name,
+        Some(external_id.clone()),
     )?;
 
     // --- Transfer detection -------------------------------------------------
@@ -268,7 +273,7 @@ async fn run(m: &mut Metrics) -> Result<()> {
             }
         } else {
             // First leg — store and wait for the counterpart.
-            store.insert(transfer::InsertLeg {
+            let inserted = store.insert(transfer::InsertLeg {
                 rule_id: &rule_match.rule_id,
                 leg: &rule_match.leg,
                 amount_units,
@@ -278,16 +283,25 @@ async fn run(m: &mut Metrics) -> Result<()> {
                 destination_firefly_id: &rule_match.destination_firefly_id,
                 occurred_at: &canonical_tx.occurred_at,
                 tags: &canonical_tx.tags,
+                external_id: canonical_tx.external_id.as_deref(),
             })?;
-            m.transfers_stored += 1;
-            m.result = Some("transfer_stored");
-            info!(
-                rule_id = rule_match.rule_id.as_str(),
-                leg = leg.as_str(),
-                amount = canonical_tx.amount,
-                narration = canonical_tx.narration.as_str(),
-                "first transfer leg stored, waiting for counterpart"
-            );
+            if inserted {
+                m.transfers_stored += 1;
+                m.result = Some("transfer_stored");
+                info!(
+                    rule_id = rule_match.rule_id.as_str(),
+                    leg = leg.as_str(),
+                    amount = canonical_tx.amount,
+                    narration = canonical_tx.narration.as_str(),
+                    "first transfer leg stored, waiting for counterpart"
+                );
+            } else {
+                m.result = Some("transfer_already_stored");
+                info!(
+                    external_id = canonical_tx.external_id.as_deref(),
+                    "transfer leg was already stored, treating replay as success"
+                );
+            }
         }
         return Ok(());
     }

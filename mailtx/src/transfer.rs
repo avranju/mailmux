@@ -125,6 +125,8 @@ pub struct InsertLeg<'a> {
     pub destination_firefly_id: &'a str,
     pub occurred_at: &'a DateTime<Utc>,
     pub tags: &'a [String],
+    /// Stable mailmux event ID used if this leg is later flushed unmatched.
+    pub external_id: Option<&'a str>,
 }
 
 /// Row returned by `PendingStore::drain_expired` — enough data to post a
@@ -139,6 +141,7 @@ pub struct ExpiredLeg {
     pub destination_firefly_id: String,
     pub occurred_at: DateTime<Utc>,
     pub tags: Vec<String>,
+    pub external_id: Option<String>,
 }
 
 pub struct PendingStore {
@@ -162,10 +165,31 @@ impl PendingStore {
                 destination_firefly_id TEXT    NOT NULL,
                 occurred_at            TEXT    NOT NULL,
                 inserted_at            INTEGER NOT NULL,
-                tags                   TEXT    NOT NULL
+                tags                   TEXT    NOT NULL,
+                external_id            TEXT
             );",
         )
         .context("initialising pending_transfers table")?;
+        // Preserve compatibility with state DBs created before external IDs
+        // were persisted for unmatched-transfer retries.
+        let columns = conn
+            .prepare("PRAGMA table_info(pending_transfers)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|column| column == "external_id") {
+            conn.execute(
+                "ALTER TABLE pending_transfers ADD COLUMN external_id TEXT",
+                [],
+            )
+            .context("adding external_id to pending_transfers")?;
+        }
+        // A replay of a first transfer leg must not create another pending row.
+        // SQLite permits multiple NULLs, preserving compatibility with legacy rows.
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_transfers_external_id
+             ON pending_transfers(external_id) WHERE external_id IS NOT NULL;",
+        )
+        .context("creating pending transfer external-ID index")?;
         Ok(Self {
             conn,
             window_secs: (window_hours * 3600) as i64,
@@ -182,7 +206,7 @@ impl PendingStore {
         let cutoff = self.cutoff_unix();
         let mut stmt = self.conn.prepare(
             "SELECT id, leg, amount_units, narration, category,
-                    source_firefly_id, destination_firefly_id, occurred_at, tags
+                    source_firefly_id, destination_firefly_id, occurred_at, tags, external_id
              FROM pending_transfers
              WHERE inserted_at < ?1
              ORDER BY inserted_at ASC",
@@ -200,6 +224,7 @@ impl PendingStore {
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
                     row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -216,6 +241,7 @@ impl PendingStore {
             dst,
             occurred_at_str,
             tags_json,
+            external_id,
         ) in rows
         {
             let leg = if leg_str == "withdrawal" {
@@ -237,6 +263,7 @@ impl PendingStore {
                 destination_firefly_id: dst,
                 occurred_at,
                 tags,
+                external_id,
             });
         }
         Ok(out)
@@ -275,16 +302,17 @@ impl PendingStore {
         }
     }
 
-    /// Insert a new pending leg into the store.
-    pub fn insert(&self, args: InsertLeg<'_>) -> Result<()> {
+    /// Insert a pending leg once. Returns false when this event was already stored.
+    pub fn insert(&self, args: InsertLeg<'_>) -> Result<bool> {
         let tags_json = serde_json::to_string(args.tags).context("serialising tags")?;
-        self.conn
+        let rows = self
+            .conn
             .execute(
-                "INSERT INTO pending_transfers
+                "INSERT OR IGNORE INTO pending_transfers
                      (rule_id, leg, amount_units, narration, category,
                       source_firefly_id, destination_firefly_id,
-                      occurred_at, inserted_at, tags)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                      occurred_at, inserted_at, tags, external_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     args.rule_id,
                     args.leg.as_str(),
@@ -296,9 +324,54 @@ impl PendingStore {
                     args.occurred_at.to_rfc3339(),
                     Utc::now().timestamp(),
                     tags_json,
+                    args.external_id,
                 ],
             )
             .context("inserting pending transfer leg")?;
-        Ok(())
+        Ok(rows > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use super::{InsertLeg, Leg, PendingStore};
+
+    #[test]
+    fn pending_leg_external_id_makes_replays_idempotent() {
+        let store = PendingStore::open(":memory:", 48).unwrap();
+        let tags = vec!["mailmux-mailtx".to_string()];
+        let args = InsertLeg {
+            rule_id: "rule",
+            leg: &Leg::Withdrawal,
+            amount_units: 1234,
+            narration: "transfer",
+            category: None,
+            source_firefly_id: "1",
+            destination_firefly_id: "2",
+            occurred_at: &Utc::now(),
+            tags: &tags,
+            external_id: Some("mailmux:event:42"),
+        };
+        assert!(store.insert(args).unwrap());
+
+        let occurred_at = Utc::now();
+        assert!(
+            !store
+                .insert(InsertLeg {
+                    rule_id: "rule",
+                    leg: &Leg::Withdrawal,
+                    amount_units: 1234,
+                    narration: "transfer",
+                    category: None,
+                    source_firefly_id: "1",
+                    destination_firefly_id: "2",
+                    occurred_at: &occurred_at,
+                    tags: &tags,
+                    external_id: Some("mailmux:event:42"),
+                })
+                .unwrap()
+        );
     }
 }

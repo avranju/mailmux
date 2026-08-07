@@ -81,12 +81,16 @@ pub struct FireflyConfig {
     /// Whether Firefly should fire webhooks for the new transaction.
     #[serde(default = "default_fire_webhooks")]
     pub fire_webhooks: bool,
-    /// Whether Firefly should reject duplicate transaction hashes.
-    #[serde(default)]
+    /// Whether Firefly should reject duplicate transaction hashes. Defaults to true.
+    #[serde(default = "default_error_if_duplicate_hash")]
     pub error_if_duplicate_hash: bool,
 }
 
 fn default_fire_webhooks() -> bool {
+    true
+}
+
+fn default_error_if_duplicate_hash() -> bool {
     true
 }
 
@@ -300,6 +304,24 @@ mod tests {
             normalize_sender_address("Alerts <a@b.example> trailing"),
             None
         );
+    }
+
+    #[test]
+    fn duplicate_hash_rejection_defaults_to_true_but_can_be_disabled() {
+        let defaulted: FireflyConfig = toml::from_str(
+            r#"base_url = "https://firefly.example/api"
+access_token = "token""#,
+        )
+        .unwrap();
+        assert!(defaulted.error_if_duplicate_hash);
+
+        let opt_out: FireflyConfig = toml::from_str(
+            r#"base_url = "https://firefly.example/api"
+access_token = "token"
+error_if_duplicate_hash = false"#,
+        )
+        .unwrap();
+        assert!(!opt_out.error_if_duplicate_hash);
     }
 
     #[test]
