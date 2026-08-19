@@ -69,15 +69,15 @@ pub async fn update_job_status(
 ) -> Result<()> {
     match attempts_update {
         AttemptsUpdate::None => {
-            let sql = r#"
+            sqlx::query(
+                r#"
                 UPDATE processor_jobs
                 SET status = $2, last_error = $3, next_retry_at = $4,
                     attempts = attempts, output = $5,
                     updated_at = now()
                 WHERE id = $1
-                "#
-            .to_string();
-            sqlx::query(&sql)
+                "#,
+            )
                 .bind(job_id)
                 .bind(status)
                 .bind(error)
@@ -88,15 +88,15 @@ pub async fn update_job_status(
                 .context("updating job status")?;
         }
         AttemptsUpdate::Increment => {
-            let sql = r#"
+            sqlx::query(
+                r#"
                 UPDATE processor_jobs
                 SET status = $2, last_error = $3, next_retry_at = $4,
                     attempts = attempts + 1, output = $5,
                     updated_at = now()
                 WHERE id = $1
-                "#
-            .to_string();
-            sqlx::query(&sql)
+                "#,
+            )
                 .bind(job_id)
                 .bind(status)
                 .bind(error)
