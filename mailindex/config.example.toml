@@ -1,0 +1,26 @@
+[server]
+bind = "127.0.0.1:8090"
+public_base_url = "http://127.0.0.1:8090"
+max_request_bytes = 52428800
+api_token_env = "MAILINDEX_API_TOKEN"
+protect_view = true
+
+[storage]
+database_path = "/var/lib/mailindex/mailindex.db"
+
+[index]
+path = "/var/lib/mailindex/tantivy"
+writer_memory_bytes = 134217728
+batch_size = 100
+commit_interval_ms = 1000
+
+[content]
+max_body_chars = 500000
+max_attachment_bytes = 26214400
+max_attachment_text_chars = 500000
+pdf_enabled = true
+
+[search]
+default_limit = 10
+max_limit = 50
+max_get_chars = 100000

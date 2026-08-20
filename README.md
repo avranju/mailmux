@@ -5,6 +5,7 @@ This repository is a Rust workspace with:
 - `mailmux`: an event-driven IMAP email processing daemon
 - `mailtx`: a command-processor companion crate for extracting bank transaction
   data from emails and posting it to an HTTP endpoint
+- `mailindex`: a local-first RFC 5322 normalization, Tantivy search, HTTP, and MCP service
 
 `mailmux` synchronizes emails from IMAP servers into PostgreSQL and triggers
 configurable processing pipelines for each incoming message.
@@ -26,6 +27,10 @@ emphasis on data integrity, recoverability, and idempotency.
 │   └── src/
 ├── mailtx/                     # command processor crate
 │   ├── README.md
+│   └── src/
+├── mailindex/                  # normalized mail search service
+│   ├── README.md
+│   ├── config.example.toml
 │   └── src/
 └── run/                        # local helper scripts
 ```
@@ -92,6 +97,7 @@ Workspace binaries are written to:
 
 - `target/release/mailmux`
 - `target/release/mailtx`
+- `target/release/mailindex`
 
 Run the tests:
 
@@ -244,6 +250,14 @@ Built-in processor types:
 - **`logger`** — logs event details via tracing
 - **`command`** — executes a CLI command, passing event JSON on stdin
   (set `config.command` and optionally `config.args` and `config.env`)
+
+## mailindex
+
+`mailindex` owns bounded normalized mail content in local Turso and a rebuildable
+Tantivy index. It exposes authenticated HTTP ingestion/search/retrieval and MCP
+search/retrieval, plus `index-status` and offline `rebuild-index` maintenance
+commands. See [`mailindex/README.md`](mailindex/README.md) and the example config.
+The reference mailmux adapter uploads raw bytes at `mailindex/contrib/mailmux-submit.sh`.
 
 ## mailtx crate notes
 

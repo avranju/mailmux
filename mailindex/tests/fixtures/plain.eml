@@ -1,0 +1,8 @@
+From: Alice <alice@example.com>
+To: Bob <bob@example.com>
+Cc: Carol <carol@example.com>
+Date: Tue, 01 Jan 2024 12:00:00 +0000
+Message-ID: <plain@example.com>
+Subject: Plain marker
+
+Distinctive plain body marker.

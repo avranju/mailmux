@@ -1,0 +1,12 @@
+pub mod cli;
+pub mod config;
+pub mod error;
+pub mod http;
+pub mod index;
+pub mod ingest;
+pub mod mcp;
+pub mod models;
+pub mod search;
+pub mod storage;
+pub use config::Config;
+pub use error::AppError;

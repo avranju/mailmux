@@ -1,0 +1,13 @@
+From: a@example.com
+To: b@example.com
+Subject: Broken PDF
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="mix"
+
+--mix
+Content-Type: application/pdf; name="broken.pdf"
+Content-Disposition: attachment; filename="broken.pdf"
+Content-Transfer-Encoding: base64
+
+bm90IGEgcGRm
+--mix--

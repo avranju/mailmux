@@ -1,0 +1,13 @@
+From: a@example.com
+To: b@example.com
+Subject: Binary
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="mix"
+
+--mix
+Content-Type: application/octet-stream; name="blob.bin"
+Content-Disposition: attachment; filename="blob.bin"
+Content-Transfer-Encoding: base64
+
+AAECAwQ=
+--mix--
