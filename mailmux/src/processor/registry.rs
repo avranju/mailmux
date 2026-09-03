@@ -60,6 +60,18 @@ impl ProcessorRegistry {
             .collect()
     }
 
+    /// Find a single processor by its exact configured name, regardless of
+    /// event subscription.
+    ///
+    /// Returns `None` when no registered processor has this name. Disabled
+    /// processors and unknown processor types are not registered.
+    pub fn processor_by_name(&self, name: &str) -> Option<&dyn Processor> {
+        self.processors
+            .iter()
+            .find(|p| p.name() == name)
+            .map(|p| p.as_ref())
+    }
+
     #[cfg(test)]
     pub fn for_tests(processors: Vec<Box<dyn Processor>>) -> Self {
         Self { processors }

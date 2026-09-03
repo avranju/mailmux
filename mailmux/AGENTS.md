@@ -30,6 +30,11 @@ mailmux replay --event-id 42
 mailmux replay --event-id 42 --processor notify
 mailmux dry-run --event-id 42 --processor notify
 
+# Historical backfill (runs one processor over durable emails; no events or
+# processor_jobs rows are persisted)
+mailmux backfill --processor mail-indexer --account personal --after 2021-01-01 --before 2022-01-01
+mailmux backfill --processor mail-indexer --account personal --after 2021-01-01 --before 2022-01-01 --dry-run
+
 # Docker
 docker compose up -d
 docker compose logs -f mailmux
@@ -62,12 +67,13 @@ Main
 
 | File | Role |
 |---|---|
-| `main.rs` | Wires all tasks together; implements `cmd_run`, `cmd_replay`, `cmd_dry_run` |
-| `cli.rs` | clap CLI: `--config`, `--log-level`, subcommands |
+| `main.rs` | Wires all tasks together; implements `cmd_run`, `cmd_replay`, `cmd_dry_run`; dispatches `backfill::run` |
+| `cli.rs` | clap CLI: `--config`, `--log-level`, subcommands; `BackfillArgs` + date parsing/validation |
+| `backfill.rs` | Historical backfill orchestration: processor resolution, transient event construction, retry/timeout execution, bounded chunk concurrency, keyset pagination, summary + exit status |
 | `config.rs` | TOML loading with `${VAR}` env substitution + validation |
 | `store.rs` | Filesystem store for raw `.eml` files at `{data_dir}/{account}/{mailbox}/{uid}.eml` |
 | `db/mod.rs` | PgPool setup + sqlx migrate runner |
-| `db/emails.rs` | `EmailRecord`, `MailboxState`, email fetch/upsert |
+| `db/emails.rs` | `EmailRecord`, `MailboxState`, email fetch/upsert; backfill `EmailBackfillFilter` + parameterized count/keyset-page queries |
 | `db/events.rs` | `Event`, atomic `insert_email_with_event` (with pg_notify), unprocessed event query |
 | `db/jobs.rs` | `ProcessorJob` CRUD: create, status update, pending/retryable fetch |
 | `events/listener.rs` | `EventLoop`: PgListener + poll fallback, dispatches to scheduler |
@@ -101,6 +107,32 @@ Config is TOML with `${VAR}` env substitution. See `config.example.toml` for an 
 Tests live in `#[cfg(test)] mod tests` blocks within each source file. Async tests use `#[tokio::test]`. Store tests use `tempfile` for temporary directories; config tests use `tempfile::NamedTempFile`.
 
 Current test coverage: `src/config.rs` and `src/store.rs` have unit tests. No integration tests or test database setup exists.
+
+## Historical backfill (`mailmux backfill`)
+
+`backfill.rs` runs exactly one configured processor (exact name match, must be
+enabled and subscribed to `email_arrived`) over durable `emails` rows:
+
+- Selection reads `emails` directly (never `events`) via parameterized,
+  keyset-paginated queries (`id > last_id ORDER BY id ASC LIMIT ≤ 500`) in
+  `db/emails.rs`; `--limit` caps the count, and a parameterized COUNT query
+  computes `selected` for dry-run/summary.
+- Each email is invoked with a **transient** `Event` whose `id == 0` (reserved
+  for non-persisted backfill events — see `db/events.rs`), `event_type =
+  "email_arrived"`, and a payload containing `backfill: true` plus
+  `email_id`/`uid`/`subject`/`sender`. The `Processor::process(&Event,
+  Option<&EmailRecord>)` contract and the command-processor `{event, email}`
+  stdin JSON (including `email.raw_message_path`) are unchanged.
+- **Never** insert `events` or `processor_jobs` rows from the backfill path —
+  retry state is in-memory only, and downstream processors are expected to be
+  idempotent.
+- Per-attempt timeout, `max_retries`, and `retry_backoff_secs` come from the
+  selected `ProcessorConfig`; concurrency is bounded by the processor's
+  `concurrency` (overridable via `--concurrency`) using deterministic
+  contiguous chunks. `--fail-fast` stops before scheduling the chunk after a
+  permanent failure; the final summary (`selected`/`processed`/`succeeded`/
+  `failed`/`skipped`/`elapsed`) is logged before a partial-failure run returns
+  a non-zero exit.
 
 ## Important Notes
 

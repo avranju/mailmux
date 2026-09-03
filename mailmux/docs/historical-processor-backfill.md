@@ -1,10 +1,4 @@
-# Specification 1: Mailmux Historical Processor Backfill
-
-**Target repository:** `avranju/mailmux`  
-**Working feature name:** Historical processor backfill  
-**Status:** Implementation specification  
-**Primary language:** Rust 2024  
-**Date:** 2026-08-19
+# Mailmux Historical Processor Backfill
 
 ## 1. Purpose
 

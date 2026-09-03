@@ -6,6 +6,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+mod backfill;
 mod cli;
 mod config;
 mod db;
@@ -49,6 +50,12 @@ async fn main() -> Result<()> {
             event_id,
             processor: processor_name,
         }) => cmd_dry_run(config, event_id, processor_name).await,
+        Some(cli::Command::Backfill(args)) => {
+            // The backfill summary is logged inside backfill::run before any
+            // partial-failure error is returned.
+            backfill::run(config, args).await?;
+            Ok(())
+        }
         None => cmd_run(config).await,
     }
 }

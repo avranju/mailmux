@@ -78,14 +78,14 @@ pub async fn update_job_status(
                 WHERE id = $1
                 "#,
             )
-                .bind(job_id)
-                .bind(status)
-                .bind(error)
-                .bind(next_retry_at)
-                .bind(output)
-                .execute(pool)
-                .await
-                .context("updating job status")?;
+            .bind(job_id)
+            .bind(status)
+            .bind(error)
+            .bind(next_retry_at)
+            .bind(output)
+            .execute(pool)
+            .await
+            .context("updating job status")?;
         }
         AttemptsUpdate::Increment => {
             sqlx::query(
@@ -97,14 +97,14 @@ pub async fn update_job_status(
                 WHERE id = $1
                 "#,
             )
-                .bind(job_id)
-                .bind(status)
-                .bind(error)
-                .bind(next_retry_at)
-                .bind(output)
-                .execute(pool)
-                .await
-                .context("updating job status")?;
+            .bind(job_id)
+            .bind(status)
+            .bind(error)
+            .bind(next_retry_at)
+            .bind(output)
+            .execute(pool)
+            .await
+            .context("updating job status")?;
         }
     }
 

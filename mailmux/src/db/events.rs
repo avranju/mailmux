@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 
 /// An event in the append-only event log.
+///
+/// Persisted events always have a positive `id`. The identifier `id == 0`
+/// is reserved for transient, non-persisted events constructed by the
+/// historical backfill command (see `crate::backfill`); it never refers to a
+/// row in the `events` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub id: i64,

@@ -52,6 +52,9 @@ emphasis on data integrity, recoverability, and idempotency.
   (startup complete) HTTP endpoints
 - **Replay & dry-run** — CLI subcommands to re-run processors for a specific
   event or test a processor without persisting results
+- **Historical backfill** — explicitly run one configured processor against
+  durable historical emails (filtered by date/account/mailbox) without
+  depending on retained events
 - **Event retention** — background cleanup of old processed events
   (configurable, default 30 days)
 - **systemd integration** — `Type=notify` service with `sd-notify` readiness
@@ -311,6 +314,89 @@ mailmux replay --event-id 42 --processor notify
 
 ```bash
 mailmux dry-run --event-id 42 --processor notify
+```
+
+**Backfill** — run one configured processor against durable historical
+emails. This operates directly on `emails` rows (and their raw `.eml`
+files), so it works for mail whose `events` rows were already cleaned up by
+retention:
+
+```bash
+mailmux backfill [OPTIONS] --processor <NAME>
+
+Selection filters:
+  --after <DATE_OR_TIME>      Include emails whose message date is >= this value
+  --before <DATE_OR_TIME>     Include emails whose message date is < this value
+  --account <ID>              Include an account; repeatable
+  --mailbox <NAME>            Include a mailbox; repeatable
+  --email-id <ID>             Include a specific emails.id; repeatable
+  --all                       Explicitly allow selecting all stored emails
+
+Execution controls:
+  --limit <N>                 Stop after N selected emails
+  --concurrency <N>           Override processor concurrency for this run
+  --fail-fast                 Stop scheduling after the first permanently failed email
+  --dry-run                   Count selected emails without invoking the processor
+```
+
+Behavior and safety:
+
+- At least one selection filter is required unless `--all` is explicitly
+  given, so a typo cannot silently run a side-effecting processor over the
+  entire archive.
+- Date filters accept `YYYY-MM-DD` (interpreted as midnight UTC) or an RFC
+  3339 timestamp (normalized to UTC). `--after` is inclusive
+  (`date >= after`), `--before` is exclusive (`date < before`), which makes
+  year/month ranges straightforward. Emails with a NULL date never match date
+  filters but can still be selected by account/mailbox/email-id.
+- Repeated values of one filter kind are ORed; different filter kinds are
+  combined with AND. `--after >= --before` is rejected.
+- Emails are always processed in ascending `emails.id` order (deterministic
+  ingestion order; message dates can be NULL or non-monotonic). `--limit`
+  applies to that ordered selection.
+- For each selected email, mailmux constructs a transient in-memory
+  `email_arrived` event and invokes exactly the one selected processor
+  through the normal `Processor` trait. **No `events` rows and no
+  `processor_jobs` rows are created or modified.** The command-processor
+  `{event, email}` JSON shape is unchanged, including
+  `email.raw_message_path`; historical invocations are identifiable via
+  `.event.payload.backfill == true` (the event `id` is `0`, a value reserved
+  for non-persisted backfill events).
+- Timeouts, `max_retries`, and `retry_backoff_secs` come from the selected
+  processor's configuration; `--concurrency` overrides its `concurrency` for
+  this run only. Concurrency is bounded, and processing order/counters remain
+  deterministic.
+- A permanently failed email does not stop the batch unless `--fail-fast` is
+  set (with `--fail-fast`, remaining selected emails are reported as
+  `skipped`).
+- The final summary is logged as `selected`, `processed`, `succeeded`,
+  `failed`, `skipped`, and `elapsed`. Exit status is 0 for dry runs, no
+  matches, and all-success runs, and non-zero when setup fails or at least
+  one email permanently fails (the summary is printed first).
+- Backfill is safe to re-run (same command, same selection, same order), but
+  mailmux does not track what a processor has already seen — **backfill
+  processors SHOULD be idempotent**.
+
+Examples:
+
+```bash
+# Re-submit all 2021 mail from one account to the mail-index processor
+mailmux backfill \
+  --processor mail-indexer \
+  --account personal \
+  --after 2021-01-01 \
+  --before 2022-01-01
+
+# Preview the selection first (counts matches, invokes nothing)
+mailmux backfill \
+  --processor mail-indexer \
+  --account personal \
+  --after 2021-01-01 \
+  --before 2022-01-01 \
+  --dry-run
+
+# Re-process two specific emails with lower concurrency
+mailmux backfill --processor mail-indexer --email-id 1042 --email-id 1043 --concurrency 1
 ```
 
 ## Docker
