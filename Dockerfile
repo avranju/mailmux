@@ -5,6 +5,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY mailmux ./mailmux
 COPY mailmux/migrations ./mailmux/migrations
 COPY mailtx ./mailtx
+COPY mailindex ./mailindex
 
 RUN cargo build --release
 
