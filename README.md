@@ -366,6 +366,8 @@ Behavior and safety:
   processor's configuration; `--concurrency` overrides its `concurrency` for
   this run only. Concurrency is bounded, and processing order/counters remain
   deterministic.
+  On Unix, timing out or cancelling a command processor terminates its process
+  group, including shell-launched descendants; stdin writes share the timeout.
 - A permanently failed email does not stop the batch unless `--fail-fast` is
   set (with `--fail-fast`, remaining selected emails are reported as
   `skipped`).
@@ -373,6 +375,8 @@ Behavior and safety:
   `failed`, `skipped`, and `elapsed`. Exit status is 0 for dry runs, no
   matches, and all-success runs, and non-zero when setup fails or at least
   one email permanently fails (the summary is printed first).
+  A pagination error also prints the accumulated summary before exiting
+  non-zero, with unprocessed selected emails counted as `skipped`.
 - Backfill is safe to re-run (same command, same selection, same order), but
   mailmux does not track what a processor has already seen — **backfill
   processors SHOULD be idempotent**.

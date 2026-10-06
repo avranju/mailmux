@@ -391,6 +391,13 @@ stable mailmux event ID as Firefly's `external_id`. On a retry, mailtx checks
 that ID before posting and treats an existing transaction as success.
 `error_if_duplicate_hash` also defaults to `true` as a backstop.
 
+For `mailmux backfill`, transient events have ID `0`. mailtx instead uses
+`mailmux:email:<email.id>` as the external ID, so distinct historical emails
+stay distinct and repeated backfills retain the same identity. The email ID
+must be positive. Normal events continue to use `mailmux:event:<event.id>`.
+These namespaces are separate: backfilling mail already processed through a
+normal event does not deduplicate against that event's transaction.
+
 ## Logging
 
 Logs are written to stderr in the default tracing compact format. To enable

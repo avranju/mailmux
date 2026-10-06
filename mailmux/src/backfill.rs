@@ -175,9 +175,10 @@ pub async fn run(config: Config, args: BackfillArgs) -> Result<BackfillSummary> 
         pool: &pool,
         filter: &filter,
     };
-    let summary = run_backfill(processor, &mut source, selected, args.dry_run, &settings).await?;
+    let result = run_backfill(processor, &mut source, selected, args.dry_run, &settings).await;
 
     pool.close().await;
+    let summary = result?;
 
     if summary.failed > 0 {
         // The summary is already logged above; surface a non-zero exit.
@@ -246,13 +247,22 @@ async fn run_backfill(
     let mut last_id: i64 = 0;
     let mut remaining: u64 = selected;
     let mut last_progress: u64 = 0;
+    let mut fetch_error = None;
 
     while remaining > 0 {
         let page_size = std::cmp::min(PAGE_SIZE, remaining as i64);
-        let page = source
+        let page = match source
             .next_page(last_id, page_size)
             .await
-            .with_context(|| format!("fetching backfill page after id {last_id}"))?;
+            .with_context(|| format!("fetching backfill page after id {last_id}"))
+        {
+            Ok(page) => page,
+            Err(error) => {
+                summary.skipped = selected.saturating_sub(summary.processed);
+                fetch_error = Some(error);
+                break;
+            }
+        };
 
         if page.is_empty() {
             // The initial count and this live page are separate queries, so
@@ -329,6 +339,19 @@ async fn run_backfill(
 
     summary.elapsed = started.elapsed();
     log_summary(&summary);
+    if let Some(error) = fetch_error {
+        // Preserve the counts in the returned error too, so operators can
+        // recover partial progress even when info-level logs are disabled.
+        return Err(error.context(format!(
+            "backfill interrupted: selected={} processed={} succeeded={} failed={} skipped={} elapsed={:?}",
+            summary.selected,
+            summary.processed,
+            summary.succeeded,
+            summary.failed,
+            summary.skipped,
+            summary.elapsed
+        )));
+    }
     Ok(summary)
 }
 
@@ -910,6 +933,75 @@ mod tests {
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.succeeded, 0);
         assert_eq!(stats.calls(), 3, "every attempt must time out");
+    }
+
+    #[tokio::test]
+    async fn test_page_error_preserves_partial_summary_and_cause() {
+        struct ErrorPageSource;
+
+        #[async_trait]
+        impl BackfillPageSource for ErrorPageSource {
+            async fn next_page(&mut self, last_id: i64, _: i64) -> Result<Vec<EmailRecord>> {
+                if last_id == 0 {
+                    Ok((1..=500).map(sample_email).collect())
+                } else {
+                    bail!("database disconnected");
+                }
+            }
+        }
+
+        let proc = FakeProcessor::new("p", FakeBehavior::FailEmails(vec![1]), Duration::ZERO);
+        let mut source = ErrorPageSource;
+        let settings = test_settings(2, 0, vec![]);
+        let error = run_backfill(&proc, &mut source, 501, false, &settings)
+            .await
+            .unwrap_err();
+        assert_eq!(proc.stats.calls(), 500);
+        assert!(error.to_string().starts_with(
+            "backfill interrupted: selected=501 processed=500 succeeded=499 failed=1 skipped=1 elapsed="
+        ));
+        assert_eq!(
+            error.chain().nth(1).unwrap().to_string(),
+            "fetching backfill page after id 500"
+        );
+        assert_eq!(error.root_cause().to_string(), "database disconnected");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_command_retries_do_not_leave_timed_out_attempts_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_processor_config("command", true, &["email_arrived"], 1);
+        cfg.config
+            .insert("command".into(), toml::Value::String("sh".into()));
+        cfg.config.insert(
+            "args".into(),
+            toml::Value::Array(
+                [
+                    "-c",
+                    "cat >/dev/null; printf x >> \"$1/started\"; sleep 1; : > \"$1/effect\"",
+                    "probe",
+                    dir.path().to_str().unwrap(),
+                ]
+                .into_iter()
+                .map(|arg| toml::Value::String(arg.into()))
+                .collect(),
+            ),
+        );
+        let processor = crate::processor::builtin::command::CommandProcessor::new(&cfg);
+        let mut settings = test_settings(1, 1, vec![0]);
+        settings.timeout = Duration::from_millis(300);
+        let mut source = SlicePageSource::new(vec![sample_email(1)]);
+        let summary = run_backfill(&processor, &mut source, 1, false, &settings)
+            .await
+            .unwrap();
+        assert_eq!(summary.failed, 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("started")).unwrap(),
+            "xx"
+        );
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!dir.path().join("effect").exists());
     }
 
     // ---------- continue-on-error vs fail-fast ----------

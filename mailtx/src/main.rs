@@ -127,10 +127,6 @@ async fn run(m: &mut Metrics) -> Result<()> {
 
     let input: input::Input =
         serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("parsing stdin JSON: {e}"))?;
-    // `events.id` is a database-global, stable identity. It survives command
-    // retries and replay, unlike any LLM-derived transaction fields.
-    let external_id = format!("mailmux:event:{}", input.event.id);
-
     let email = match &input.email {
         Some(e) => e,
         None => {
@@ -142,6 +138,8 @@ async fn run(m: &mut Metrics) -> Result<()> {
             return Ok(());
         }
     };
+
+    let external_id = input.external_id()?;
 
     let sender = email.sender.as_deref().unwrap_or("");
     if !config.sender_allowed(sender) {

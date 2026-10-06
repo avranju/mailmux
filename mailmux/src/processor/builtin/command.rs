@@ -21,6 +21,29 @@ pub struct CommandProcessor {
     timeout: Duration,
 }
 
+/// Kill shell-launched descendants when a processing future is cancelled.
+/// The child is placed in its own group, so this never targets mailmux's group.
+#[cfg(unix)]
+struct ProcessGroupGuard {
+    id: Option<libc::pid_t>,
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            // SAFETY: the positive child pid is also its dedicated process
+            // group id. A negative pid directs SIGKILL to that group only.
+            if unsafe { libc::kill(-id, libc::SIGKILL) } == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    warn!(process_group = id, %error, "failed to kill command process group");
+                }
+            }
+        }
+    }
+}
+
 impl CommandProcessor {
     pub fn new(config: &ProcessorConfig) -> Self {
         let command = config
@@ -89,28 +112,45 @@ impl Processor for CommandProcessor {
         command
             .args(&self.args)
             .envs(self.env.iter().map(|(k, v)| (k, v)))
+            .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+
+        #[cfg(unix)]
+        command.process_group(0);
 
         let mut child = command
             .spawn()
             .with_context(|| format!("spawning command: {}", self.command))?;
 
-        // Write JSON to stdin
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(input_json.as_bytes())
-                .await
-                .context("writing to command stdin")?;
-            // Drop stdin to close it
-        }
+        #[cfg(unix)]
+        let mut process_group = ProcessGroupGuard {
+            id: child.id().map(|id| id as libc::pid_t),
+        };
 
-        // Wait for the process with a timeout
-        let output = tokio::time::timeout(self.timeout, child.wait_with_output())
+        // Include stdin writes in the timeout: commands may never read input.
+        // Dropping this future kills the child and, on Unix, its process group.
+        let execution = async move {
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(input_json.as_bytes())
+                    .await
+                    .context("writing to command stdin")?;
+            }
+            child
+                .wait_with_output()
+                .await
+                .context("waiting for command output")
+        };
+        let output = tokio::time::timeout(self.timeout, execution)
             .await
-            .map_err(|_| anyhow::anyhow!("command timed out after {:?}", self.timeout))?
-            .context("waiting for command output")?;
+            .map_err(|_| anyhow::anyhow!("command timed out after {:?}", self.timeout))??;
+
+        #[cfg(unix)]
+        {
+            process_group.id = None;
+        }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -213,6 +253,113 @@ mod tests {
             concurrency: 1,
             config: config_map,
         }
+    }
+
+    #[cfg(unix)]
+    fn cancellation_event() -> Event {
+        Event {
+            id: 0,
+            event_type: "email_arrived".into(),
+            account_id: "test".into(),
+            mailbox_name: "INBOX".into(),
+            email_id: None,
+            payload: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[cfg(unix)]
+    const SIDE_EFFECT_COMMAND: &str = r#"
+cat >/dev/null
+printf x > "$1/started"
+(sleep 1; : > "$1/descendant") &
+sleep 1
+: > "$1/parent"
+wait
+"#;
+
+    #[cfg(unix)]
+    async fn assert_no_side_effects(dir: &std::path::Path) {
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            !dir.join("parent").exists(),
+            "cancelled command kept running"
+        );
+        assert!(
+            !dir.join("descendant").exists(),
+            "cancelled command's descendant kept running"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_command_timeout_kills_child_and_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = build_command_config(
+            "sh",
+            vec![
+                "-c",
+                SIDE_EFFECT_COMMAND,
+                "probe",
+                dir.path().to_str().unwrap(),
+            ],
+        );
+        let mut processor = CommandProcessor::new(&config);
+        processor.timeout = Duration::from_millis(300);
+        let error = processor
+            .process(&cancellation_event(), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("command timed out"));
+        assert!(dir.path().join("started").exists());
+        assert_no_side_effects(dir.path()).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_external_cancellation_kills_child_and_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = build_command_config(
+            "sh",
+            vec![
+                "-c",
+                SIDE_EFFECT_COMMAND,
+                "probe",
+                dir.path().to_str().unwrap(),
+            ],
+        );
+        let processor = CommandProcessor::new(&config);
+        let task =
+            tokio::spawn(async move { processor.process(&cancellation_event(), None).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !dir.path().join("started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_no_side_effects(dir.path()).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_command_timeout_includes_blocked_stdin_write() {
+        let config = build_command_config("sh", vec!["-c", "sleep 5"]);
+        let mut processor = CommandProcessor::new(&config);
+        processor.timeout = Duration::from_millis(100);
+        let mut event = cancellation_event();
+        event.payload = serde_json::json!({"large": "x".repeat(1024 * 1024)});
+        let result = tokio::time::timeout(Duration::from_secs(2), processor.process(&event, None))
+            .await
+            .expect("command's own timeout must cover blocked stdin");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("command timed out")
+        );
     }
 
     #[tokio::test]

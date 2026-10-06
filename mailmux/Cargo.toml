@@ -32,6 +32,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 webpki-roots = "1.0"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 temp-env = "0.3.6"
 tempfile = "3"
