@@ -1,0 +1,16 @@
+From: a@example.com
+To: b@example.com
+Subject: Attachment
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="mix"
+
+--mix
+Content-Type: text/plain
+
+body
+--mix
+Content-Type: text/plain; name="notes.txt"
+Content-Disposition: attachment; filename="notes.txt"
+
+Unique attachment marker.
+--mix--

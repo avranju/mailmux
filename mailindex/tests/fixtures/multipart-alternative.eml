@@ -1,0 +1,16 @@
+From: a@example.com
+To: b@example.com
+Date: Tue, 02 Jan 2024 12:00:00 +0000
+Subject: Alternative
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="alt"
+
+--alt
+Content-Type: text/plain; charset=utf-8
+
+Plain marker only.
+--alt
+Content-Type: text/html; charset=utf-8
+
+<html><body>Plain marker only. <em>Html marker</em></body></html>
+--alt--
