@@ -83,7 +83,7 @@ http_code=$(
         --request PUT \
         "$url" \
         --header "Authorization: Bearer $MAILINDEX_API_TOKEN" \
-        --form "metadata=$metadata;type=application/json" \
+        --form-string "metadata=$metadata" \
         --form "message=@$raw_message_path;type=message/rfc822"
 ) ||
     fail "mailindex transport failed"

@@ -28,6 +28,49 @@ fn message(id: &str, body: &str, hash: &str) -> NormalizedMessage {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_uploads_and_index_updates_share_the_writer_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = repository(&dir).await;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(51));
+    let mut tasks = tokio::task::JoinSet::new();
+    for n in 0..50 {
+        // Exercise Repository::clone as well as sharing one Arc<Repository>.
+        let repo = repo.as_ref().clone();
+        let barrier = barrier.clone();
+        tasks.spawn(async move {
+            let id = n.to_string();
+            barrier.wait().await;
+            let result = repo.upsert(&message(&id, "body", &id)).await.unwrap();
+            repo.mark_error(result.document_id, &id, "retry")
+                .await
+                .unwrap();
+            repo.requeue("test", &id).await.unwrap().unwrap();
+            repo.mark_indexed_any(result.document_id, &id)
+                .await
+                .unwrap();
+            repo.mark_indexed_versions(&[(result.document_id, id.clone())])
+                .await
+                .unwrap();
+            repo.requeue("test", &id).await.unwrap().unwrap();
+            repo.mark_indexed(result.document_id, &id).await.unwrap();
+        });
+    }
+    barrier.wait().await;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+    })
+    .await
+    .expect("concurrent writes should complete");
+    let counts = repo.status_counts().await.unwrap();
+    assert_eq!(counts.total, 50);
+    assert_eq!(counts.indexed, 50);
+    assert_eq!(counts.pending, 0);
+    assert_eq!(counts.error, 0);
+}
+
 #[tokio::test]
 async fn migrations_idempotency_replacement_and_cas() {
     let dir = tempfile::tempdir().unwrap();

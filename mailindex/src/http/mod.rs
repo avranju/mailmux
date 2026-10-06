@@ -13,7 +13,9 @@ use crate::{
 };
 use anyhow::Result;
 use axum::{
-    Router, middleware,
+    Router,
+    extract::DefaultBodyLimit,
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
@@ -72,6 +74,10 @@ pub fn router(state: AppState) -> Router {
         .merge(protected)
         .merge(view)
         .merge(mcp)
+        // The transport layer below enforces the configured limit for every
+        // request, including multipart. Avoid Axum's separate 2 MiB default
+        // and nested limit errors when an oversized body is read.
+        .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(
             state.config.server.max_request_bytes,
         ))

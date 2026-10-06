@@ -8,13 +8,17 @@ use crate::{
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use models::*;
-use std::path::Path;
+use std::{path::Path, sync::Arc};
+use tokio::sync::Mutex;
 use turso::transaction::TransactionBehavior;
 use turso::{Builder, Connection, Database, Value};
 
 #[derive(Clone)]
 pub struct Repository {
     db: Database,
+    // Turso has a single database writer. Share this gate across repository
+    // clones so uploads, indexing updates, and migrations wait their turn.
+    write_gate: Arc<Mutex<()>>,
 }
 
 fn s(v: impl Into<String>) -> Value {
@@ -71,6 +75,7 @@ impl Repository {
             db: Builder::new_local(path.to_string_lossy().as_ref())
                 .build()
                 .await?,
+            write_gate: Arc::new(Mutex::new(())),
         })
     }
 
@@ -81,6 +86,7 @@ impl Repository {
     }
 
     pub async fn migrate(&self) -> Result<()> {
+        let _write_guard = self.write_gate.lock().await;
         migrations::migrate(&self.connection().await?).await
     }
 
@@ -117,6 +123,7 @@ impl Repository {
     }
 
     pub async fn upsert(&self, m: &NormalizedMessage) -> Result<UpsertOutcome> {
+        let _write_guard = self.write_gate.lock().await;
         let mut c = self.connection().await?;
         let tx =
             turso::transaction::Transaction::new(&mut c, TransactionBehavior::Immediate).await?;
@@ -545,6 +552,7 @@ impl Repository {
     }
 
     pub async fn mark_indexed(&self, id: i64, hash: &str) -> Result<()> {
+        let _write_guard = self.write_gate.lock().await;
         let c = self.connection().await?;
         c.execute(
             "UPDATE documents
@@ -562,6 +570,7 @@ impl Repository {
     }
 
     pub async fn mark_error(&self, id: i64, hash: &str, error: &str) -> Result<()> {
+        let _write_guard = self.write_gate.lock().await;
         let c = self.connection().await?;
         c.execute(
             "UPDATE documents
@@ -579,6 +588,7 @@ impl Repository {
     }
 
     pub async fn mark_indexed_any(&self, id: i64, hash: &str) -> Result<()> {
+        let _write_guard = self.write_gate.lock().await;
         let c = self.connection().await?;
         c.execute(
             "UPDATE documents
@@ -601,6 +611,7 @@ impl Repository {
         if versions.is_empty() {
             return Ok(());
         }
+        let _write_guard = self.write_gate.lock().await;
         let mut c = self.connection().await?;
         let tx =
             turso::transaction::Transaction::new(&mut c, TransactionBehavior::Immediate).await?;
@@ -623,6 +634,7 @@ impl Repository {
     }
 
     pub async fn requeue(&self, source: &str, id: &str) -> Result<Option<(i64, IndexState)>> {
+        let _write_guard = self.write_gate.lock().await;
         let c = self.connection().await?;
         let n = c
             .execute(

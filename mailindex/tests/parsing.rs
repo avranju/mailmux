@@ -14,6 +14,70 @@ fn limits() -> ContentConfig {
     }
 }
 
+fn attachment_message(media: &str, encoding: &str, payload: &str) -> String {
+    format!(
+        "Subject: Attachment\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=parts\r\n\r\n\
+         --parts\r\nContent-Type: text/plain\r\n\r\nBody\r\n\
+         --parts\r\nContent-Type: {media}\r\nContent-Transfer-Encoding: {encoding}\r\n\
+         Content-Disposition: attachment; filename=attachment\r\n\r\n{payload}\r\n--parts--\r\n"
+    )
+}
+
+#[test]
+fn attached_messages_keep_payload_size_hash_and_size_limits() {
+    for (encoding, encoded, payload) in [
+        (
+            "7bit",
+            "Subject: Forwarded\r\n\r\nNested payload.",
+            "Subject: Forwarded\r\n\r\nNested payload.",
+        ),
+        (
+            "7bit",
+            "Subject: Another message\r\n\r\nDifferent payload.",
+            "Subject: Another message\r\n\r\nDifferent payload.",
+        ),
+        (
+            "quoted-printable",
+            "Subject:=20Forwarded=0D=0A=0D=0ANested=20payload.",
+            "Subject: Forwarded\r\n\r\nNested payload.",
+        ),
+    ] {
+        let raw = attachment_message("message/rfc822", encoding, encoded);
+        let parsed = parser::parse(raw.as_bytes(), &limits()).unwrap();
+        assert_eq!(parsed.attachments.len(), 1);
+        let attachment = &parsed.attachments[0];
+        assert_eq!(attachment.media_type.as_deref(), Some("message/rfc822"));
+        assert_eq!(attachment.size_bytes, payload.len() as i64);
+        assert_eq!(
+            attachment.sha256,
+            mailindex::ingest::sha256(payload.as_bytes())
+        );
+        assert_eq!(attachment.status, "unsupported");
+
+        let mut cfg = limits();
+        cfg.max_attachment_bytes = payload.len() - 1;
+        let oversized = parser::parse(raw.as_bytes(), &cfg).unwrap();
+        assert_eq!(oversized.attachments[0].status, "too_large");
+        assert_eq!(oversized.attachments[0].size_bytes, payload.len() as i64);
+    }
+}
+
+#[test]
+fn text_attachments_retain_the_declared_mime_subtype() {
+    for (media, payload) in [
+        ("text/calendar", "BEGIN:VCALENDAR\r\nEND:VCALENDAR"),
+        ("text/csv", "name,amount\r\nAlice,42"),
+        ("text/html", "<b>Attachment marker</b>"),
+    ] {
+        let raw = attachment_message(media, "7bit", payload);
+        let parsed = parser::parse(raw.as_bytes(), &limits()).unwrap();
+        let attachment = &parsed.attachments[0];
+        assert_eq!(attachment.media_type.as_deref(), Some(media));
+        assert_eq!(attachment.status, "extracted");
+        assert!(attachment.text.is_some());
+    }
+}
+
 #[test]
 fn fixtures_parse_authoritative_metadata_and_safe_html_fallback() {
     let p = parser::parse(fixture("plain.eml"), &limits()).unwrap();

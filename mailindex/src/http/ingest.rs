@@ -6,7 +6,10 @@ use crate::{
 };
 use axum::{
     Json,
-    extract::{Multipart, Path, State, multipart::MultipartRejection},
+    extract::{
+        Multipart, Path, State,
+        multipart::{MultipartError, MultipartRejection},
+    },
     http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -35,6 +38,14 @@ fn is_multipart_content_type(value: &str) -> bool {
     })
 }
 
+fn multipart_error(error: MultipartError) -> AppError {
+    if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        AppError::TooLarge
+    } else {
+        AppError::Invalid(error.body_text())
+    }
+}
+
 pub async fn upload(
     State(st): State<AppState>,
     Path((source, source_id)): Path<(String, String)>,
@@ -54,19 +65,12 @@ pub async fn upload(
     validate_identity(&source_id).map_err(|e| AppError::Invalid(e.to_string()))?;
     let mut metadata = None;
     let mut message = None;
-    while let Some(field) = multipart.next_field().await.map_err(|error| {
-        let message = error.to_string();
-        if message.contains("length limit") || message.contains("body too large") {
-            AppError::TooLarge
-        } else {
-            AppError::Invalid(message)
-        }
-    })? {
+    while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
         let name = field.name().unwrap_or("").to_owned();
         if name != "metadata" && name != "message" {
             return Err(AppError::Invalid("unexpected multipart field".into()));
         }
-        let bytes = field.bytes().await.map_err(|_| AppError::TooLarge)?;
+        let bytes = field.bytes().await.map_err(multipart_error)?;
         if name == "metadata" {
             if metadata.is_some() {
                 return Err(AppError::Invalid("duplicate metadata".into()));

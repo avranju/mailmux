@@ -51,22 +51,21 @@ pub fn parse(raw: &[u8], cfg: &ContentConfig) -> Result<Parsed> {
         .unwrap_or_default();
     let mut attachments = Vec::new();
     for (i, p) in m.attachments().enumerate() {
-        let (bytes, media) = match &p.body {
-            PartType::Binary(b) | PartType::InlineBinary(b) => (
-                b.as_ref(),
-                p.content_type()
-                    .map(|x| format!("{}/{}", x.c_type, x.c_subtype.as_deref().unwrap_or(""))),
-            ),
-            PartType::Text(t) => (t.as_bytes(), Some("text/plain".into())),
-            PartType::Html(t) => (t.as_bytes(), Some("text/html".into())),
-            _ => (b"".as_slice(), None),
-        };
-        let media = media
-            .or_else(|| {
-                p.content_type()
-                    .map(|x| format!("{}/{}", x.c_type, x.c_subtype.as_deref().unwrap_or("")))
-            })
-            .unwrap_or_else(|| "application/octet-stream".into());
+        // contents() also returns the nested payload for message/rfc822,
+        // including transfer-decoded bytes and the nested message's headers.
+        let bytes = p.contents();
+        let media = p
+            .content_type()
+            .map(|x| format!("{}/{}", x.c_type, x.c_subtype.as_deref().unwrap_or("")))
+            .unwrap_or_else(|| {
+                match &p.body {
+                    PartType::Text(_) => "text/plain",
+                    PartType::Html(_) => "text/html",
+                    PartType::Message(_) => "message/rfc822",
+                    _ => "application/octet-stream",
+                }
+                .into()
+            });
         let (status, text, error, truncated) =
             extractors::extract(&media, p.attachment_name(), bytes, cfg);
         attachments.push(NormalizedAttachment {

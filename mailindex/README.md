@@ -40,6 +40,10 @@ worker; canonical Turso rows remain the source of truth. The `rebuild-index` com
 must be run with the serving process stopped and builds a sibling index before a
 backup-and-swap installation. `index-status` reports canonical state counts.
 
+Database writes are serialized across uploads and indexing state updates. The
+configured request limit also applies to multipart uploads. Citation pages disclose
+both text truncated during ingestion and text omitted by the retrieval limit.
+
 ```sh
 mailindex --config /etc/mailindex/config.toml index-status
 # Stop the serving process first; rebuild uses Tantivy's writer lock.

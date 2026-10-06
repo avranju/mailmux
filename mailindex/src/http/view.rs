@@ -24,6 +24,9 @@ pub async fn view(
         esc(subject),
         esc(subject)
     );
+    if d.response_truncated {
+        out.push_str("<p>Some content is omitted because this page reached its text limit.</p>");
+    }
     out.push_str("<dl>");
     let row = |out: &mut String, label: &str, value: &str| {
         out.push_str(&format!("<dt>{}</dt><dd>{}</dd>", label, esc(value)));
@@ -65,10 +68,14 @@ pub async fn view(
     row(&mut out, "Index state", &format!("{:?}", d.index_state));
     out.push_str("</dl><h2>Body</h2><pre>");
     out.push_str(&esc(&d.body));
+    out.push_str("</pre>");
     if d.body_truncated {
-        out.push_str("</pre><p>Body was truncated during normalization.</p>");
-    } else {
-        out.push_str("</pre>");
+        out.push_str("<p>Body was truncated during normalization.</p>");
+    }
+    if d.body_response_truncated {
+        out.push_str(
+            "<p>Body is shortened for display because this page reached its text limit.</p>",
+        );
     }
     out.push_str("<h2>Attachments</h2><ul>");
     for a in d.attachments {
@@ -108,6 +115,12 @@ pub async fn view(
                 "<details><summary>Extracted text</summary><pre>{}</pre></details>",
                 esc(&t)
             ));
+        }
+        if a.text_truncated {
+            out.push_str("<p>Attachment text was truncated during extraction.</p>");
+        }
+        if a.response_truncated {
+            out.push_str("<p>Attachment text is shortened for display because this page reached its text limit.</p>");
         }
         out.push_str("</li>");
     }
