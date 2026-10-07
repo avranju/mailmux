@@ -37,6 +37,7 @@ pub struct PostReceipt {
     pub id: Option<String>,
 }
 
+#[allow(clippy::double_must_use)] // async_trait futures and Result are both must-use.
 #[async_trait]
 pub trait TransactionEndpoint: Send + Sync {
     fn name(&self) -> &'static str;
