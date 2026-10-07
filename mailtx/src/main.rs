@@ -53,6 +53,7 @@ async fn main() {
 
 async fn run(m: &mut Metrics) -> Result<()> {
     let config = config::Config::load()?;
+    let llm_config = config.resolve_llm()?;
     let endpoint = endpoint::build_endpoint(&config);
     let http_client = reqwest::Client::new();
 
@@ -153,7 +154,7 @@ async fn run(m: &mut Metrics) -> Result<()> {
 
     let body = email::extract_body(&email.raw_message_path)?;
 
-    let llm_client = genai::Client::default();
+    let llm_client = llm::LlmClient::from_config(&llm_config)?;
 
     // Fetch existing categories from Firefly so the LLM can reuse them.
     let categories = match endpoint.fetch_categories(&http_client).await {
@@ -168,24 +169,27 @@ async fn run(m: &mut Metrics) -> Result<()> {
         }
     };
 
-    let tx =
-        match llm::extract_transaction(&llm_client, &config.llm_model, subject, &body, &categories)
-            .await
-        {
-            Ok(tx) => {
-                m.llm_result = Some("success");
-                tx
-            }
-            Err(e) => {
-                m.llm_result = Some("error");
-                return Err(e);
-            }
-        };
+    let tx = match llm_client
+        .extract_transaction(subject, &body, &categories)
+        .await
+    {
+        Ok(tx) => {
+            m.llm_result = Some("success");
+            tx
+        }
+        Err(e) => {
+            m.llm_result = Some("error");
+            return Err(e);
+        }
+    };
 
-    if tx.status != "found" {
+    if tx.status == "not_found" {
         info!("LLM did not find transaction data in email, skipping");
         m.result = Some("no_transaction");
         return Ok(());
+    }
+    if tx.status != "found" {
+        anyhow::bail!("LLM returned an invalid transaction status");
     }
 
     let category_name = tx

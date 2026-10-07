@@ -1,6 +1,6 @@
 # Design: configurable LLM servers for mailtx
 
-**Status:** Proposed; no runtime changes implemented.
+**Status:** Implemented. See [mailtx configuration](../README.md#configuration) and the [manual testing guide](manual-testing.md) for current usage.
 
 ## Recommendation
 
@@ -22,6 +22,10 @@ Ollama `/api/chat`, Anthropic Messages, and OpenAI Responses are different
 protocols; they are not interchangeable endpoint paths. Existing provider
 support remains available through `genai`. Other custom protocols can be added
 as explicit backends if needed.
+
+## Pre-implementation assessment
+
+The following assessment describes the source before this design was implemented.
 
 ## Current implementation and gaps
 

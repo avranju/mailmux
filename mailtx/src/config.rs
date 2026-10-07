@@ -1,6 +1,62 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use serde_json::{Map, Value};
+use std::time::Duration;
 use tracing::warn;
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmBackend {
+    #[default]
+    Auto,
+    #[serde(rename = "openai_compatible")]
+    OpenAiCompatible,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmResponseFormat {
+    #[default]
+    JsonSchema,
+    JsonObject,
+    Prompt,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct LlmConfig {
+    #[serde(default)]
+    pub backend: LlmBackend,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub endpoint: Option<String>,
+    pub api_key_env: Option<String>,
+    pub response_format: Option<LlmResponseFormat>,
+    pub timeout_secs: Option<u64>,
+    pub connect_timeout_secs: Option<u64>,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f64>,
+    pub allow_insecure_http: Option<bool>,
+    pub extra_body: Option<toml::Table>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedLlmConfig {
+    pub backend: LlmBackend,
+    pub model: String,
+    pub response_format: LlmResponseFormat,
+    pub timeout: Duration,
+    pub connect_timeout: Duration,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f64>,
+    pub custom: Option<ResolvedOpenAiCompatibleConfig>,
+}
+#[derive(Debug, Clone)]
+pub struct ResolvedOpenAiCompatibleConfig {
+    pub url: reqwest::Url,
+    pub api_key_env: Option<String>,
+    pub extra_body: Map<String, Value>,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -9,8 +65,8 @@ pub struct Config {
     /// Model name passed to genai, e.g. "claude-haiku-4-5-20251001" or "gpt-4o-mini".
     /// genai infers the provider from the model name and reads the corresponding
     /// API key from the environment automatically (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.).
-    #[serde(default = "default_llm_model")]
-    pub llm_model: String,
+    pub llm_model: Option<String>,
+    pub llm: Option<LlmConfig>,
     /// Tag applied to every transaction posted to Firefly. Defaults to "mailmux-mailtx".
     #[serde(default = "default_tag")]
     pub tag: String,
@@ -43,6 +99,143 @@ pub struct TransferRule {
     /// description of the deposit email for this rule to match.
     #[serde(default)]
     pub deposit_keywords: Vec<String>,
+}
+
+pub fn build_llm_url(base: &str, endpoint: &str, allow_http: bool) -> Result<reqwest::Url> {
+    if base.contains('\\') {
+        anyhow::bail!("llm.base_url contains a forbidden backslash");
+    }
+    let mut url =
+        reqwest::Url::parse(base).map_err(|_| anyhow::anyhow!("llm.base_url is invalid"))?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.host().is_none()
+    {
+        anyhow::bail!(
+            "llm.base_url must be absolute and contain no credentials, query, or fragment"
+        );
+    }
+    if url.scheme() != "https" && !(allow_http && url.scheme() == "http") {
+        anyhow::bail!("llm.base_url requires HTTPS unless llm.allow_insecure_http is true");
+    }
+    if !endpoint.starts_with('/')
+        || endpoint.starts_with("//")
+        || endpoint.contains(['\\', '?', '#'])
+    {
+        anyhow::bail!("llm.endpoint must be a single-leading-slash path");
+    }
+    let mut decoded = endpoint.to_string();
+    let original_slashes = endpoint.matches('/').count();
+    let mut stable = false;
+    for _ in 0..64 {
+        // URL parsers may discard ASCII tab/newline characters before resolving
+        // dot segments, so reject them in every representation we inspect.
+        if decoded.chars().any(char::is_control) {
+            anyhow::bail!("llm.endpoint contains a forbidden control character");
+        }
+        if decoded.split('/').any(|s| s == "." || s == "..")
+            || decoded.contains('\\')
+            || decoded.matches('/').count() > original_slashes
+        {
+            anyhow::bail!("llm.endpoint contains traversal or encoded separators");
+        }
+        let next = percent_decode(&decoded)?;
+        if next == decoded {
+            stable = true;
+            break;
+        }
+        decoded = next;
+    }
+    if !stable {
+        anyhow::bail!("llm.endpoint encoding is too deeply nested");
+    }
+    let origin = (
+        url.scheme().to_string(),
+        url.host_str().unwrap_or("").to_string(),
+        url.port(),
+    );
+    let prefix = url.path().trim_end_matches('/');
+    url.set_path(&format!("{prefix}{endpoint}"));
+    if (
+        url.scheme().to_string(),
+        url.host_str().unwrap_or("").to_string(),
+        url.port(),
+    ) != origin
+    {
+        anyhow::bail!("llm.endpoint changes URL origin");
+    }
+    Ok(url)
+}
+fn percent_decode(input: &str) -> Result<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                anyhow::bail!("llm.endpoint has malformed escape");
+            }
+            let h = std::str::from_utf8(&bytes[i + 1..i + 3])
+                .ok()
+                .and_then(|x| u8::from_str_radix(x, 16).ok())
+                .ok_or_else(|| anyhow::anyhow!("llm.endpoint has malformed escape"))?;
+            out.push(h);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| anyhow::anyhow!("llm.endpoint has invalid encoding"))
+}
+pub fn extra_body_to_json(table: &toml::Table) -> Result<Map<String, Value>> {
+    const RESERVED: &[&str] = &[
+        "model",
+        "messages",
+        "stream",
+        "response_format",
+        "max_tokens",
+        "max_completion_tokens",
+        "temperature",
+        "n",
+    ];
+    let mut result = Map::new();
+    for (key, value) in table {
+        if RESERVED.contains(&key.as_str()) {
+            anyhow::bail!("llm.extra_body contains a managed request key");
+        }
+        let json = toml_value_to_json(value)?;
+        result.insert(key.clone(), json);
+    }
+    Ok(result)
+}
+fn toml_value_to_json(value: &toml::Value) -> Result<Value> {
+    Ok(match value {
+        toml::Value::String(v) => Value::String(v.clone()),
+        toml::Value::Integer(v) => Value::Number((*v).into()),
+        toml::Value::Float(v) if v.is_finite() => serde_json::Number::from_f64(*v)
+            .map(Value::Number)
+            .ok_or_else(|| anyhow::anyhow!("llm.extra_body contains a nonfinite number"))?,
+        toml::Value::Float(_) => anyhow::bail!("llm.extra_body contains a nonfinite number"),
+        toml::Value::Boolean(v) => Value::Bool(*v),
+        toml::Value::Datetime(_) => {
+            anyhow::bail!("llm.extra_body does not support datetime values")
+        }
+        toml::Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(toml_value_to_json)
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        toml::Value::Table(table) => Value::Object(
+            table
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), toml_value_to_json(v)?)))
+                .collect::<Result<Map<_, _>>>()?,
+        ),
+    })
 }
 
 fn default_llm_model() -> String {
@@ -118,8 +311,14 @@ impl Config {
             .context("MAILTX_CONFIG env var required (path to TOML config file)")?;
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading config file: {path}"))?;
-        let mut config: Self =
-            toml::from_str(&content).with_context(|| format!("parsing config file: {path}"))?;
+        let mut config: Self = toml::from_str(&content).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid TOML configuration in {} at {}:{}",
+                path,
+                e.span().map(|s| s.start).unwrap_or(0),
+                "unknown"
+            )
+        })?;
 
         // Normalise allowed_senders to lowercase mailbox addresses and drop invalid entries.
         config.allowed_senders = config
@@ -145,6 +344,88 @@ impl Config {
         }
 
         Ok(config)
+    }
+
+    pub fn resolve_llm(&self) -> Result<ResolvedLlmConfig> {
+        let raw = self.llm.as_ref();
+        if raw.is_some() && self.llm_model.is_some() {
+            anyhow::bail!("llm_model cannot be combined with [llm]");
+        }
+        let backend = raw.map_or(LlmBackend::Auto, |c| c.backend);
+        let model = if backend == LlmBackend::OpenAiCompatible {
+            raw.and_then(|c| c.model.clone())
+                .ok_or_else(|| anyhow::anyhow!("llm.model is required for openai_compatible"))?
+        } else {
+            raw.and_then(|c| c.model.clone())
+                .or_else(|| self.llm_model.clone())
+                .unwrap_or_else(default_llm_model)
+        };
+        if model.trim().is_empty() {
+            anyhow::bail!("llm.model must not be blank");
+        }
+        let response_format = raw.and_then(|c| c.response_format).unwrap_or_default();
+        let timeout_secs = raw.and_then(|c| c.timeout_secs).unwrap_or(60);
+        let connect_secs = raw.and_then(|c| c.connect_timeout_secs).unwrap_or(10);
+        if timeout_secs == 0 || connect_secs == 0 || connect_secs > timeout_secs {
+            anyhow::bail!(
+                "LLM deadlines must be positive and connect_timeout_secs must not exceed timeout_secs"
+            );
+        }
+        let mut max_tokens = raw.and_then(|c| c.max_tokens);
+        if max_tokens == Some(0) {
+            anyhow::bail!("llm.max_tokens must be positive");
+        }
+        let mut temperature = raw.and_then(|c| c.temperature);
+        if let Some(t) = temperature
+            && (!t.is_finite() || !(0.0..=2.0).contains(&t))
+        {
+            anyhow::bail!("llm.temperature must be between 0 and 2");
+        }
+        let custom = if backend == LlmBackend::OpenAiCompatible {
+            let c = raw.expect("custom backend requires llm table");
+            let base = c
+                .base_url
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("llm.base_url is required"))?;
+            let endpoint = c.endpoint.as_deref().unwrap_or("/v1/chat/completions");
+            let url = build_llm_url(base, endpoint, c.allow_insecure_http.unwrap_or(false))?;
+            if c.api_key_env
+                .as_deref()
+                .is_some_and(|v| v.trim().is_empty())
+            {
+                anyhow::bail!("llm.api_key_env must not be blank");
+            }
+            max_tokens = Some(max_tokens.unwrap_or(1024));
+            temperature = Some(temperature.unwrap_or(0.0));
+            Some(ResolvedOpenAiCompatibleConfig {
+                url,
+                api_key_env: c.api_key_env.clone(),
+                extra_body: extra_body_to_json(
+                    c.extra_body.as_ref().unwrap_or(&toml::Table::new()),
+                )?,
+            })
+        } else {
+            if let Some(c) = raw
+                && (c.base_url.is_some()
+                    || c.endpoint.is_some()
+                    || c.api_key_env.is_some()
+                    || c.allow_insecure_http.is_some()
+                    || c.extra_body.is_some())
+            {
+                anyhow::bail!("custom LLM settings require backend = openai_compatible");
+            }
+            None
+        };
+        Ok(ResolvedLlmConfig {
+            backend,
+            model,
+            response_format,
+            timeout: Duration::from_secs(timeout_secs),
+            connect_timeout: Duration::from_secs(connect_secs),
+            max_tokens,
+            temperature,
+            custom,
+        })
     }
 
     /// Returns true if the sender's parsed mailbox address exactly matches an
@@ -339,7 +620,8 @@ error_if_duplicate_hash = false"#,
     fn test_config(allowed_senders: Vec<String>) -> Config {
         Config {
             allowed_senders,
-            llm_model: "test-model".to_string(),
+            llm_model: Some("test-model".to_string()),
+            llm: None,
             tag: "test-tag".to_string(),
             firefly: FireflyConfig {
                 base_url: "https://firefly.example/api".to_string(),
@@ -356,6 +638,137 @@ error_if_duplicate_hash = false"#,
             transfer_match_window_hours: 48,
             transfer_rules: vec![],
         }
+    }
+
+    #[test]
+    fn resolves_legacy_and_custom_defaults() {
+        let mut config = test_config(vec![]);
+        config.llm_model = None;
+        assert_eq!(
+            config.resolve_llm().unwrap().model,
+            "claude-haiku-4-5-20251001"
+        );
+        config.llm = Some(super::LlmConfig {
+            backend: super::LlmBackend::OpenAiCompatible,
+            model: Some(" org/model::x ".into()),
+            base_url: Some("http://localhost:8080/prefix/".into()),
+            allow_insecure_http: Some(true),
+            ..Default::default()
+        });
+        let resolved = config.resolve_llm().unwrap();
+        assert_eq!(resolved.model, " org/model::x ");
+        assert_eq!(
+            resolved.custom.unwrap().url.as_str(),
+            "http://localhost:8080/prefix/v1/chat/completions"
+        );
+        assert_eq!(resolved.max_tokens, Some(1024));
+        assert_eq!(resolved.temperature, Some(0.0));
+    }
+
+    #[test]
+    fn accepts_toml_documented_backend_spelling_and_auto_model() {
+        let raw: super::LlmConfig = toml::from_str(
+            r#"backend = "openai_compatible"
+model = "opaque/model::id"
+base_url = "https://llm.example/prefix""#,
+        )
+        .unwrap();
+        let mut config = test_config(vec![]);
+        config.llm_model = None;
+        config.llm = Some(raw);
+        assert_eq!(config.resolve_llm().unwrap().model, "opaque/model::id");
+
+        let raw: super::LlmConfig = toml::from_str("model = \"gpt-4o-mini\"").unwrap();
+        config.llm = Some(raw);
+        assert_eq!(config.resolve_llm().unwrap().model, "gpt-4o-mini");
+        config.llm = None;
+        assert_eq!(
+            config.resolve_llm().unwrap().model,
+            "claude-haiku-4-5-20251001"
+        );
+        config.llm_model = Some("legacy".into());
+        config.llm = Some(super::LlmConfig::default());
+        assert!(config.resolve_llm().is_err());
+    }
+
+    #[test]
+    fn extra_body_rejects_managed_keys_and_converts_nested_values() {
+        let table: toml::Table = toml::from_str("x = { nested = [1, true, 'ok'] }").unwrap();
+        let converted = super::extra_body_to_json(&table).unwrap();
+        assert_eq!(converted["x"]["nested"][1], true);
+        for key in [
+            "model",
+            "messages",
+            "stream",
+            "response_format",
+            "max_tokens",
+            "max_completion_tokens",
+            "temperature",
+            "n",
+        ] {
+            let table = toml::from_str::<toml::Table>(&format!("{key} = 1")).unwrap();
+            assert!(super::extra_body_to_json(&table).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn rejects_zero_tokens_and_accepts_positive_tokens() {
+        let mut config = test_config(vec![]);
+        config.llm_model = None;
+        config.llm = Some(toml::from_str("max_tokens = 0").unwrap());
+        assert!(config.resolve_llm().is_err());
+        config.llm = Some(toml::from_str("max_tokens = 42").unwrap());
+        assert_eq!(config.resolve_llm().unwrap().max_tokens, Some(42));
+        assert!(toml::from_str::<super::LlmConfig>("max_tokens = -1").is_err());
+        assert!(toml::from_str::<super::LlmConfig>("max_tokens = 4294967296").is_err());
+    }
+
+    #[test]
+    fn rejects_control_character_traversal_and_preserves_prefix() {
+        for control in ['\t', '\r', '\n'] {
+            let endpoint = format!("/.{control}./v1/chat/completions");
+            assert!(
+                super::build_llm_url("https://example.test/inference", &endpoint, false).is_err(),
+                "control character {control:?}"
+            );
+            let encoded = match control {
+                '\t' => "%09",
+                '\r' => "%0d",
+                _ => "%0a",
+            };
+            let endpoint = format!("/.{encoded}./v1/chat/completions");
+            assert!(
+                super::build_llm_url("https://example.test/inference", &endpoint, false).is_err()
+            );
+        }
+        for endpoint in ["/v1/chat/completions", "/nested/path"] {
+            let url =
+                super::build_llm_url("https://example.test/inference/", endpoint, false).unwrap();
+            assert!(url.path().starts_with("/inference/"), "{}", url.path());
+        }
+    }
+
+    #[test]
+    fn rejects_llm_endpoint_traversal_and_insecure_policy() {
+        for endpoint in [
+            "//evil/x",
+            "/../x",
+            "/%2e%2e/x",
+            "/%252e%252e/x",
+            "/a%2fb",
+            "/a%252fb",
+            "/%252525252e%252525252e/x",
+            "/%2525252525252525252e%2525252525252525252e/x",
+            "/a%2525252525252525252fb",
+            "/a%2525252525252525255cb",
+        ] {
+            assert!(
+                super::build_llm_url("https://example.test/prefix", endpoint, false).is_err(),
+                "{endpoint}"
+            );
+        }
+        assert!(super::build_llm_url("http://lan.local", "/v1/chat/completions", false).is_err());
+        assert!(super::build_llm_url("http://lan.local", "/v1/chat/completions", true).is_ok());
     }
 
     // ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@ repository.
 
 **mailtx** is a mailmux command processor binary. It is invoked by
 mailmux once per `email_arrived` event, reads a JSON payload from stdin,
-extracts bank transaction data from the email using the Anthropic Claude API,
+extracts bank transaction data from the email using either genai provider routing or an explicitly configured OpenAI-compatible Chat Completions endpoint,
 and posts the result to a configured HTTP endpoint.
 
 It is a **standalone Rust binary** — it has no shared code with mailmux and
@@ -48,7 +48,7 @@ stdin JSON
   → check email.sender against ALLOWED_SENDERS        (skip → exit 0)
   → read raw_message_path from disk
   → extract plain-text body (text/plain preferred, HTML stripped if needed)
-  → call Anthropic Messages API with structured prompt
+  → LlmClient builds shared prompt/schema and calls auto(genai) or custom Chat Completions
   → if status = "not_found" → skip → exit 0
   → HTTP POST { amount, transaction_type, narration } to ENDPOINT_URL
   → exit 0 on success, exit 1 on any error
@@ -59,11 +59,12 @@ stdin JSON
 | File        | Role                                                                                                              |
 | ----------- | ----------------------------------------------------------------------------------------------------------------- |
 | `main.rs`   | Orchestrates the pipeline; owns stdin reading and exit code                                                       |
-| `config.rs` | Loads config from a TOML file (`MAILTX_CONFIG`); `sender_allowed()` does substring match                         |
+| `config.rs` | Loads config from a TOML file (`MAILTX_CONFIG`); `sender_allowed()` does exact normalized mailbox matching                         |
 | `input.rs`  | Minimal serde types mirroring mailmux's stdin schema; only used fields are declared                               |
 | `email.rs`  | Reads `.eml` file with `mail-parser`; prefers text/plain, strips HTML via regex if only text/html is available    |
-| `llm.rs`    | Anthropic Messages API (`POST /v1/messages`); parses JSON response; strips markdown code fences from model output |
-| `post.rs`   | HTTP POST to `ENDPOINT_URL` with `Authorization` header                                                           |
+| `llm.rs`    | LlmClient dispatch, shared prompt/schema, and strict transaction validation |
+| `llm/openai_compatible.rs` | Dedicated custom Chat Completions transport with explicit auth and bounded responses |
+| `endpoint/` | Firefly and endpoint HTTP operations                                                           |
 
 ## Configuration
 
@@ -83,7 +84,7 @@ Configuration is split between a TOML file (most settings) and a few env vars
 ### TOML config file
 
 ```toml
-# Senders matched as case-insensitive substrings of the From header.
+# Senders matched as exact normalized mailbox addresses.
 allowed_senders = ["alerts@mybank.com", "noreply@anotherbank.com"]
 
 # Model name passed to genai. Provider is inferred from the name.
@@ -163,23 +164,24 @@ environment that starts mailmux (systemd `EnvironmentFile`, Docker Compose
   on `html5ever` (the Servo HTML parser). It handles malformed HTML gracefully
   and is spec-compliant. The `width` parameter (120) controls line wrapping and
   has no effect on LLM input quality.
-- **LLM output may include markdown fences.** `llm.rs` strips ` ```json ` /
-  ` ``` ` wrappers before parsing the JSON response.
+- **LLM outputs are untrusted.** Shared parsing accepts bare JSON or one enclosing Markdown fence and validates status and business fields without exposing model output in errors.
+- **Configuration is resolved before pipeline side effects.** `Config::resolve_llm` validates backend and endpoint settings; custom credentials are read only from an explicitly named `api_key_env`.
+- **Timeouts are coordinated.** LLM calls have bounded connection and total deadlines; configure mailmux's outer timeout longer than the LLM deadline plus Firefly work.
 
 ## Adding or Changing Behaviour
 
 **To add a new extracted field** (e.g. account number):
 
 1. Add the field to `TransactionData` in `src/llm.rs`
-2. Update the prompt string in `PROMPT_TEMPLATE`
-3. Update `TransactionPayload` in `src/post.rs` if the field should be posted
+2. Update `build_prompt` and `transaction_schema` in `src/llm.rs`
+3. Update the canonical Firefly transaction payload in `src/endpoint/firefly.rs` if the field should be posted
 
 **To change the LLM model**, update `llm_model` in the TOML config file — no
 code change needed. `genai` infers the provider from the model name and reads
 the relevant API key env var automatically.
 
-**To change the endpoint payload shape**, edit `TransactionPayload` in
-`src/post.rs`.
+**To change the Firefly endpoint payload shape**, edit the payload types in
+`src/endpoint/firefly.rs`.
 
 **To add a new config variable**, add it to the appropriate struct in
 `src/config.rs` (derive `Deserialize`), document it in the TOML example in
@@ -187,10 +189,10 @@ README.md and this file.
 
 ## Tests
 
-No tests currently exist. When adding tests:
+Tests exist for sender normalization, Firefly behavior, transfer state, and pipeline helpers. When adding tests:
 
 - Unit-test `config::Config::sender_allowed` with edge cases (full "Name
-  <email>" format, case differences, partial substrings)
+  <email>" format, case differences, and non-exact mailbox addresses)
 - Unit-test `email::html_to_text` with samples of real bank notification HTML
 - Integration-test the LLM and post modules with a mock HTTP server (e.g.
   `wiremock`)

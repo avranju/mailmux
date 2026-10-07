@@ -273,11 +273,11 @@ identification.
 - Detailed docs: `mailtx/README.md`
 
 Configuration lives in a TOML file whose path is given by the `MAILTX_CONFIG`
-environment variable. LLM API keys (`ANTHROPIC_API_KEY`, etc.) are read from
-the environment by the `genai` crate. These can be supplied either via
-`config.env` in the processor block (added on top of the inherited environment)
-or by setting them in the environment that starts mailmux (systemd
-`EnvironmentFile`, Docker Compose `environment`, etc.).
+environment variable. Provider API keys are inferred from the environment only
+in `auto` mode. Custom OpenAI-compatible endpoints use an explicit `api_key_env`
+or no authentication; see [mailtx custom endpoint configuration](mailtx/README.md#configuration).
+For cold local models, allow enough time beyond the LLM deadline (for example,
+180 seconds for LLM plus a 240-second mailmux processor timeout, concurrency 1).
 
 Typical integration in `mailmux` config:
 

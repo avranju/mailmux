@@ -7,7 +7,7 @@ For each incoming email it:
 
 1. Checks the sender against a configured allow-list — skips silently if not matched
 2. Reads the raw `.eml` file and extracts a plain-text body (strips HTML if needed)
-3. Sends the subject and body to the Anthropic Claude API with a structured prompt
+3. Sends the subject and body to the configured LLM backend (`auto` via genai, or an explicit OpenAI-compatible Chat Completions endpoint)
 4. If Claude identifies a bank transaction, maps it to Firefly's transaction
    schema and posts it to Firefly III
 
@@ -57,19 +57,21 @@ ignores the rest.
 | `src/config.rs` | Loads configuration from a TOML file (`MAILTX_CONFIG`)       |
 | `src/input.rs`  | Serde types mirroring the mailmux stdin schema               |
 | `src/email.rs`  | Reads `.eml` file, extracts plain-text body (HTML stripping) |
-| `src/llm.rs`    | Anthropic Messages API call and JSON response parsing        |
+| `src/llm.rs`    | Backend dispatch, shared prompts/schema, and extraction validation |
 | `src/endpoint/` | Endpoint abstraction and Firefly III implementation          |
 
 ### LLM prompt
 
-The prompt asks Claude to return a JSON object with four fields:
+The shared prompt asks the configured model to return a JSON object with six fields:
 
 ```json
 {
   "status": "found",
   "amount": 1234.56,
   "transaction_type": "withdrawal",
-  "narration": "Amazon Pay"
+  "narration": "Amazon Pay",
+  "transaction_date": "2026-02-26T13:45:00+05:30",
+  "category": "Shopping"
 }
 ```
 
@@ -176,7 +178,7 @@ per-email/per-processor outcome record.
 ## Prerequisites
 
 - Rust 1.80+ (edition 2024) — for `std::sync::LazyLock`
-- An Anthropic API key
+- An API key for the selected cloud provider, if required
 - A running mailmux instance
 
 ## Build
@@ -195,8 +197,7 @@ Most configuration lives in a TOML file. Point `MAILTX_CONFIG` at it:
 MAILTX_CONFIG=/etc/mailtx/config.toml
 ```
 
-LLM API keys are read from the environment by the `genai` crate — they do not
-go in the TOML file.
+In `auto` mode, genai infers provider keys from the environment. In custom mode, no provider keys are inferred: use `api_key_env` for an explicit Bearer key or omit it for no authentication.
 
 ### Environment variables
 
@@ -211,7 +212,7 @@ go in the TOML file.
 ### TOML config file
 
 ```toml
-# Senders matched as case-insensitive substrings of the From header.
+# Senders matched as exact normalized mailbox addresses.
 allowed_senders = ["alerts@mybank.com", "noreply@anotherbank.com"]
 
 # Model name passed to genai. Provider (and required API key) is inferred from
@@ -257,7 +258,20 @@ debit_card_last4   = []
 aliases            = ["sbm bank"]
 ```
 
-The LLM provider is inferred automatically from the model name by `genai`:
+With no `[llm]` table, `llm_model` retains genai's automatic provider routing. Or configure auto explicitly (a model in this table is allowed; do not also set `llm_model`):
+
+```toml
+[llm]
+backend = "auto"
+model = "gpt-4o-mini"
+response_format = "json_schema"
+# timeout_secs = 60
+# connect_timeout_secs = 10
+# max_tokens = 1024
+# temperature = 0.0
+```
+
+Custom mode is explicit and sends the configured model ID unchanged:
 
 | Provider       | Example model               | API key env var     |
 | -------------- | --------------------------- | ------------------- |
@@ -267,12 +281,38 @@ The LLM provider is inferred automatically from the model name by `genai`:
 | Groq           | `llama-3.1-8b-instant`      | `GROQ_API_KEY`      |
 | Ollama (local) | `llama3.2`                  | _(no key required)_ |
 
+Example custom configuration (llama.cpp or llama-swap Chat Completions):
+
+```toml
+[llm]
+backend = "openai_compatible"
+model = "bank-extractor"
+base_url = "http://127.0.0.1:8080"
+allow_insecure_http = true
+endpoint = "/v1/chat/completions"
+response_format = "json_schema" # json_schema, json_object, or prompt
+# api_key_env = "MAILTX_LLM_API_KEY" # omitted means no Authorization header
+# timeout_secs = 60; connect_timeout_secs = 10
+# max_tokens = 1024; temperature = 0.0
+```
+
+Custom mode defaults to `/v1/chat/completions`, 60s total/10s connect timeout,
+1024 max tokens, and temperature 0.0. A `[llm]` table conflicts with an explicitly
+set legacy `llm_model`. `extra_body` supports server-specific JSON fields but
+cannot override `model`, `messages`, `stream`, `response_format`, `max_tokens`,
+`max_completion_tokens`, `temperature`, or `n`. Base URL paths are preserved as prefixes;
+no `/v1` is inferred. Native Ollama, llama.cpp completion, Anthropic Messages,
+and OpenAI Responses protocols are not supported here. There is no discovery,
+model management, fallback, or internal retry. HTTP to a custom LLM host requires
+`allow_insecure_http = true` (LAN/container hosts are permitted); prefer HTTPS or
+encrypted tunnels. This permission is separate from Firefly's loopback-only HTTP
+exception. Invalid model output is an error; only valid `not_found` is skipped.
+The 60-second deadline is new; cold models may need `timeout_secs = 180`,
+mailmux timeout around 240 seconds, and `concurrency = 1`.
+
 ### Sender matching
 
-`allowed_senders` entries are matched as **case-insensitive substrings** of the
-full sender field, which may be in `"Display Name <email@domain.com>"` format.
-Matching on the bare email address (e.g. `alerts@mybank.com`) is sufficient and
-is the recommended approach.
+`allowed_senders` entries are matched by exact normalized mailbox address.
 
 ### Asset account matching
 
