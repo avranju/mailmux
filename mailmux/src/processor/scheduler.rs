@@ -82,6 +82,23 @@ impl JobScheduler {
                 continue;
             }
 
+            // Register the entire dispatch atomically. Pending jobs protect an
+            // old event from cleanup between processor executions.
+            let processor_names: Vec<_> = processors.iter().map(|p| p.name()).collect();
+            let mut new_jobs: HashMap<_, _> = match jobs::create_jobs(
+                &self.pool,
+                event.id,
+                &processor_names,
+            )
+            .await
+            {
+                Ok(jobs) => jobs.into_iter().map(|(id, name)| (name, id)).collect(),
+                Err(e) => {
+                    error!(event_id = event.id, error = %e, "failed to register processor jobs");
+                    continue;
+                }
+            };
+
             let email = if let Some(email_id) = event.email_id {
                 match get_email_by_id(&self.pool, email_id).await {
                     Ok(e) => e,
@@ -101,30 +118,16 @@ impl JobScheduler {
 
             for processor in processors {
                 let processor_name = processor.name().to_string();
+                let Some(job_id) = new_jobs.remove(&processor_name) else {
+                    // Duplicate dispatch from the NOTIFY + poll overlap: only
+                    // execute jobs newly registered by this dispatch.
+                    continue;
+                };
                 let timeout_secs = self
                     .processor_configs
                     .get(&processor_name)
                     .map(|c| c.timeout_secs)
                     .unwrap_or(30);
-
-                let job_id = match jobs::create_job(&self.pool, event.id, &processor_name).await {
-                    Ok(Some(id)) => id,
-                    Ok(None) => {
-                        // Job already exists for this (event, processor) pair — duplicate
-                        // dispatch from the NOTIFY + poll overlap. The first dispatch
-                        // already created the job; nothing to do here.
-                        continue;
-                    }
-                    Err(e) => {
-                        error!(
-                            event_id = event.id,
-                            processor = processor_name,
-                            error = %e,
-                            "failed to create processor job"
-                        );
-                        continue;
-                    }
-                };
 
                 self.execute_job(
                     job_id,
@@ -444,6 +447,53 @@ mod tests {
         }
     }
 
+    struct CleanupBetweenProcessors {
+        pool: PgPool,
+        events: Vec<String>,
+        terminal_status: &'static str,
+    }
+
+    #[async_trait]
+    impl Processor for CleanupBetweenProcessors {
+        fn name(&self) -> &str {
+            "first"
+        }
+
+        fn subscribed_events(&self) -> &[String] {
+            &self.events
+        }
+
+        async fn process(
+            &self,
+            event: &Event,
+            _email: Option<&EmailRecord>,
+        ) -> Result<ProcessorOutput> {
+            // Force the state cleanup would observe immediately after the
+            // scheduler finishes this job, before the next processor runs.
+            sqlx::query(
+                "UPDATE processor_jobs SET status = $2 WHERE event_id = $1 AND processor_name = 'first'",
+            )
+            .bind(event.id)
+            .bind(self.terminal_status)
+            .execute(&self.pool)
+            .await?;
+            crate::housekeeping::cleanup_old_events(&self.pool, 30).await?;
+
+            assert!(get_event_by_id(&self.pool, event.id).await?.is_some());
+            let next_job = jobs::get_job_by_event_and_processor(&self.pool, event.id, "second")
+                .await?
+                .expect("the next job must already be registered");
+            assert_eq!(next_job.status, "pending");
+
+            Ok(ProcessorOutput {
+                success: self.terminal_status == "completed",
+                message: None,
+                metadata: None,
+                metrics: vec![],
+            })
+        }
+    }
+
     fn test_processor_config(name: &str, max_retries: u32, backoff: Vec<u64>) -> ProcessorConfig {
         ProcessorConfig {
             name: name.into(),
@@ -455,6 +505,66 @@ mod tests {
             concurrency: 1,
             config: HashMap::new(),
         }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn test_cleanup_preserves_partially_dispatched_event(pool: PgPool) -> Result<()> {
+        for terminal_status in ["completed", "abandoned"] {
+            let event_id = sqlx::query_scalar(
+                r#"
+                INSERT INTO events (event_type, account_id, mailbox_name, created_at)
+                VALUES ('email_arrived', 'test', 'INBOX', now() - interval '60 days')
+                RETURNING id
+                "#,
+            )
+            .fetch_one(&pool)
+            .await?;
+            let event = get_event_by_id(&pool, event_id).await?.unwrap();
+            let registry = Arc::new(ProcessorRegistry::for_tests(vec![
+                Box::new(CleanupBetweenProcessors {
+                    pool: pool.clone(),
+                    events: vec!["email_arrived".into()],
+                    terminal_status,
+                }),
+                Box::new(TestProcessor {
+                    name: "second".into(),
+                    events: vec!["email_arrived".into()],
+                    output: ProcessorOutput {
+                        success: true,
+                        message: None,
+                        metadata: None,
+                        metrics: vec![],
+                    },
+                }),
+            ]));
+            let scheduler = JobScheduler::new(
+                pool.clone(),
+                registry,
+                tokio::sync::mpsc::channel(16).1,
+                CancellationToken::new(),
+                vec![
+                    test_processor_config("first", 0, vec![]),
+                    test_processor_config("second", 0, vec![]),
+                ],
+            );
+
+            scheduler.process_events(vec![event.clone()]).await;
+            // Repeated dispatch must not execute existing jobs again.
+            scheduler.process_events(vec![event]).await;
+            for (name, status) in [("first", terminal_status), ("second", "completed")] {
+                let job = jobs::get_job_by_event_and_processor(&pool, event_id, name)
+                    .await?
+                    .expect("both processors should have run");
+                assert_eq!(job.status, status);
+                assert_eq!(job.attempts, 1);
+            }
+
+            // Once the full dispatch is terminal, retention cleanup can delete it.
+            crate::housekeeping::cleanup_old_events(&pool, 30).await?;
+            assert!(get_event_by_id(&pool, event_id).await?.is_none());
+        }
+        Ok(())
     }
 
     #[sqlx::test(migrations = "./migrations")]

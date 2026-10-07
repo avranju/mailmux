@@ -50,6 +50,28 @@ pub async fn create_job(pool: &PgPool, event_id: i64, processor_name: &str) -> R
     Ok(id)
 }
 
+/// Atomically register all matching processors before any job is executed.
+/// Only newly inserted jobs are returned; existing jobs are left unchanged.
+pub async fn create_jobs(
+    pool: &PgPool,
+    event_id: i64,
+    processor_names: &[&str],
+) -> Result<Vec<(i64, String)>> {
+    sqlx::query_as(
+        r#"
+        INSERT INTO processor_jobs (event_id, processor_name, status)
+        SELECT $1, unnest($2::text[]), 'pending'
+        ON CONFLICT (event_id, processor_name) DO NOTHING
+        RETURNING id, processor_name
+        "#,
+    )
+    .bind(event_id)
+    .bind(processor_names)
+    .fetch_all(pool)
+    .await
+    .context("registering processor jobs")
+}
+
 /// Update a job's status and optionally persist or clear output.
 ///
 /// Use `AttemptsUpdate::Increment` when transitioning to `in_progress` so that
