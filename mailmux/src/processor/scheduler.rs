@@ -24,6 +24,11 @@ pub struct JobScheduler {
     event_rx: mpsc::Receiver<Vec<Event>>,
     token: CancellationToken,
     processor_configs: HashMap<String, ProcessorConfig>,
+    #[cfg(test)]
+    before_claim: Option<(
+        tokio::sync::mpsc::UnboundedSender<()>,
+        Arc<tokio::sync::Barrier>,
+    )>,
 }
 
 impl JobScheduler {
@@ -44,6 +49,8 @@ impl JobScheduler {
             event_rx,
             token,
             processor_configs: configs,
+            #[cfg(test)]
+            before_claim: None,
         }
     }
 
@@ -72,20 +79,20 @@ impl JobScheduler {
 
     async fn process_events(&self, events: Vec<Event>) {
         for event in events {
-            let processors = self.registry.processors_for_event(&event.event_type);
+            let processors = self.registry.processors_for_event(&event);
             if processors.is_empty() {
                 debug!(
                     event_id = event.id,
                     event_type = event.event_type,
-                    "no processors for event type"
+                    "no processors eligible for event"
                 );
-                continue;
             }
 
-            // Register the entire dispatch atomically. Pending jobs protect an
+            // Register the entire dispatch atomically, including zero-match
+            // events, so they cannot block later events in polling batches.
             // old event from cleanup between processor executions.
             let processor_names: Vec<_> = processors.iter().map(|p| p.name()).collect();
-            let mut new_jobs: HashMap<_, _> = match jobs::create_jobs(
+            let mut new_jobs: HashMap<_, _> = match jobs::register_event_dispatch(
                 &self.pool,
                 event.id,
                 &processor_names,
@@ -98,6 +105,10 @@ impl JobScheduler {
                     continue;
                 }
             };
+
+            if new_jobs.is_empty() {
+                continue;
+            }
 
             let email = if let Some(email_id) = event.email_id {
                 match get_email_by_id(&self.pool, email_id).await {
@@ -149,42 +160,33 @@ impl JobScheduler {
         email: Option<&crate::db::emails::EmailRecord>,
         timeout_secs: u64,
     ) {
-        // Clear previous output when entering in_progress so a retry/replay
-        // cannot leave a stale result visible on timeout or error.
-        if let Err(e) = jobs::update_job_status(
-            &self.pool,
-            job_id,
-            "in_progress",
-            None,
-            None,
-            None,
-            jobs::AttemptsUpdate::Increment,
-        )
-        .await
-        {
-            error!(job_id, error = %e, "failed to update job status to in_progress");
-            return;
-        }
-
         let processor = match self
             .registry
-            .processors_for_event(&event.event_type)
-            .into_iter()
-            .find(|p| p.name() == processor_name)
+            .require_processor_for_event(processor_name, event)
         {
-            Some(p) => p,
-            None => {
-                // Can happen if a processor was removed from config after a job was
-                // persisted (e.g. during a retry sweep). Not a bug from process_events.
-                error!(
-                    job_id,
-                    processor = processor_name,
-                    event_id = event.id,
-                    "processor not found in registry; was it removed from config?"
-                );
+            Ok(processor) => processor,
+            Err(error) => {
+                if let Err(db_error) =
+                    jobs::abandon_queued_job(&self.pool, job_id, &error.to_string()).await
+                {
+                    error!(job_id, error = %db_error, "failed to abandon ineligible queued job");
+                }
                 return;
             }
         };
+        #[cfg(test)]
+        if let Some((arrived, barrier)) = &self.before_claim {
+            let _ = arrived.send(());
+            barrier.wait().await;
+        }
+        match jobs::claim_job(&self.pool, job_id).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                error!(job_id, error = %error, "failed to claim queued job");
+                return;
+            }
+        }
 
         let timeout = Duration::from_secs(timeout_secs);
         let result = tokio::time::timeout(timeout, processor.process(event, email)).await;
@@ -355,8 +357,8 @@ impl JobScheduler {
     }
 
     /// Periodically sweep for failed jobs that are ready to retry.
-    async fn retry_sweep(&self) {
-        let retryable = match jobs::get_retryable_jobs(&self.pool, 50).await {
+    pub(crate) async fn retry_sweep(&self) {
+        let retryable = match jobs::get_runnable_jobs(&self.pool, 50).await {
             Ok(jobs) => jobs,
             Err(e) => {
                 debug!(error = %e, "failed to fetch retryable jobs");
@@ -420,6 +422,36 @@ mod tests {
     use crate::processor::ProcessorOutput;
     use async_trait::async_trait;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingProcessor {
+        name: String,
+        events: Vec<String>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Processor for CountingProcessor {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn subscribed_events(&self) -> &[String] {
+            &self.events
+        }
+        async fn process(
+            &self,
+            _event: &Event,
+            _email: Option<&EmailRecord>,
+        ) -> Result<ProcessorOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ProcessorOutput {
+                success: true,
+                message: None,
+                metadata: None,
+                metrics: vec![],
+            })
+        }
+    }
 
     /// A minimal test processor that returns a fixed ProcessorOutput.
     struct TestProcessor {
@@ -494,17 +526,257 @@ mod tests {
         }
     }
 
+    async fn create_scheduler_test_event(pool: &PgPool) -> Result<i64> {
+        Ok(sqlx::query_scalar("INSERT INTO events (event_type, account_id, mailbox_name, payload) VALUES ('email_arrived', 'test', 'INBOX', '{}'::jsonb) RETURNING id")
+            .fetch_one(pool).await?)
+    }
+
     fn test_processor_config(name: &str, max_retries: u32, backoff: Vec<u64>) -> ProcessorConfig {
         ProcessorConfig {
             name: name.into(),
             enabled: true,
             events: vec!["email_arrived".into()],
+            sources: None,
             max_retries,
             retry_backoff_secs: backoff,
             timeout_secs: 30,
             concurrency: 1,
             config: HashMap::new(),
         }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn unmatched_poll_batch_does_not_starve_later_matching_event(pool: PgPool) -> Result<()> {
+        for _ in 0..100 {
+            sqlx::query("INSERT INTO events (event_type, account_id, mailbox_name, payload) VALUES ('email_arrived', 'excluded', 'INBOX', '{}'::jsonb)")
+                .execute(&pool).await?;
+        }
+        let matching_id: i64 = sqlx::query_scalar("INSERT INTO events (event_type, account_id, mailbox_name, payload) VALUES ('email_arrived', 'included', 'INBOX', '{}'::jsonb) RETURNING id")
+            .fetch_one(&pool).await?;
+        let config = ProcessorConfig {
+            sources: Some(vec![crate::config::ProcessorSource {
+                account: "included".into(),
+                mailboxes: None,
+            }]),
+            ..test_processor_config("matching", 0, vec![])
+        };
+        let registry = Arc::new(ProcessorRegistry::for_tests_with_configs(vec![(
+            Box::new(TestProcessor {
+                name: "matching".into(),
+                events: vec!["email_arrived".into()],
+                output: ProcessorOutput {
+                    success: true,
+                    message: None,
+                    metadata: None,
+                    metrics: vec![],
+                },
+            }),
+            config.clone(),
+        )]));
+        let scheduler = JobScheduler::new(
+            pool.clone(),
+            registry,
+            tokio::sync::mpsc::channel(16).1,
+            CancellationToken::new(),
+            vec![config],
+        );
+        let first_batch = crate::db::events::get_unprocessed_events(&pool, 100).await?;
+        assert_eq!(first_batch.len(), 100);
+        scheduler.process_events(first_batch).await;
+        let next_batch = crate::db::events::get_unprocessed_events(&pool, 100).await?;
+        assert!(next_batch.iter().any(|event| event.id == matching_id));
+        scheduler.process_events(next_batch).await;
+        let marker: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT dispatched_at FROM events WHERE id = $1")
+                .bind(matching_id)
+                .fetch_one(&pool)
+                .await?;
+        assert!(marker.is_some());
+        let unmatched_jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM processor_jobs j JOIN events e ON e.id=j.event_id WHERE e.account_id='excluded'").fetch_one(&pool).await?;
+        assert_eq!(unmatched_jobs, 0);
+        let matching_job = jobs::get_job_by_event_and_processor(&pool, matching_id, "matching")
+            .await?
+            .unwrap();
+        assert_eq!(matching_job.status, "completed");
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn scheduler_recovers_pending_once_and_abandons_ineligible_queued_jobs(
+        pool: PgPool,
+    ) -> Result<()> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let config = ProcessorConfig {
+            sources: Some(vec![
+                crate::config::ProcessorSource {
+                    account: "test".into(),
+                    mailboxes: None,
+                },
+                crate::config::ProcessorSource {
+                    account: "test".into(),
+                    mailboxes: Some(vec!["INBOX".into()]),
+                },
+            ]),
+            ..test_processor_config("counting", 0, vec![])
+        };
+        let registry = Arc::new(ProcessorRegistry::for_tests_with_configs(vec![(
+            Box::new(CountingProcessor {
+                name: "counting".into(),
+                events: vec!["email_arrived".into()],
+                calls: calls.clone(),
+            }),
+            config.clone(),
+        )]));
+        let scheduler = JobScheduler::new(
+            pool.clone(),
+            registry,
+            tokio::sync::mpsc::channel(16).1,
+            CancellationToken::new(),
+            vec![config],
+        );
+
+        let event_id = create_scheduler_test_event(&pool).await?;
+        let event = get_event_by_id(&pool, event_id).await?.unwrap();
+        // Both dispatchers race from an event with no pre-existing job. The
+        // overlapping selectors must still register and invoke it exactly once.
+        let (left, right) = tokio::join!(
+            scheduler.process_events(vec![event.clone()]),
+            scheduler.process_events(vec![event])
+        );
+        let _ = (left, right);
+        let completed = jobs::get_job_by_event_and_processor(&pool, event_id, "counting")
+            .await?
+            .unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.attempts, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A separately seeded eligible pending job is recovered by the sweep.
+        let pending_event_id = create_scheduler_test_event(&pool).await?;
+        let pending_id = jobs::create_job(&pool, pending_event_id, "counting")
+            .await?
+            .unwrap();
+        scheduler.retry_sweep().await;
+        let recovered = jobs::get_job_by_id(&pool, pending_id).await?.unwrap();
+        assert_eq!(recovered.status, "completed");
+        assert_eq!(recovered.attempts, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // Pause dispatch immediately before its claim. Its transaction has
+        // committed and returned the new job ID, so the sweep can observe the
+        // same pending row and contend through the identical execution path.
+        let contested_event_id = create_scheduler_test_event(&pool).await?;
+        let contested_event = get_event_by_id(&pool, contested_event_id).await?.unwrap();
+        let mut contested_scheduler = JobScheduler::new(
+            pool.clone(),
+            scheduler.registry.clone(),
+            tokio::sync::mpsc::channel(16).1,
+            CancellationToken::new(),
+            vec![test_processor_config("counting", 0, vec![])],
+        );
+        let (arrived_tx, mut arrived_rx) = tokio::sync::mpsc::unbounded_channel();
+        contested_scheduler.before_claim =
+            Some((arrived_tx, Arc::new(tokio::sync::Barrier::new(2))));
+        let contested_scheduler = Arc::new(contested_scheduler);
+        let dispatch_scheduler = contested_scheduler.clone();
+        let dispatch = tokio::spawn(async move {
+            dispatch_scheduler
+                .process_events(vec![contested_event])
+                .await;
+        });
+        // This notification is emitted only after registration commits and
+        // dispatch has reached the claim gate. Start the sweep afterward, so
+        // its runnable-job query cannot race ahead of job registration.
+        tokio::time::timeout(Duration::from_secs(5), arrived_rx.recv())
+            .await
+            .expect("dispatch did not reach the pre-claim gate")
+            .expect("pre-claim notification channel closed");
+        let sweep_scheduler = contested_scheduler.clone();
+        let sweep = tokio::spawn(async move { sweep_scheduler.retry_sweep().await });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (dispatch, sweep) = tokio::join!(dispatch, sweep);
+            dispatch.expect("dispatch task panicked");
+            sweep.expect("sweep task panicked");
+        })
+        .await
+        .expect("dispatch-versus-sweep claim contention timed out");
+        let contested_job_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM processor_jobs WHERE event_id=$1 AND processor_name='counting'",
+        )
+        .bind(contested_event_id)
+        .fetch_one(&pool)
+        .await?;
+        let contested = jobs::get_job_by_id(&pool, contested_job_id).await?.unwrap();
+        assert_eq!(contested.status, "completed");
+        assert_eq!(contested.attempts, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // Current source exclusions are enforced by the same sweep execution
+        // path, for pending and due failed work, without invoking or mutating
+        // prior output/attempt history.
+        for (status, attempts) in [("pending", 3), ("failed", 4)] {
+            for reason in ["source", "subscription", "disabled", "removed"] {
+                let excluded_event = create_scheduler_test_event(&pool).await?;
+                let job_id = jobs::create_job(&pool, excluded_event, "counting")
+                    .await?
+                    .unwrap();
+                let previous_output = serde_json::json!({"kept": true});
+                sqlx::query("UPDATE processor_jobs SET status=$2, attempts=$3, last_error='old error', next_retry_at=CASE WHEN $2='failed' THEN now()-interval '1 second' ELSE NULL END, output=$4 WHERE id=$1")
+                    .bind(job_id).bind(status).bind(attempts).bind(&previous_output).execute(&pool).await?;
+                let mut excluded_config = test_processor_config("counting", 0, vec![]);
+                match reason {
+                    "source" => {
+                        excluded_config.sources = Some(vec![crate::config::ProcessorSource {
+                            account: "other-account".into(),
+                            mailboxes: None,
+                        }])
+                    }
+                    "subscription" => excluded_config.events = vec!["email_removed".into()],
+                    "disabled" => excluded_config.enabled = false,
+                    _ => {}
+                }
+                let excluded_registry = Arc::new(ProcessorRegistry::for_tests_with_configs(
+                    if reason == "removed" {
+                        vec![]
+                    } else {
+                        vec![(
+                            Box::new(CountingProcessor {
+                                name: "counting".into(),
+                                events: vec!["email_arrived".into()],
+                                calls: calls.clone(),
+                            }),
+                            excluded_config.clone(),
+                        )]
+                    },
+                ));
+                let excluded_scheduler = JobScheduler::new(
+                    pool.clone(),
+                    excluded_registry,
+                    tokio::sync::mpsc::channel(16).1,
+                    CancellationToken::new(),
+                    vec![excluded_config],
+                );
+                excluded_scheduler.retry_sweep().await;
+                let abandoned = jobs::get_job_by_id(&pool, job_id).await?.unwrap();
+                assert_eq!(abandoned.status, "abandoned");
+                assert_eq!(abandoned.attempts, attempts);
+                assert_eq!(abandoned.output, Some(previous_output));
+                assert!(abandoned.next_retry_at.is_none());
+                let error = abandoned.last_error.as_deref().unwrap();
+                assert!(
+                    match reason {
+                        "source" => error.contains("excludes source"),
+                        "subscription" => error.contains("not subscribed"),
+                        _ => error.contains("unavailable or disabled"),
+                    },
+                    "unexpected {reason} error: {error}"
+                );
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        Ok(())
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -892,6 +1164,7 @@ exit 1
             name: "test_cmd".into(),
             enabled: true,
             events: vec!["email_arrived".into()],
+            sources: None,
             max_retries: 0,
             retry_backoff_secs: vec![],
             timeout_secs: 10,

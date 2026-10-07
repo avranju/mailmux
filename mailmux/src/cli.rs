@@ -22,7 +22,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Re-run processors for a specific event
+    /// Re-run currently eligible processors for a specific event
     Replay {
         /// The event ID to replay
         #[arg(long)]
@@ -33,7 +33,7 @@ pub enum Command {
         processor: Option<String>,
     },
 
-    /// Run a processor against an event without persisting results
+    /// Run a currently eligible processor against an event without persisting results
     DryRun {
         /// The event ID to process
         #[arg(long)]
@@ -81,7 +81,7 @@ pub struct BackfillArgs {
     #[arg(long = "email-id")]
     pub email_ids: Vec<i64>,
 
-    /// Explicitly allow selecting all stored emails
+    /// Select all stored emails eligible under the processor's source restrictions
     #[arg(long)]
     pub all: bool,
 

@@ -146,6 +146,7 @@ pub async fn run(config: Config, args: BackfillArgs) -> Result<BackfillSummary> 
         accounts: args.accounts.clone(),
         mailboxes: args.mailboxes.clone(),
         email_ids: args.email_ids.clone(),
+        processor_sources: processor_config.sources.clone(),
     };
 
     let pool = db::connect(&config.database).await?;
@@ -368,6 +369,7 @@ fn log_summary(summary: &BackfillSummary) {
 }
 
 /// Supplies keyset pages of matching emails to the backfill loop.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 trait BackfillPageSource {
     /// Fetch at most `page_size` emails with `id > last_id`, ascending id.
@@ -556,6 +558,7 @@ mod tests {
             name: name.into(),
             enabled,
             events: events.iter().map(|s| s.to_string()).collect(),
+            sources: None,
             max_retries,
             retry_backoff_secs: vec![],
             timeout_secs: 30,
@@ -740,6 +743,160 @@ mod tests {
                 })
             }
         }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn postgres_backfill_sources_intersect_before_limits_and_persist_nothing(
+        pool: PgPool,
+    ) -> Result<()> {
+        use crate::config::ProcessorSource;
+        let mut inserted_ids = Vec::new();
+        // Excluded records precede eligible records in keyset order. Two paired
+        // branches are selected and overlap intentionally; SQL must not emit duplicates.
+        for index in 0..530_i64 {
+            let (account, mailbox) = if index < 8 {
+                // Deliberately excluded rows sort before every eligible row.
+                ("personal", "Other")
+            } else if index < 16 {
+                ("personal", "Archive")
+            } else if index < 526 {
+                ("work", "INBOX")
+            } else {
+                ("other", "INBOX")
+            };
+            let id: i64 = sqlx::query_scalar("INSERT INTO emails (account_id, mailbox_name, uid, raw_message_path) VALUES ($1,$2,$3,'/tmp/test') RETURNING id")
+                .bind(account).bind(mailbox).bind(index).fetch_one(&pool).await?;
+            inserted_ids.push((id, account, mailbox));
+        }
+        let sources = Some(vec![
+            ProcessorSource {
+                account: "personal".into(),
+                mailboxes: Some(vec!["INBOX".into(), "Archive".into()]),
+            },
+            ProcessorSource {
+                account: "work".into(),
+                mailboxes: Some(vec!["INBOX".into()]),
+            },
+            ProcessorSource {
+                account: "work".into(),
+                mailboxes: None,
+            },
+        ]);
+        let filter = EmailBackfillFilter {
+            processor_sources: sources,
+            ..Default::default()
+        };
+        let matched = count_emails_for_backfill(&pool, &filter).await?;
+        assert_eq!(matched, 518);
+
+        // CLI restrictions intersect (rather than replace) processor sources;
+        // COUNT and keyset pages must return the same single eligible row.
+        let target_id = inserted_ids
+            .iter()
+            .find(|(_, account, mailbox)| *account == "work" && *mailbox == "INBOX")
+            .unwrap()
+            .0;
+        sqlx::query("UPDATE emails SET date=now() WHERE id=$1")
+            .bind(target_id)
+            .execute(&pool)
+            .await?;
+        let mut combined = filter.clone();
+        combined.accounts = vec!["work".into()];
+        combined.mailboxes = vec!["INBOX".into()];
+        combined.email_ids = vec![target_id];
+        combined.after = Some(Utc::now() - chrono::Duration::minutes(1));
+        combined.before = Some(Utc::now() + chrono::Duration::minutes(1));
+        assert_eq!(count_emails_for_backfill(&pool, &combined).await?, 1);
+        let combined_page = get_email_backfill_page(&pool, &combined, 0, 10).await?;
+        assert_eq!(
+            combined_page
+                .iter()
+                .map(|email| email.id)
+                .collect::<Vec<_>>(),
+            vec![target_id]
+        );
+        let mut empty_intersection = filter.clone();
+        empty_intersection.accounts = vec!["other".into()];
+        assert_eq!(
+            count_emails_for_backfill(&pool, &empty_intersection).await?,
+            0
+        );
+        assert!(
+            get_email_backfill_page(&pool, &empty_intersection, 0, 10)
+                .await?
+                .is_empty()
+        );
+
+        let events_before: i64 = sqlx::query_scalar("SELECT count(*) FROM events")
+            .fetch_one(&pool)
+            .await?;
+        let jobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM processor_jobs")
+            .fetch_one(&pool)
+            .await?;
+        let settings = test_settings(8, 0, vec![]);
+        let proc = FakeProcessor::succeed("pg-backfill", Duration::ZERO);
+        let stats = proc.stats.clone();
+        let mut empty_dry_source = DbBackfillPageSource {
+            pool: &pool,
+            filter: &empty_intersection,
+        };
+        let empty_dry = run_backfill(&proc, &mut empty_dry_source, 0, true, &settings).await?;
+        assert_eq!(empty_dry.selected, 0);
+        let mut empty_real_source = DbBackfillPageSource {
+            pool: &pool,
+            filter: &empty_intersection,
+        };
+        let empty_real = run_backfill(&proc, &mut empty_real_source, 0, false, &settings).await?;
+        assert_eq!(empty_real.selected, 0);
+        assert_eq!(stats.calls(), 0);
+        let mut dry_source = DbBackfillPageSource {
+            pool: &pool,
+            filter: &filter,
+        };
+        let dry = run_backfill(
+            &proc,
+            &mut dry_source,
+            cap_selected(matched, Some(503)),
+            true,
+            &settings,
+        )
+        .await?;
+        assert_eq!(dry.selected, 503);
+        assert_eq!(stats.calls(), 0);
+        let mut real_source = DbBackfillPageSource {
+            pool: &pool,
+            filter: &filter,
+        };
+        let actual = run_backfill(
+            &proc,
+            &mut real_source,
+            cap_selected(matched, Some(503)),
+            false,
+            &settings,
+        )
+        .await?;
+        assert_eq!(actual.selected, dry.selected);
+        assert_eq!(actual.processed, 503);
+        assert_eq!(stats.calls(), 503);
+        let expected: Vec<i64> = inserted_ids
+            .iter()
+            .filter(|(_, a, m)| {
+                (*a == "personal" && (*m == "INBOX" || *m == "Archive"))
+                    || (*a == "work" && *m == "INBOX")
+            })
+            .map(|(id, _, _)| *id)
+            .take(503)
+            .collect();
+        assert_eq!(stats.seen_ids(), expected);
+        let events_after: i64 = sqlx::query_scalar("SELECT count(*) FROM events")
+            .fetch_one(&pool)
+            .await?;
+        let jobs_after: i64 = sqlx::query_scalar("SELECT count(*) FROM processor_jobs")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!((events_before, jobs_before), (events_after, jobs_after));
+        Ok(())
     }
 
     // ---------- transient event construction ----------

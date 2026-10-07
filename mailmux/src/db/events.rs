@@ -107,16 +107,14 @@ pub async fn insert_email_with_event(
     Ok(Some((email_id, event_id)))
 }
 
-/// Fetch unprocessed events (events that have no corresponding processor_jobs).
+/// Fetch events that have not completed a routing pass.
 pub async fn get_unprocessed_events(pool: &PgPool, limit: i64) -> Result<Vec<Event>> {
     let rows = sqlx::query(
         r#"
         SELECT e.id, e.event_type, e.account_id, e.mailbox_name, e.email_id,
                e.payload, e.created_at
         FROM events e
-        WHERE NOT EXISTS (
-            SELECT 1 FROM processor_jobs pj WHERE pj.event_id = e.id
-        )
+        WHERE e.dispatched_at IS NULL
         ORDER BY e.id ASC
         LIMIT $1
         "#,
@@ -163,4 +161,69 @@ pub async fn get_event_by_id(pool: &PgPool, id: i64) -> Result<Option<Event>> {
         payload: r.get("payload"),
         created_at: r.get("created_at"),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn dispatch_migration_preserves_existing_jobs_and_leaves_jobless_events_unrouted(
+        pool: PgPool,
+    ) -> Result<()> {
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20240101000000_initial_schema.sql"
+        ))
+        .execute(&pool)
+        .await?;
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20260804000000_add_processor_jobs_output.sql"
+        ))
+        .execute(&pool)
+        .await?;
+        let with_job: i64 = sqlx::query_scalar("INSERT INTO events (event_type, account_id, mailbox_name, payload) VALUES ('email_arrived','test','INBOX','{}') RETURNING id")
+            .fetch_one(&pool).await?;
+        let without_job: i64 = sqlx::query_scalar("INSERT INTO events (event_type, account_id, mailbox_name, payload) VALUES ('email_arrived','test','Archive','{}') RETURNING id")
+            .fetch_one(&pool).await?;
+        let job_id: i64 = sqlx::query_scalar("INSERT INTO processor_jobs (event_id, processor_name, status, attempts, last_error, output) VALUES ($1,'existing','failed',3,'saved','{\"kept\":true}') RETURNING id")
+            .bind(with_job).fetch_one(&pool).await?;
+        let before: serde_json::Value =
+            sqlx::query_scalar("SELECT to_jsonb(p) FROM processor_jobs p WHERE id=$1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await?;
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20261008000000_add_event_dispatch_marker.sql"
+        ))
+        .execute(&pool)
+        .await?;
+        let after: serde_json::Value =
+            sqlx::query_scalar("SELECT to_jsonb(p) FROM processor_jobs p WHERE id=$1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(before, after);
+        let dispatched: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT dispatched_at FROM events WHERE id=$1")
+                .bind(with_job)
+                .fetch_one(&pool)
+                .await?;
+        let undispatched: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT dispatched_at FROM events WHERE id=$1")
+                .bind(without_job)
+                .fetch_one(&pool)
+                .await?;
+        assert!(dispatched.is_some());
+        assert!(undispatched.is_none());
+        assert_eq!(
+            get_unprocessed_events(&pool, 10)
+                .await?
+                .iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            vec![without_job]
+        );
+        Ok(())
+    }
 }

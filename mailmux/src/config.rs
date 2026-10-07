@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::db::events::Event;
 use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
 use regex::Regex;
@@ -120,6 +121,24 @@ fn default_imap_command_timeout() -> u64 {
     60
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessorSource {
+    pub account: String,
+    #[serde(default)]
+    pub mailboxes: Option<Vec<String>>,
+}
+
+impl ProcessorSource {
+    pub fn matches(&self, account_id: &str, mailbox_name: &str) -> bool {
+        self.account == account_id
+            && self
+                .mailboxes
+                .as_ref()
+                .is_none_or(|names| names.iter().any(|name| name == mailbox_name))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct ProcessorConfig {
@@ -128,6 +147,8 @@ pub struct ProcessorConfig {
     pub enabled: bool,
     #[serde(default)]
     pub events: Vec<String>,
+    #[serde(default)]
+    pub sources: Option<Vec<ProcessorSource>>,
     #[serde(default)]
     pub max_retries: u32,
     #[serde(default)]
@@ -138,6 +159,20 @@ pub struct ProcessorConfig {
     pub concurrency: u32,
     #[serde(default)]
     pub config: HashMap<String, toml::Value>,
+}
+
+impl ProcessorConfig {
+    pub fn matches_source(&self, account_id: &str, mailbox_name: &str) -> bool {
+        self.sources
+            .as_ref()
+            .is_none_or(|sources| sources.iter().any(|s| s.matches(account_id, mailbox_name)))
+    }
+
+    pub fn matches_event(&self, event: &Event) -> bool {
+        self.enabled
+            && self.events.iter().any(|e| e == &event.event_type)
+            && self.matches_source(&event.account_id, &event.mailbox_name)
+    }
 }
 
 fn default_enabled() -> bool {
@@ -162,8 +197,9 @@ impl Config {
         let mut config: Config = toml::from_str(&content)
             .with_context(|| format!("parsing config file: {}", path.display()))?;
 
-        config.validate()?;
+        config.validate_password_references()?;
         config.resolve_env_vars();
+        config.validate()?;
 
         Ok(config)
     }
@@ -187,8 +223,7 @@ impl Config {
         }
     }
 
-    /// Substitute `${VAR}` environment variable references in all string
-    /// fields. Called after `validate()` so all values are structurally sound.
+    /// Substitute `${VAR}` environment variable references in all string fields.
     fn resolve_env_vars(&mut self) {
         // General
         substitute_env_vars(&mut self.general.data_dir);
@@ -204,6 +239,9 @@ impl Config {
             substitute_env_vars(&mut account.imap_host);
             substitute_env_vars(&mut account.username);
             substitute_env_vars(&mut account.password);
+            for mailbox in &mut account.mailboxes {
+                substitute_env_vars(mailbox);
+            }
 
             if let Some(ca_file) = &mut account.tls_ca_file {
                 substitute_env_vars(ca_file);
@@ -213,7 +251,56 @@ impl Config {
         // Processors
         for processor in &mut self.processors {
             substitute_env_vars(&mut processor.name);
+            if let Some(sources) = &mut processor.sources {
+                for source in sources {
+                    substitute_env_vars(&mut source.account);
+                    if let Some(mailboxes) = &mut source.mailboxes {
+                        for mailbox in mailboxes {
+                            substitute_env_vars(mailbox);
+                        }
+                    }
+                }
+            }
             substitute_toml_value_env_vars(&mut processor.config);
+        }
+    }
+
+    fn validate_password_references(&self) -> Result<()> {
+        for account in &self.accounts {
+            if !is_env_var_reference(&account.password) {
+                bail!(
+                    "account '{}': password must be an environment variable reference (e.g. password = \"${{MY_PASSWORD}}\"). Literal passwords in config files are not allowed.",
+                    account.id
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn warn_unmonitored_processor_sources(&self) {
+        for processor in &self.processors {
+            for source in processor.sources.iter().flatten() {
+                if self
+                    .accounts
+                    .iter()
+                    .find(|a| a.id == source.account)
+                    .is_some_and(|a| !a.enabled)
+                {
+                    warn!(processor = %processor.name, account = %source.account, "processor source account is disabled; historical emails remain selectable");
+                }
+                if let Some(mailboxes) = &source.mailboxes {
+                    for mailbox in mailboxes {
+                        if self
+                            .accounts
+                            .iter()
+                            .find(|a| a.id == source.account)
+                            .is_none_or(|a| !a.mailboxes.contains(mailbox))
+                        {
+                            warn!(processor = %processor.name, account = %source.account, mailbox = %mailbox, "processor source mailbox is not currently monitored");
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -236,14 +323,6 @@ impl Config {
             }
             if account.username.is_empty() {
                 bail!("account '{}': username must not be empty", account.id);
-            }
-            if !is_env_var_reference(&account.password) {
-                bail!(
-                    "account '{}': password must be an environment variable \
-                     reference (e.g. password = \"${{MY_PASSWORD}}\"). \
-                     Literal passwords in config files are not allowed.",
-                    account.id
-                );
             }
             if account.mailboxes.is_empty() {
                 bail!(
@@ -296,6 +375,42 @@ impl Config {
             }
             if !seen_names.insert(&processor.name) {
                 bail!("duplicate processor name: {}", processor.name);
+            }
+            if let Some(sources) = &processor.sources {
+                if sources.is_empty() {
+                    bail!("processor '{}': sources must not be empty", processor.name);
+                }
+                for source in sources {
+                    if source.account.is_empty() {
+                        bail!(
+                            "processor '{}': source account must not be empty",
+                            processor.name
+                        );
+                    }
+                    if !self.accounts.iter().any(|a| a.id == source.account) {
+                        bail!(
+                            "processor '{}': unknown source account '{}'",
+                            processor.name,
+                            source.account
+                        );
+                    }
+                    if let Some(mailboxes) = &source.mailboxes {
+                        if mailboxes.is_empty() {
+                            bail!(
+                                "processor '{}': source for account '{}' has an empty mailboxes list",
+                                processor.name,
+                                source.account
+                            );
+                        }
+                        if mailboxes.iter().any(String::is_empty) {
+                            bail!(
+                                "processor '{}': source for account '{}' has an empty mailbox name",
+                                processor.name,
+                                source.account
+                            );
+                        }
+                    }
+                }
             }
             for event in &processor.events {
                 if !KNOWN_EVENT_TYPES.contains(&event.as_str()) {
@@ -412,6 +527,69 @@ concurrency = 1
     }
 
     #[test]
+    fn source_matching_is_exact_and_paired() {
+        let source = ProcessorSource {
+            account: "personal".into(),
+            mailboxes: Some(vec!["INBOX".into(), "Archive".into()]),
+        };
+        assert!(source.matches("personal", "INBOX"));
+        assert!(source.matches("personal", "Archive"));
+        assert!(!source.matches("work", "INBOX"));
+        assert!(!source.matches("personal", "inbox"));
+    }
+
+    #[test]
+    fn explicit_empty_sources_are_rejected() {
+        let toml = sample_toml().replace(
+            "events = [\"email_arrived\"]",
+            "events = [\"email_arrived\"]\nsources = []",
+        );
+        let f = write_temp_config(&toml);
+        let err = Config::load(f.path()).unwrap_err();
+        assert!(err.to_string().contains("sources must not be empty"));
+    }
+
+    #[test]
+    fn malformed_sources_are_rejected_even_for_disabled_processors() {
+        for (selector, expected) in [
+            (r#"{ account = "missing" }"#, "unknown source account"),
+            (r#"{ account = "" }"#, "source account must not be empty"),
+            (
+                r#"{ account = "test", mailboxes = [] }"#,
+                "empty mailboxes list",
+            ),
+            (
+                r#"{ account = "test", mailboxes = [""] }"#,
+                "empty mailbox name",
+            ),
+            (r#"{ account = "test", extra = true }"#, "unknown field"),
+        ] {
+            let toml = sample_toml().replace(
+                "enabled = true\nevents = [\"email_arrived\"]",
+                &format!("enabled = false\nevents = [\"email_arrived\"]\nsources = [{selector}]"),
+            );
+            let file = write_temp_config(&toml);
+            let error = Config::load(file.path()).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{selector}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn selector_account_reference_and_optional_mailboxes_validate() {
+        let toml = sample_toml().replace(
+            "events = [\"email_arrived\"]",
+            "events = [\"email_arrived\"]\nsources = [{ account = \"test\" }]",
+        );
+        let file = write_temp_config(&toml);
+        let config = Config::load(file.path()).unwrap();
+        assert!(config.processors[0].matches_source("test", "Archive"));
+        assert!(!config.processors[0].matches_source("Test", "Archive"));
+    }
+
+    #[test]
     fn test_load_valid_config() {
         let f = write_temp_config(sample_toml());
         let config = Config::load(f.path()).unwrap();
@@ -489,6 +667,77 @@ mailboxes = ["INBOX"]
             let config = Config::load(f.path()).unwrap();
             assert_eq!(config.accounts[0].password, "my_secret");
         });
+    }
+
+    #[test]
+    fn env_substitutions_apply_to_accounts_and_source_selectors_before_validation() {
+        temp_env::with_vars(
+            [
+                ("MM_ACCOUNT", Some("historical")),
+                ("MM_SOURCE", Some("historical")),
+                ("MM_BOX", Some("Archive")),
+                ("MM_SELECTOR_BOX", Some("Archive")),
+            ],
+            || {
+                let toml = sample_toml()
+                    .replace("id = \"test\"", "id = \"${MM_ACCOUNT}\"")
+                    .replace("mailboxes = [\"INBOX\"]", "mailboxes = [\"${MM_BOX}\"]")
+                    .replace("events = [\"email_arrived\"]", "events = [\"email_arrived\"]\nsources = [{ account = \"${MM_SOURCE}\", mailboxes = [\"${MM_SELECTOR_BOX}\"] }]");
+                let file = write_temp_config(&toml);
+                let config = Config::load(file.path()).unwrap();
+                assert_eq!(config.accounts[0].id, "historical");
+                assert_eq!(config.accounts[0].mailboxes, ["Archive"]);
+                assert!(config.processors[0].matches_source("historical", "Archive"));
+            },
+        );
+    }
+
+    #[test]
+    fn resolved_empty_and_duplicate_account_ids_are_rejected() {
+        temp_env::with_var("MM_EMPTY", Some(""), || {
+            let toml = sample_toml().replace("id = \"test\"", "id = \"${MM_EMPTY}\"");
+            let file = write_temp_config(&toml);
+            assert!(
+                Config::load(file.path())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("account id must not be empty")
+            );
+        });
+        temp_env::with_var("MM_DUP", Some("same"), || {
+            let toml = sample_toml()
+                .replace("id = \"test\"", "id = \"${MM_DUP}\"")
+                .replace("[[processors]]", "[[accounts]]\nid = \"same\"\nimap_host = \"imap.example.com\"\nusername = \"other\"\npassword = \"${TEST_SECRET}\"\nmailboxes = [\"INBOX\"]\n\n[[processors]]");
+            let file = write_temp_config(&toml);
+            assert!(
+                Config::load(file.path())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("duplicate account id")
+            );
+        });
+    }
+
+    #[test]
+    fn missing_selector_account_is_rejected_and_disabled_historical_account_is_valid() {
+        let missing = sample_toml().replace(
+            "events = [\"email_arrived\"]",
+            "events = [\"email_arrived\"]\nsources = [{ mailboxes = [\"INBOX\"] }]",
+        );
+        let file = write_temp_config(&missing);
+        assert!(
+            format!("{:#}", Config::load(file.path()).unwrap_err())
+                .contains("missing field `account`")
+        );
+
+        let historical = sample_toml()
+            .replace("id = \"test\"", "id = \"old\"")
+            .replace("enabled = true", "enabled = false")
+            .replace("events = [\"email_arrived\"]", "events = [\"email_arrived\"]\nsources = [{ account = \"old\", mailboxes = [\"FormerBox\"] }]");
+        let file = write_temp_config(&historical);
+        let config = Config::load(file.path()).unwrap();
+        assert!(config.processors[0].matches_source("old", "FormerBox"));
+        config.warn_unmonitored_processor_sources();
     }
 
     #[test]

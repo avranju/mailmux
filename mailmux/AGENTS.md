@@ -75,28 +75,28 @@ Main
 | `db/mod.rs` | PgPool setup + sqlx migrate runner |
 | `db/emails.rs` | `EmailRecord`, `MailboxState`, email fetch/upsert; backfill `EmailBackfillFilter` + parameterized count/keyset-page queries |
 | `db/events.rs` | `Event`, atomic `insert_email_with_event` (with pg_notify), unprocessed event query |
-| `db/jobs.rs` | `ProcessorJob` CRUD: create, status update, pending/retryable fetch |
+| `db/jobs.rs` | `ProcessorJob` CRUD, transactional event dispatch registration, conditional claims/abandonment, runnable job fetch |
 | `events/listener.rs` | `EventLoop`: PgListener + poll fallback, dispatches to scheduler |
 | `imap/mod.rs` | `AccountManager`: spawns/supervises MailboxWatchers, circuit breaker logic |
 | `imap/connection.rs` | `ImapConnection` wrapping `imap-next`: connect+TLS, login, SELECT, UID FETCH, IDLE |
 | `imap/sync.rs` | `MailboxWatcher`: sync+IDLE cycle, polling fallback, rate limiting, message ingestion |
 | `processor/mod.rs` | `Processor` trait + `ProcessorOutput` |
-| `processor/registry.rs` | Builds processors from config, matches events to processors |
+| `processor/registry.rs` | Builds processors paired with config and applies shared full-event eligibility |
 | `processor/scheduler.rs` | Dispatches events, executes processors, handles failures/retries |
 | `processor/builtin/logger.rs` | Logs event details via tracing |
 | `processor/builtin/command.rs` | Spawns external CLI, passes event JSON on stdin |
 
 ## Database Schema
 
-Four tables managed by a single migration in `migrations/`:
+Four tables managed by ordered migrations in `migrations/`:
 - `mailbox_states` — `uid_validity` + `last_seen_uid` per account+mailbox
 - `emails` — parsed email metadata + path to raw `.eml` on disk
-- `events` — append-only event log (`event_type`, account, mailbox, email_id, JSONB payload)
+- `events` — append-only event log (`event_type`, account, mailbox, email_id, JSONB payload, nullable `dispatched_at`)
 - `processor_jobs` — per (event, processor) tracking: status (`pending`/`in_progress`/`completed`/`failed`/`abandoned`), attempts, last_error, next_retry_at
 
 ## Configuration
 
-Config is TOML with `${VAR}` env substitution. See `config.example.toml` for an annotated reference. Top-level sections:
+Config is TOML with `${VAR}` env substitution. See `config.example.toml` for an annotated reference. `ProcessorSource` and `ProcessorConfig::matches_event` provide shared exact matching. Source filtering stays outside `Processor` implementations and Event JSON remains unchanged. Dispatch locks the event row, inserts eligible jobs and marks routing complete transactionally. The scheduler recovers pending jobs; conditional claims prevent duplicate invocation and ineligible queued jobs are abandoned. Top-level sections:
 - `[general]` — data_dir, log_level, log_format, shutdown_grace_period_secs, event_retention_days, health_port
 - `[database]` — url, max_connections
 - `[[accounts]]` — per IMAP account settings (host, port, TLS, credentials, mailboxes, rate limits)
@@ -106,7 +106,7 @@ Config is TOML with `${VAR}` env substitution. See `config.example.toml` for an 
 
 Tests live in `#[cfg(test)] mod tests` blocks within each source file. Async tests use `#[tokio::test]`. Store tests use `tempfile` for temporary directories; config tests use `tempfile::NamedTempFile`.
 
-Current test coverage: `src/config.rs` and `src/store.rs` have unit tests. No integration tests or test database setup exists.
+Tests live inline. PostgreSQL-backed `#[sqlx::test]` cases are ignored by default and require `DATABASE_URL`; run them with `cargo test -p mailmux -- --ignored`.
 
 ## Historical backfill (`mailmux backfill`)
 

@@ -1,3 +1,4 @@
+use crate::config::ProcessorSource;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -161,6 +162,7 @@ pub struct EmailBackfillFilter {
     pub mailboxes: Vec<String>,
     /// Include these specific `emails.id` values; repeated values are ORed.
     pub email_ids: Vec<i64>,
+    pub processor_sources: Option<Vec<ProcessorSource>>,
 }
 
 /// Append the backfill filter predicates to a query builder.
@@ -192,6 +194,37 @@ fn append_backfill_filters(builder: &mut QueryBuilder<Postgres>, filter: &EmailB
                 builder.push(" OR ");
             }
             builder.push("mailbox_name = ").push_bind(mailbox);
+        }
+        builder.push(")");
+    }
+    if let Some(sources) = &filter.processor_sources {
+        builder.push(" AND (");
+        if sources.is_empty() {
+            builder.push("FALSE");
+        }
+        for (index, source) in sources.iter().enumerate() {
+            if index > 0 {
+                builder.push(" OR ");
+            }
+            builder.push("(account_id = ").push_bind(&source.account);
+            match &source.mailboxes {
+                None => {
+                    builder.push(")");
+                }
+                Some(mailboxes) if mailboxes.is_empty() => {
+                    builder.push(" AND FALSE)");
+                }
+                Some(mailboxes) => {
+                    builder.push(" AND (");
+                    for (mailbox_index, mailbox) in mailboxes.iter().enumerate() {
+                        if mailbox_index > 0 {
+                            builder.push(" OR ");
+                        }
+                        builder.push("mailbox_name = ").push_bind(mailbox);
+                    }
+                    builder.push("))");
+                }
+            }
         }
         builder.push(")");
     }
@@ -310,6 +343,7 @@ mod tests {
             accounts: vec!["personal".into(), "work".into()],
             mailboxes: vec!["INBOX".into(), "Sent".into()],
             email_ids: vec![10, 20],
+            processor_sources: None,
         }
     }
 
@@ -351,6 +385,29 @@ mod tests {
                 !sql.contains(literal),
                 "literal {literal} leaked into sql: {sql}"
             );
+        }
+    }
+
+    #[test]
+    fn source_predicates_keep_account_mailbox_pairs_bound() {
+        let filter = EmailBackfillFilter {
+            processor_sources: Some(vec![
+                ProcessorSource {
+                    account: "personal".into(),
+                    mailboxes: Some(vec!["INBOX".into(), "Archive".into()]),
+                },
+                ProcessorSource {
+                    account: "work".into(),
+                    mailboxes: None,
+                },
+            ]),
+            ..Default::default()
+        };
+        let (sql, params) = built(build_backfill_count_query(&filter));
+        assert!(sql.contains("(account_id = $1 AND (mailbox_name = $2 OR mailbox_name = $3)) OR (account_id = $4)"), "{sql}");
+        assert_eq!(params, 4);
+        for value in ["personal", "work", "INBOX", "Archive"] {
+            assert!(!sql.contains(value));
         }
     }
 
@@ -526,5 +583,44 @@ mod tests {
             seen.extend(page_ids);
         }
         assert_eq!(seen, all_ids);
+
+        // Paired processor sources are intersected before COUNT and keyset
+        // pagination; account/mailbox cross-pairs must not broaden selection.
+        let paired = EmailBackfillFilter {
+            processor_sources: Some(vec![
+                ProcessorSource {
+                    account: "a".into(),
+                    mailboxes: Some(vec!["INBOX".into()]),
+                },
+                ProcessorSource {
+                    account: "b".into(),
+                    mailboxes: Some(vec!["Sent".into()]),
+                },
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(count_emails_for_backfill(&pool, &paired).await.unwrap(), 3);
+        let first = get_email_backfill_page(&pool, &paired, 0, 2).await.unwrap();
+        assert_eq!(
+            first.iter().map(|email| email.id).collect::<Vec<_>>(),
+            vec![id1, id2]
+        );
+        let second = get_email_backfill_page(&pool, &paired, first.last().unwrap().id, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.iter().map(|email| email.id).collect::<Vec<_>>(),
+            vec![id7]
+        );
+        let empty_sources = EmailBackfillFilter {
+            processor_sources: Some(vec![]),
+            ..Default::default()
+        };
+        assert_eq!(
+            count_emails_for_backfill(&pool, &empty_sources)
+                .await
+                .unwrap(),
+            0
+        );
     }
 }

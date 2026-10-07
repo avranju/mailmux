@@ -42,6 +42,7 @@ pub struct ProcessorOutput {
 }
 
 /// Trait that all processors must implement.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Processor: Send + Sync {
     /// The processor's unique name.

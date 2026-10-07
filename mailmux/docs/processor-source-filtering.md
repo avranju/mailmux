@@ -1,6 +1,6 @@
 # Processor source filtering
 
-Status: proposed; not implemented.
+Status: implemented; PostgreSQL-backed acceptance verification is pending.
 
 ## 1. Problem
 
@@ -195,6 +195,15 @@ email storage, timeout settings, retry settings, or concurrency settings.
 This feature does not include content-based filtering, exclusions, wildcard
 selectors, dynamic configuration reload, automatic historical replay, or a
 general routing expression language.
+
+## Implementation map
+
+- Configuration and matching: `src/config.rs`; runtime registration and eligibility: `src/processor/registry.rs`.
+- Transactional dispatch and queued claims: `src/db/jobs.rs` and `src/processor/scheduler.rs`.
+- Source-restricted backfill SQL: `src/db/emails.rs` and `src/backfill.rs`.
+- Dispatch marker and existing-history treatment: `migrations/20261008000000_add_event_dispatch_marker.sql`.
+
+Verify with `cargo test -p mailmux` and `cargo clippy -p mailmux --all-targets -- -D warnings`. PostgreSQL-backed ignored tests use `cargo test -p mailmux -- --ignored` with `DATABASE_URL` configured.
 
 ## 9. Verification and acceptance criteria
 

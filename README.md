@@ -242,11 +242,41 @@ env = { NOTIFY_TOKEN = "${NOTIFY_TOKEN}" }
 | `name`               | _required_ | Unique processor name                                                              |
 | `enabled`            | `true`     | Whether the processor is active                                                    |
 | `events`             | `[]`       | Event types to subscribe to. Currently `email_arrived` is the only supported type. |
+| `sources`            | omitted    | Optional account/mailbox allowlist; omitted means all sources. Selectors use exact account IDs and mailbox names. |
 | `max_retries`        | `0`        | Max retry attempts on failure                                                      |
 | `retry_backoff_secs` | `[]`       | Backoff schedule (seconds per attempt)                                             |
 | `timeout_secs`       | `30`       | Execution timeout                                                                  |
 | `concurrency`        | `1`        | Max concurrent executions                                                          |
 | `config`             | `{}`       | Processor-specific key/value config                                                |
+
+Source selectors preserve account/mailbox pairing, for example:
+
+```toml
+sources = [
+  { account = "personal", mailboxes = ["INBOX", "Archive"] },
+  { account = "work", mailboxes = ["INBOX"] },
+]
+# Account-only: sources = [{ account = "personal" }]
+```
+
+Explicit empty source/mailbox lists, empty names, unknown account IDs, and
+unknown selector fields are rejected. A configured disabled account remains a
+valid historical source. Mailbox names not currently monitored produce startup
+warnings rather than errors. Source strings support `${VAR}` substitution.
+
+Current eligibility is enforced for dispatch, retries and pending jobs, replay,
+event dry-run, and historical backfill. CLI selection (including backfill
+`--all`) cannot bypass it. Filters take effect on restart. Broadening filters
+does not automatically reroute already dispatched events; use explicit replay
+or backfill for historical processing.
+
+Dispatch completion is tracked in `events.dispatched_at`, independently of
+processor-job rows. Events with no eligible processors are marked routed too,
+so zero-match batches cannot starve later events. The migration marks existing
+events that already have jobs as dispatched without changing those jobs;
+existing events without jobs receive one routing pass after upgrade. Retention
+keeps undispatched events and outstanding jobs, but may delete old dispatched
+events with no jobs.
 
 Built-in processor types:
 

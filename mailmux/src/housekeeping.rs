@@ -42,6 +42,7 @@ pub(crate) async fn cleanup_old_events(pool: &PgPool, retention_days: u64) -> Re
         SELECT e.id
         FROM events e
         WHERE e.created_at < now() - ($1 || ' days')::interval
+        AND e.dispatched_at IS NOT NULL
         AND NOT EXISTS (
             SELECT 1 FROM processor_jobs pj
             WHERE pj.event_id = e.id
@@ -109,10 +110,19 @@ mod tests {
     async fn create_event(pool: &PgPool, age_days: i32) -> Result<i64> {
         Ok(sqlx::query_scalar(
             r#"
-            INSERT INTO events (event_type, account_id, mailbox_name, created_at)
-            VALUES ('email_arrived', 'test', 'INBOX', now() - make_interval(days => $1))
+            INSERT INTO events (event_type, account_id, mailbox_name, created_at, dispatched_at)
+            VALUES ('email_arrived', 'test', 'INBOX', now() - make_interval(days => $1), now())
             RETURNING id
             "#,
+        )
+        .bind(age_days)
+        .fetch_one(pool)
+        .await?)
+    }
+
+    async fn create_unrouted_event(pool: &PgPool, age_days: i32) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "INSERT INTO events (event_type, account_id, mailbox_name, created_at) VALUES ('email_arrived','test','INBOX',now()-make_interval(days => $1)) RETURNING id",
         )
         .bind(age_days)
         .fetch_one(pool)
@@ -140,6 +150,11 @@ mod tests {
         let recent_completed = create_event(&pool, 2).await?;
         create_job(&pool, recent_completed, "completed").await?;
         let old_without_jobs = create_event(&pool, 60).await?;
+        let old_undispatched = create_unrouted_event(&pool, 60).await?;
+        let old_in_progress = create_event(&pool, 60).await?;
+        create_job(&pool, old_in_progress, "in_progress").await?;
+        let old_failed = create_event(&pool, 60).await?;
+        create_job(&pool, old_failed, "failed").await?;
 
         cleanup_old_events(&pool, 30).await?;
 
@@ -151,7 +166,13 @@ mod tests {
                     .await?;
             assert!(!exists, "eligible event {deleted_id} should be deleted");
         }
-        for retained_id in [old_pending, recent_completed] {
+        for retained_id in [
+            old_pending,
+            recent_completed,
+            old_undispatched,
+            old_in_progress,
+            old_failed,
+        ] {
             let exists: bool =
                 sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM events WHERE id = $1)")
                     .bind(retained_id)

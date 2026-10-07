@@ -247,6 +247,7 @@ mod tests {
             name: "test_command".into(),
             enabled: true,
             events: vec!["email_arrived".into()],
+            sources: None,
             max_retries: 0,
             retry_backoff_secs: vec![],
             timeout_secs: 10,

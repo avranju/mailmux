@@ -95,6 +95,18 @@ concurrency = 1
 # name = "notify"
 # enabled = true
 # events = ["email_arrived"]
+# Source selectors are optional; omission allows all accounts/mailboxes.
+# Account IDs and mailbox names use exact matching. Each mailbox list stays
+# paired with its account. Empty sources/mailboxes lists are invalid.
+# Account-only selector: all mailboxes for this account.
+# sources = [{ account = "personal" }]
+# Paired restriction: personal INBOX/Archive and work INBOX only.
+# sources = [
+#   { account = "personal", mailboxes = ["INBOX", "Archive"] },
+#   { account = "work", mailboxes = ["INBOX"] },
+# ]
+# IDs and mailbox names support ${VAR} substitution. Referenced accounts must
+# be declared, but may be disabled for historical selection.
 # max_retries = 3
 # retry_backoff_secs = [5, 30, 300]
 # timeout_secs = 30

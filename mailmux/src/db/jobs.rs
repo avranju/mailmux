@@ -9,6 +9,7 @@ pub enum AttemptsUpdate {
     /// Leave the attempts count unchanged.
     None,
     /// Increment the current attempts count by one.
+    #[allow(dead_code)]
     Increment,
 }
 
@@ -50,26 +51,36 @@ pub async fn create_job(pool: &PgPool, event_id: i64, processor_name: &str) -> R
     Ok(id)
 }
 
-/// Atomically register all matching processors before any job is executed.
-/// Only newly inserted jobs are returned; existing jobs are left unchanged.
-pub async fn create_jobs(
+/// Atomically register eligible jobs and mark event routing complete.
+pub async fn register_event_dispatch(
     pool: &PgPool,
     event_id: i64,
     processor_names: &[&str],
 ) -> Result<Vec<(i64, String)>> {
-    sqlx::query_as(
-        r#"
-        INSERT INTO processor_jobs (event_id, processor_name, status)
-        SELECT $1, unnest($2::text[]), 'pending'
-        ON CONFLICT (event_id, processor_name) DO NOTHING
-        RETURNING id, processor_name
-        "#,
-    )
-    .bind(event_id)
-    .bind(processor_names)
-    .fetch_all(pool)
-    .await
-    .context("registering processor jobs")
+    let mut tx = pool.begin().await.context("beginning event dispatch")?;
+    let dispatched: Option<Option<DateTime<Utc>>> =
+        sqlx::query_scalar("SELECT dispatched_at FROM events WHERE id = $1 FOR UPDATE")
+            .bind(event_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .context("locking event for dispatch")?;
+    let Some(dispatched) = dispatched else {
+        tx.commit().await?;
+        return Ok(vec![]);
+    };
+    if dispatched.is_some() {
+        tx.commit().await?;
+        return Ok(vec![]);
+    }
+    let inserted = sqlx::query_as("INSERT INTO processor_jobs (event_id, processor_name, status) SELECT $1, unnest($2::text[]), 'pending' ON CONFLICT (event_id, processor_name) DO NOTHING RETURNING id, processor_name")
+        .bind(event_id).bind(processor_names).fetch_all(&mut *tx).await.context("registering processor jobs")?;
+    sqlx::query("UPDATE events SET dispatched_at=now() WHERE id=$1")
+        .bind(event_id)
+        .execute(&mut *tx)
+        .await
+        .context("marking event dispatched")?;
+    tx.commit().await.context("committing event dispatch")?;
+    Ok(inserted)
 }
 
 /// Update a job's status and optionally persist or clear output.
@@ -133,8 +144,29 @@ pub async fn update_job_status(
     Ok(())
 }
 
-/// Atomically reset an existing job for replay: set status to pending,
-/// zero out attempts, clear last_error / next_retry_at / output.
+/// Reset and claim an existing job for explicit replay in one row-locked
+/// operation. A scheduler sweep that already claimed the job wins; replay
+/// never overwrites an in-progress execution.
+pub async fn reset_and_claim_job_for_replay(pool: &PgPool, job_id: i64) -> Result<bool> {
+    let mut tx = pool.begin().await.context("beginning replay claim")?;
+    let result = sqlx::query(
+        r#"
+        UPDATE processor_jobs
+        SET status = 'in_progress', attempts = 1, last_error = NULL,
+            next_retry_at = NULL, output = NULL, updated_at = now()
+        WHERE id = $1 AND status <> 'in_progress'
+        "#,
+    )
+    .bind(job_id)
+    .execute(&mut *tx)
+    .await
+    .context("resetting and claiming job for replay")?;
+    tx.commit().await.context("committing replay claim")?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Legacy reset helper retained for the focused state-reset test.
+#[allow(dead_code)]
 pub async fn reset_job_for_replay(pool: &PgPool, job_id: i64) -> Result<()> {
     sqlx::query(
         r#"
@@ -194,15 +226,15 @@ pub async fn get_job_by_event_and_processor(
     Ok(row.map(row_to_job))
 }
 
-/// Get failed jobs that are ready to retry.
-pub async fn get_retryable_jobs(pool: &PgPool, limit: i64) -> Result<Vec<ProcessorJob>> {
+/// Get pending jobs and failed jobs whose retry time is due.
+pub async fn get_runnable_jobs(pool: &PgPool, limit: i64) -> Result<Vec<ProcessorJob>> {
     let rows = sqlx::query(
         r#"
         SELECT id, event_id, processor_name, status, attempts, last_error,
                next_retry_at, created_at, updated_at, output
         FROM processor_jobs
-        WHERE status = 'failed' AND next_retry_at IS NOT NULL AND next_retry_at <= now()
-        ORDER BY next_retry_at ASC
+        WHERE status = 'pending' OR (status = 'failed' AND next_retry_at IS NOT NULL AND next_retry_at <= now())
+        ORDER BY COALESCE(next_retry_at, created_at) ASC, id ASC
         LIMIT $1
         "#,
     )
@@ -212,6 +244,18 @@ pub async fn get_retryable_jobs(pool: &PgPool, limit: i64) -> Result<Vec<Process
     .context("fetching retryable jobs")?;
 
     Ok(rows.into_iter().map(row_to_job).collect())
+}
+
+/// Atomically claim pending or due failed work.
+pub async fn claim_job(pool: &PgPool, job_id: i64) -> Result<bool> {
+    let result = sqlx::query("UPDATE processor_jobs SET status='in_progress', attempts=attempts+1, last_error=NULL, next_retry_at=NULL, output=NULL, updated_at=now() WHERE id=$1 AND (status='pending' OR (status='failed' AND next_retry_at IS NOT NULL AND next_retry_at <= now()))").bind(job_id).execute(pool).await.context("claiming processor job")?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Abandon queued work that is no longer eligible without incrementing attempts.
+pub async fn abandon_queued_job(pool: &PgPool, job_id: i64, reason: &str) -> Result<bool> {
+    let result = sqlx::query("UPDATE processor_jobs SET status='abandoned', last_error=$2, next_retry_at=NULL, updated_at=now() WHERE id=$1 AND (status='pending' OR (status='failed' AND next_retry_at IS NOT NULL AND next_retry_at <= now()))").bind(job_id).bind(reason).execute(pool).await.context("abandoning queued processor job")?;
+    Ok(result.rows_affected() == 1)
 }
 
 fn row_to_job(r: sqlx::postgres::PgRow) -> ProcessorJob {
@@ -245,6 +289,89 @@ mod tests {
         .await
         .context("creating test event")?;
         Ok(event_id)
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn dispatch_registration_is_atomic_and_concurrent_safe(pool: PgPool) -> Result<()> {
+        let event_id = create_test_event(&pool).await?;
+        let (left, right) = tokio::join!(
+            register_event_dispatch(&pool, event_id, &["one", "two"]),
+            register_event_dispatch(&pool, event_id, &["one", "two"]),
+        );
+        let left = left?;
+        let right = right?;
+        assert_eq!(left.len() + right.len(), 2);
+        assert_eq!(
+            left.iter()
+                .chain(&right)
+                .map(|(_, name)| name.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            2
+        );
+        assert!(
+            register_event_dispatch(&pool, event_id, &["later"])
+                .await?
+                .is_empty()
+        );
+
+        let rollback_event = create_test_event(&pool).await?;
+        sqlx::query("CREATE FUNCTION reject_dispatch_marker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.dispatched_at IS NOT NULL THEN RAISE EXCEPTION 'test dispatch failure'; END IF; RETURN NEW; END $$")
+            .execute(&pool).await?;
+        sqlx::query("CREATE TRIGGER reject_dispatch_marker BEFORE UPDATE ON events FOR EACH ROW EXECUTE FUNCTION reject_dispatch_marker()")
+            .execute(&pool).await?;
+        assert!(
+            register_event_dispatch(&pool, rollback_event, &["rolled_back"])
+                .await
+                .is_err()
+        );
+        let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM processor_jobs WHERE event_id=$1")
+            .bind(rollback_event)
+            .fetch_one(&pool)
+            .await?;
+        let dispatched: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT dispatched_at FROM events WHERE id=$1")
+                .bind(rollback_event)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(jobs, 0);
+        assert!(dispatched.is_none());
+        sqlx::query("DROP TRIGGER reject_dispatch_marker ON events")
+            .execute(&pool)
+            .await?;
+        sqlx::query("DROP FUNCTION reject_dispatch_marker()")
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn concurrent_claim_and_abandonment_preserve_state(pool: PgPool) -> Result<()> {
+        let event_id = create_test_event(&pool).await?;
+        let job_id = create_job(&pool, event_id, "test_proc").await?.unwrap();
+        let runnable = get_runnable_jobs(&pool, 10).await?;
+        assert!(
+            runnable.iter().any(|job| job.id == job_id),
+            "pending job should be recovered by the sweep"
+        );
+        let (a, b) = tokio::join!(claim_job(&pool, job_id), claim_job(&pool, job_id));
+        assert_eq!(usize::from(a?) + usize::from(b?), 1);
+        assert_eq!(get_job_by_id(&pool, job_id).await?.unwrap().attempts, 1);
+
+        let queued = create_job(&pool, event_id, "queued").await?.unwrap();
+        let previous_output = serde_json::json!({"kept": true});
+        sqlx::query("UPDATE processor_jobs SET status='failed', attempts=4, last_error='old', next_retry_at=now()-interval '1 second', output=$2 WHERE id=$1")
+            .bind(queued).bind(&previous_output).execute(&pool).await?;
+        assert!(abandon_queued_job(&pool, queued, "not eligible").await?);
+        let job = get_job_by_id(&pool, queued).await?.unwrap();
+        assert_eq!(job.status, "abandoned");
+        assert_eq!(job.attempts, 4);
+        assert_eq!(job.output, Some(previous_output));
+        assert!(job.next_retry_at.is_none());
+        assert_eq!(job.last_error.as_deref(), Some("not eligible"));
+        Ok(())
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -297,6 +424,39 @@ mod tests {
         assert_eq!(job.attempts, 1);
         assert_eq!(job.output, Some(new_output));
 
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn replay_and_sweep_claims_are_mutually_exclusive(pool: PgPool) -> Result<()> {
+        let event_id = create_test_event(&pool).await?;
+        let job_id = create_job(&pool, event_id, "test_proc").await?.unwrap();
+
+        // Sweep wins first: replay must not reset or steal its in-progress job.
+        assert!(claim_job(&pool, job_id).await?);
+        assert!(!reset_and_claim_job_for_replay(&pool, job_id).await?);
+        let job = get_job_by_id(&pool, job_id).await?.unwrap();
+        assert_eq!(job.status, "in_progress");
+        assert_eq!(job.attempts, 1);
+
+        // After a completed prior run, replay atomically acquires ownership;
+        // a subsequent sweep cannot claim the job a second time.
+        update_job_status(
+            &pool,
+            job_id,
+            "completed",
+            None,
+            None,
+            None,
+            AttemptsUpdate::None,
+        )
+        .await?;
+        assert!(reset_and_claim_job_for_replay(&pool, job_id).await?);
+        assert!(!claim_job(&pool, job_id).await?);
+        let job = get_job_by_id(&pool, job_id).await?.unwrap();
+        assert_eq!(job.status, "in_progress");
+        assert_eq!(job.attempts, 1);
         Ok(())
     }
 
