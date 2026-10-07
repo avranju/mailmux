@@ -24,6 +24,23 @@ uploads, JSON APIs, and MCP; views are protected by default and can be made publ
 search limits are enforced; attachment extraction is best effort and never rejects a
 message. Raw messages and attachment bytes are not stored.
 
+Citation links from both HTTP and MCP use `server.public_base_url`. By default,
+MCP accepts the hostname from that URL (on any port). To accept internal Docker
+Compose hostnames while returning public citation links, set an explicit allowlist:
+
+```toml
+[server]
+public_base_url = "https://mail.example.com"
+mcp_allowed_hosts = ["mailindex:8090", "mail.example.com"]
+```
+
+`mcp_allowed_hosts` replaces the derived list, so include the public hostname if
+clients also use it for MCP. Entries are case-insensitive hostnames or IP addresses,
+optionally with a port: `mailindex` accepts any port, while `mailindex:8090` accepts
+only port 8090. Use brackets for IPv6, such as `[::1]:8090`. Omit schemes, paths,
+credentials, whitespace, and wildcards. An empty list is rejected. This setting
+affects only MCP Host validation; bearer authentication and `protect_view` still apply.
+
 Upload metadata may contain `account_id`, `mailbox_name`, and `uid`; the complete
 object is retained as producer metadata JSON. Identity is the `(source, source_id)`
 path pair, not RFC `Message-ID`. Search requires nonblank text and supports inclusive

@@ -15,6 +15,7 @@ pub fn config(dir: &TempDir) -> Config {
         server: ServerConfig {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             public_base_url: "http://127.0.0.1:8090".into(),
+            mcp_allowed_hosts: None,
             max_request_bytes: 2_000_000,
             api_token_env: None,
             protect_view: true,

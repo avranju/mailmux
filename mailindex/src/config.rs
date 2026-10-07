@@ -27,6 +27,8 @@ pub struct Config {
 pub struct ServerConfig {
     pub bind: SocketAddr,
     pub public_base_url: String,
+    /// Override the MCP Host allowlist; omission derives it from public_base_url.
+    pub mcp_allowed_hosts: Option<Vec<String>>,
     pub max_request_bytes: usize,
     pub api_token_env: Option<String>,
     #[serde(default = "default_true")]
@@ -112,6 +114,18 @@ impl Config {
         if base.scheme() != "http" && base.scheme() != "https" {
             bail!("public_base_url must use http or https")
         }
+        if let Some(hosts) = &self.server.mcp_allowed_hosts {
+            if hosts.is_empty() {
+                bail!("server.mcp_allowed_hosts must contain at least one host")
+            }
+            for host in hosts {
+                if !valid_mcp_host(host) {
+                    bail!(
+                        "invalid server.mcp_allowed_hosts entry {host:?}: expected a hostname or IP address with an optional port, without a scheme, path, credentials, whitespace, or wildcard"
+                    )
+                }
+            }
+        }
         if !self.storage.database_path.is_absolute() || !self.index.path.is_absolute() {
             bail!("database_path and index.path must be absolute")
         }
@@ -152,6 +166,9 @@ impl Config {
     }
 
     pub fn mcp_allowed_hosts(&self) -> Vec<String> {
+        if let Some(hosts) = &self.server.mcp_allowed_hosts {
+            return hosts.clone();
+        }
         let Some(host) = url::Url::parse(&self.server.public_base_url).ok() else {
             return vec![];
         };
@@ -173,6 +190,24 @@ impl Config {
             urlencoding(id)
         )
     }
+}
+
+fn valid_mcp_host(value: &str) -> bool {
+    let Ok(authority) = value.parse::<axum::http::uri::Authority>() else {
+        return false;
+    };
+    let host = authority.host();
+    let valid_host = if host.starts_with('[') && host.ends_with(']') {
+        host[1..host.len() - 1]
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok()
+    } else {
+        !host.is_empty()
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    };
+    valid_host && !value.contains('@') && (value == host || authority.port_u16().is_some())
 }
 
 fn urlencoding(s: &str) -> String {
@@ -229,6 +264,7 @@ mod tests {
             server: ServerConfig {
                 bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
                 public_base_url: "http://127.0.0.1".into(),
+                mcp_allowed_hosts: None,
                 max_request_bytes: 1,
                 api_token_env: None,
                 protect_view: true,
@@ -276,5 +312,74 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(too_large.contains("less than"));
+    }
+
+    #[test]
+    fn mcp_hosts_default_to_public_url_when_omitted() {
+        let mut config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        assert!(config.server.mcp_allowed_hosts.is_none());
+        for (base, expected) in [
+            ("http://127.0.0.1:8090", vec!["127.0.0.1:8090", "127.0.0.1"]),
+            ("https://mail.example.com", vec!["mail.example.com"]),
+            ("http://[::1]:8090", vec!["[::1]:8090", "[::1]"]),
+        ] {
+            config.server.public_base_url = base.into();
+            assert_eq!(config.mcp_allowed_hosts(), expected);
+        }
+    }
+
+    #[test]
+    fn explicit_mcp_hosts_replace_defaults_without_changing_citation_urls() {
+        let text = include_str!("../config.example.toml").replace(
+            "# mcp_allowed_hosts = [\"mailindex:8090\", \"mail.example.com\"]",
+            "mcp_allowed_hosts = [\"mailindex:8090\", \"mailindex-alias\", \"[::1]:8090\"]",
+        );
+        let mut config: Config = toml::from_str(&text).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        config.storage.database_path = dir.path().join("mail.db");
+        config.index.path = dir.path().join("index");
+        config.server.public_base_url = "https://mail.example.com/archive/".into();
+        config.validate().unwrap();
+        assert_eq!(
+            config.mcp_allowed_hosts(),
+            vec!["mailindex:8090", "mailindex-alias", "[::1]:8090"]
+        );
+        assert_eq!(
+            config.view_url("src", "mail-1"),
+            "https://mail.example.com/archive/view/src/mail%2D1"
+        );
+    }
+
+    #[test]
+    fn invalid_mcp_hosts_are_rejected_at_configuration_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path(), TANTIVY_WRITER_MEMORY_MIN);
+        for hosts in [
+            vec![],
+            vec![""],
+            vec![" "],
+            vec!["mailindex", "https://mailindex:8090"],
+            vec!["mailindex/mcp"],
+            vec!["mailindex?query"],
+            vec!["mailindex#fragment"],
+            vec!["user@mailindex:8090"],
+            vec!["*"],
+            vec!["*.example.com"],
+            vec![" mailindex"],
+            vec!["mailindex:8090 "],
+            vec!["mailindex:"],
+            vec!["mailindex:abc"],
+            vec!["mailindex:65536"],
+            vec!["[invalid]:8090"],
+            vec!["::1"],
+        ] {
+            config.server.mcp_allowed_hosts =
+                Some(hosts.iter().map(|host| (*host).into()).collect());
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("server.mcp_allowed_hosts"),
+                "{hosts:?}: {error}"
+            );
+        }
     }
 }
