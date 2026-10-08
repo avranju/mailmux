@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod documents;
 pub mod health;
+pub mod index_status;
 pub mod ingest;
 pub mod search;
 pub mod view;
@@ -51,6 +52,7 @@ pub fn router(state: AppState) -> Router {
             post(search::reindex),
         )
         .route("/v1/search", post(search::search))
+        .route("/v1/index-status", get(index_status::get))
         .layer(middleware::from_fn_with_state(state.clone(), auth::require));
     let view = Router::new().route("/view/{source}/{source_id}", get(view::view));
     let view = if state.config.server.protect_view {

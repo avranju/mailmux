@@ -49,6 +49,83 @@ async fn assert_json_error(response: axum::response::Response, status: StatusCod
 }
 
 #[tokio::test]
+async fn index_status_returns_repository_counts_and_requires_authentication() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Arc::new(config(&dir));
+    let repo = repository(&dir).await;
+    let (idx, _writer) = SearchIndex::open(&cfg.index.path, cfg.index.writer_memory_bytes).unwrap();
+    let app = router(AppState {
+        repo: repo.clone(),
+        search: Arc::new(SearchService {
+            repo: repo.clone(),
+            index: Arc::new(idx),
+            config: cfg.clone(),
+        }),
+        config: cfg.clone(),
+        notify: Arc::new(Notify::new()),
+        ready: Arc::new(AtomicBool::new(true)),
+        token: Some("secret".into()),
+        cancel: CancellationToken::new(),
+    });
+
+    for id in ["pending-a", "pending-b", "indexed", "error"] {
+        let message = normalize_message(
+            "s".into(),
+            id.into(),
+            serde_json::json!({}),
+            fixture("plain.eml"),
+            &cfg.content,
+        )
+        .unwrap();
+        let outcome = repo.upsert(&message).await.unwrap();
+        match id {
+            "indexed" => repo
+                .mark_indexed(outcome.document_id, &message.raw_sha256)
+                .await
+                .unwrap(),
+            "error" => repo
+                .mark_error(outcome.document_id, &message.raw_sha256, "indexing failed")
+                .await
+                .unwrap(),
+            _ => {}
+        }
+    }
+
+    for authorization in [None, Some("Bearer wrong"), Some("Basic secret")] {
+        let mut request = Request::get("/v1/index-status");
+        if let Some(value) = authorization {
+            request = request.header("authorization", value);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_json_error(response, StatusCode::UNAUTHORIZED, "unauthorized").await;
+    }
+
+    let response = app
+        .oneshot(
+            Request::get("/v1/index-status")
+                .header("authorization", "Bearer secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({"total": 4, "pending": 2, "indexed": 1, "error": 1})
+    );
+}
+
+#[tokio::test]
 async fn multipart_upload_uses_the_configured_limit_above_two_mib() {
     let dir = tempfile::tempdir().unwrap();
     let boundary = "large-upload";
