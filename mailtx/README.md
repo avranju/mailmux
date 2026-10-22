@@ -591,3 +591,30 @@ workflow = true
 `needs-review` is reserved for checks requiring attention, and `reconciled` for
 successful balance verification; ordinary imports do not claim reconciliation.
 Custom tags remain supported independently of these automatic groups.
+
+### Running bank balance monitoring
+
+Enable monitoring when notifications contain explicit `Closing balance`, `Avl Bal`,
+or `Available balance` figures, and set the native currency of each account:
+
+```toml
+state_db = "/var/lib/mailtx/state.sqlite" # top level
+[balance_monitor]
+enabled = true # default: false
+tolerance_minor_units = 1
+```
+
+The first observation establishes a baseline. Later withdrawals subtract and
+deposits add their amounts; agreement earns `reconciled`, and gaps earn
+`needs-review` with a warning and `metadata.balance_status = "drift"`. Monitoring
+continues from the observed bank balance after a gap so one missing email does
+not trigger drift forever. Persisted bank observations are independent of Firefly
+posting success; replay retains the original verdict. Older/equal-timestamp email
+observations are `out_of_order`, require review, and do not rewind the baseline.
+Email timestamps order observations, with transaction timestamps as fallback.
+
+Currencies and accounts have separate baselines. Missing balance evidence is
+reported as `no_balance`; contradictory figures or currency mismatches require
+review. Labels must describe the post-transaction available/closing balance.
+Credit-limit/available-credit figures are not supported as account balances.
+This is evidence from notifications, not an independent bank statement audit.

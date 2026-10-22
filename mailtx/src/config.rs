@@ -74,6 +74,8 @@ pub struct Config {
     pub tags: Vec<String>,
     #[serde(default)]
     pub tagging: crate::tagging::TaggingConfig,
+    #[serde(default)]
+    pub balance_monitor: crate::balance::BalanceConfig,
     pub firefly: FireflyConfig,
     #[serde(default)]
     pub payee_rules: Vec<PayeeRule>,
@@ -392,6 +394,9 @@ impl Config {
         }
         config.validate_transfer_rules()?;
         crate::transfer::window_seconds(config.transfer_match_window_hours)?;
+        if config.balance_monitor.enabled && config.state_db.is_none() {
+            anyhow::bail!("balance_monitor requires state_db");
+        }
         if !config.transfer_rules.is_empty() && config.state_db.is_none() {
             anyhow::bail!(
                 "transfer_rules are configured but state_db is not set; \
@@ -749,6 +754,7 @@ error_if_duplicate_hash = false"#,
             tag: "test-tag".to_string(),
             tags: vec![],
             tagging: Default::default(),
+            balance_monitor: Default::default(),
             firefly: FireflyConfig {
                 base_url: "https://firefly.example/api".to_string(),
                 access_token: "token".to_string(),

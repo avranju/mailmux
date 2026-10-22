@@ -6,6 +6,7 @@ use tracing::{info, warn};
 use crate::matcher::AccountMatcher;
 use crate::metrics::Metrics;
 
+mod balance;
 mod category_cache;
 mod config;
 mod email;
@@ -263,6 +264,69 @@ async fn run(m: &mut Metrics) -> Result<()> {
         .map(|account| account.id.as_str())
         .unwrap_or(&resolved.account_id);
     tagging::apply(&mut canonical_tx, source_id, &config.tagging);
+
+    if config.balance_monitor.enabled {
+        if let Some(currency) = canonical_tx.currency_code.as_deref() {
+            match balance::closing_balance(&body, currency) {
+                Ok(Some(closing)) => {
+                    let mut store =
+                        balance::BalanceStore::open(config.state_db.as_deref().unwrap())?;
+                    let units = money::minor_units(canonical_tx.amount)?;
+                    let signed_units = if canonical_tx.kind == endpoint::TransactionKind::Withdrawal
+                    {
+                        -units
+                    } else {
+                        units
+                    };
+                    let status = store.observe(
+                        balance::Observation {
+                            external_id: &external_id,
+                            account: &resolved.firefly_account_id,
+                            currency,
+                            timestamp: email
+                                .date
+                                .map(|date| date.timestamp())
+                                .unwrap_or(canonical_tx.occurred_at.timestamp()),
+                            signed_units,
+                            balance_units: balance::signed_minor_units(closing)?,
+                        },
+                        config.balance_monitor.tolerance_minor_units,
+                    )?;
+                    m.balance_status = Some(status.as_str());
+                    if config.tagging.workflow {
+                        match status {
+                            balance::Outcome::Reconciled => {
+                                canonical_tx.extend_tags(["reconciled".into()])
+                            }
+                            balance::Outcome::Drift | balance::Outcome::OutOfOrder => {
+                                canonical_tx.extend_tags(["needs-review".into()])
+                            }
+                            balance::Outcome::Initialized => {}
+                        }
+                    }
+                    if matches!(
+                        status,
+                        balance::Outcome::Drift | balance::Outcome::OutOfOrder
+                    ) {
+                        warn!(
+                            account_id = resolved.account_id,
+                            status = status.as_str(),
+                            "bank balance requires review"
+                        );
+                    }
+                }
+                Ok(None) => m.balance_status = Some("no_balance"),
+                Err(_) => {
+                    m.balance_status = Some("invalid_balance");
+                    canonical_tx.extend_tags(["needs-review".into()]);
+                    warn!("ambiguous or unexpected bank balance requires review");
+                }
+            }
+        } else {
+            m.balance_status = Some("unknown_currency");
+            warn!("balance monitoring requires an account currency");
+        }
+    }
 
     let original_narration = canonical_tx.narration.clone();
     canonical_tx.narration = payee::normalize(&original_narration, &config.payee_rules);

@@ -9,6 +9,7 @@ use serde::Serialize;
 /// its Prometheus endpoint.
 #[derive(Debug, Default)]
 pub struct Metrics {
+    pub balance_status: Option<&'static str>,
     /// Terminal outcome for this invocation.
     pub result: Option<&'static str>,
     /// Result of the LLM call, set whenever a call was attempted.
@@ -33,6 +34,8 @@ pub struct Metrics {
 /// and any associated Firefly transaction ID.
 #[derive(Debug, Serialize)]
 pub struct ProcessorMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance_status: Option<&'static str>,
     /// Terminal outcome string, e.g. `"posted"`, `"no_transaction"`, `"error"`.
     pub outcome: &'static str,
     /// Firefly transaction ID when a transaction was posted.
@@ -119,6 +122,7 @@ impl Metrics {
         // Build outcome metadata from the terminal result.
         let outcome = self.result.unwrap_or("error");
         let metadata = ProcessorMetadata {
+            balance_status: self.balance_status,
             outcome,
             firefly_transaction_id: self.firefly_transaction_id,
         };

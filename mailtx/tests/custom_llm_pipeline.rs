@@ -665,3 +665,93 @@ fn configured_payee_cleanup_reaches_firefly_description() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn balance_monitor_persists_across_processes_and_alerts_on_a_missing_transaction() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = root();
+    let invocation = AtomicUsize::new(0);
+    let llm = Fixture::start(3, move |_| {
+        let day = 5 + invocation.fetch_add(1, Ordering::SeqCst);
+        response(&format!(
+            r#"{{"status":"found","amount":100,"transaction_type":"withdrawal","narration":"Shop","transaction_date":"2026-01-0{day}","category":"Food"}}"#
+        ))
+    });
+    let ff = Fixture::start(9, |request| {
+        if request.starts_with("GET /api/v1/categories") {
+            (
+                200,
+                r#"{"data":[],"meta":{"pagination":{"current_page":1,"total_pages":1}}}"#.into(),
+            )
+        } else if request.starts_with("GET /api/v1/search") {
+            (200, r#"{"count":0}"#.into())
+        } else {
+            (200, r#"{"data":{"id":"tx"}}"#.into())
+        }
+    });
+    let (config, eml) = setup_config(&root, &llm.url, &ff.url, "");
+    let db = root.join("balance.sqlite");
+    let text = fs::read_to_string(&config)
+        .unwrap()
+        .replace(
+            "[llm]",
+            &format!(
+                "state_db='{}'\n[balance_monitor]\nenabled=true\n[llm]",
+                db.display()
+            ),
+        )
+        .replace("[firefly]", "[firefly]\ncurrency_code='INR'");
+    fs::write(&config, text).unwrap();
+    for (id, balance, status) in [
+        (108, 900, "initialized"),
+        (109, 800, "reconciled"),
+        (110, 600, "drift"),
+    ] {
+        fs::write(&eml,format!("From: allowed@example.test\nContent-Type: text/plain\n\nPurchase INR 100. Closing balance INR {balance}.\n")).unwrap();
+        let output = run(&config, &eml, id, &[]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let metadata: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(metadata["metadata"]["balance_status"], status);
+    }
+    llm.finish();
+    let requests = ff.finish();
+    let posts: Vec<Value> = requests
+        .iter()
+        .filter(|r| r.starts_with("POST "))
+        .map(|r| serde_json::from_str(r.split("\r\n\r\n").nth(1).unwrap()).unwrap())
+        .collect();
+    assert!(
+        posts[1]["transactions"][0]["tags"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("reconciled"))
+    );
+    assert!(
+        posts[2]["transactions"][0]["tags"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("needs-review"))
+    );
+    let db = rusqlite::Connection::open(db).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM balance_observations", [], |row| row
+            .get::<_, i64>(
+            0
+        ))
+        .unwrap(),
+        3
+    );
+    assert_eq!(
+        db.query_row("SELECT balance_units FROM balance_checkpoints", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        60000
+    );
+    drop(db);
+    fs::remove_dir_all(root).unwrap();
+}
