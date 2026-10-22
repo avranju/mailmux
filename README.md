@@ -560,3 +560,8 @@ Exported metrics:
 ## License
 
 [MIT](LICENSE)
+
+IMAP retry decisions and sync-failure metrics use typed errors for authentication,
+deadlines, transport, protocol, and unsupported IDLE. Error context and server
+message wording do not determine retry behavior or metric categories. Only an
+explicit IDLE rejection selects polling; other failures reconnect.
