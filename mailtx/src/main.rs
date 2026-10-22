@@ -243,6 +243,17 @@ async fn run(m: &mut Metrics) -> Result<()> {
         .clone()
         .or_else(|| config.firefly.currency_code.clone());
 
+    canonical_tx.extend_tags(
+        config.tags.iter().cloned().chain(
+            config
+                .firefly
+                .asset_accounts
+                .iter()
+                .filter(|account| account.firefly_account_id.trim() == resolved.firefly_account_id)
+                .flat_map(|account| account.tags.iter().cloned()),
+        ),
+    );
+
     let original_narration = canonical_tx.narration.clone();
     canonical_tx.narration = payee::normalize(&original_narration, &config.payee_rules);
 

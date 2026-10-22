@@ -633,8 +633,9 @@ fn configured_payee_cleanup_reaches_firefly_description() {
     let (config, eml) = setup_config(&root, &llm.url, &ff.url, "");
     let text = fs::read_to_string(&config).unwrap().replace(
         "[llm]",
-        "[[payee_rules]]\ncontains='swiggy'\nname='Swiggy delivery'\n[llm]",
+        "tags=[' imports ','mailtx-test-tag','']\n[[payee_rules]]\ncontains='swiggy'\nname='Swiggy delivery'\n[llm]",
     );
+    let text = format!("{text}\ntags=['bank-custom','imports']\n");
     fs::write(&config, text).unwrap();
     let output = run(&config, &eml, 107, &[]);
     assert!(
@@ -646,6 +647,10 @@ fn configured_payee_cleanup_reaches_firefly_description() {
     let requests = ff.finish();
     let post = requests.iter().find(|r| r.starts_with("POST ")).unwrap();
     let payload: Value = serde_json::from_str(post.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        payload["transactions"][0]["tags"],
+        json!(["mailtx-test-tag", "imports", "bank-custom"])
+    );
     assert_eq!(payload["transactions"][0]["description"], "Swiggy delivery");
     assert_eq!(
         payload["transactions"][0]["destination_name"],

@@ -553,3 +553,22 @@ deposits send it as `source_name` (revenue account). Previously both were omitte
 leaving Firefly to use its anonymous/cash counterparty. Firefly can create or reuse
 the named account. Transfers retain both explicit asset-account IDs. This affects
 new imports; it does not rewrite existing transactions or their counterparties.
+
+### Additional canonical tags
+
+The legacy top-level `tag` remains the provenance tag. Optional top-level `tags`
+and per-asset-account `tags` add arbitrary categories or workflow labels:
+
+```toml
+tag = "mailmux-mailtx"
+tags = ["imported"]
+# Other top-level settings, then the Firefly table...
+[[firefly.asset_accounts]]
+id = "hdfc"
+firefly_account_id = "12"
+tags = ["bank-hdfc"]
+```
+
+Tags are trimmed, empty values removed, and duplicates removed in first-seen
+order. They are carried by CanonicalTransaction through posting and pending
+transfer storage, rather than reconstructed by the Firefly transport.

@@ -70,6 +70,8 @@ pub struct Config {
     /// Tag applied to every transaction posted to Firefly. Defaults to "mailmux-mailtx".
     #[serde(default = "default_tag")]
     pub tag: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub firefly: FireflyConfig,
     #[serde(default)]
     pub payee_rules: Vec<PayeeRule>,
@@ -311,6 +313,8 @@ fn default_error_if_duplicate_hash() -> bool {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FireflyAssetAccountConfig {
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// Stable local identifier (for logs/debugging).
     pub id: String,
     /// Firefly asset account ID.
@@ -741,6 +745,7 @@ error_if_duplicate_hash = false"#,
             llm: None,
             payee_rules: vec![],
             tag: "test-tag".to_string(),
+            tags: vec![],
             firefly: FireflyConfig {
                 base_url: "https://firefly.example/api".to_string(),
                 access_token: "token".to_string(),

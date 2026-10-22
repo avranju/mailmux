@@ -184,6 +184,7 @@ mod tests {
         DeterministicAccountMatcher::new(
             &[
                 FireflyAssetAccountConfig {
+                    tags: vec![],
                     id: "hdfc_9772".to_string(),
                     firefly_account_id: "12".to_string(),
                     account_suffixes: vec!["9772".to_string()],
@@ -193,6 +194,7 @@ mod tests {
                     aliases: vec!["hdfc savings".to_string()],
                 },
                 FireflyAssetAccountConfig {
+                    tags: vec![],
                     id: "sbm_3989".to_string(),
                     firefly_account_id: "42".to_string(),
                     account_suffixes: vec!["3989".to_string()],

@@ -35,6 +35,20 @@ pub struct CanonicalTransaction {
     pub external_id: Option<String>,
 }
 
+impl CanonicalTransaction {
+    /// Stable ordering, trimmed nonempty tags, and no duplicates across sources.
+    pub fn extend_tags(&mut self, values: impl IntoIterator<Item = String>) {
+        self.tags.extend(values);
+        let mut seen = std::collections::HashSet::new();
+        self.tags = self
+            .tags
+            .drain(..)
+            .map(|tag| tag.trim().to_string())
+            .filter(|tag| !tag.is_empty() && seen.insert(tag.clone()))
+            .collect();
+    }
+}
+
 pub struct FetchedCategories {
     pub names: Vec<String>,
     pub request_count: usize,
