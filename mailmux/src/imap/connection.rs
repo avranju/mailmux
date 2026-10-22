@@ -22,6 +22,33 @@ use tracing::{debug, trace};
 
 use crate::config::AccountConfig;
 
+// Bound aggregate command results as well as each individual wire response.
+const MAX_RESPONSE_ITEMS: usize = 1_000_000;
+const MAX_FETCH_BYTES: usize = 128 * 1024 * 1024;
+const MAX_WIRE_RESPONSE_BYTES: u32 = 100 * 1024 * 1024;
+
+#[derive(Default)]
+struct ResponseBudget {
+    items: usize,
+    bytes: usize,
+}
+
+impl ResponseBudget {
+    fn reserve(&mut self, bytes: usize) -> Result<()> {
+        if self.items >= MAX_RESPONSE_ITEMS || bytes > MAX_FETCH_BYTES - self.bytes {
+            tracing::warn!(
+                items = self.items,
+                bytes = self.bytes,
+                "IMAP response limit exceeded"
+            );
+            bail!("IMAP response limit exceeded; command results discarded");
+        }
+        self.items += 1;
+        self.bytes += bytes;
+        Ok(())
+    }
+}
+
 const IDLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum time to sit in IDLE without any server activity before forcing a
@@ -207,7 +234,9 @@ impl ImapConnection {
         .await
         .unwrap_or_else(|_| bail!("IMAP connection timed out after {}s", connect_timeout.as_secs()))?;
 
-        let client = Client::new(Options::default());
+        let mut options = Options::default();
+        options.max_response_size = MAX_WIRE_RESPONSE_BYTES;
+        let client = Client::new(options);
         let command_timeout = Duration::from_secs(config.imap_command_timeout_secs);
         let mut conn = Self {
             stream,
@@ -387,6 +416,7 @@ impl ImapConnection {
         let _handle = self.client.enqueue_command(cmd);
 
         let mut messages = Vec::new();
+        let mut budget = ResponseBudget::default();
         let timeout = self.command_timeout;
 
         loop {
@@ -402,7 +432,7 @@ impl ImapConnection {
             match event {
                 Event::DataReceived { data } => {
                     if let Data::Fetch { seq: _, items } = data {
-                        let msg = parse_fetch_response(items.as_ref());
+                        let msg = parse_fetch_response(items.as_ref(), &mut budget)?;
                         if let Some(msg) = msg {
                             messages.push(msg);
                         }
@@ -426,7 +456,9 @@ impl ImapConnection {
                             )
                             .await
                             {
-                                if let Some(msg) = parse_fetch_response(items.as_ref()) {
+                                if let Some(msg) =
+                                    parse_fetch_response(items.as_ref(), &mut budget)?
+                                {
                                     messages.push(msg);
                                 }
                             }
@@ -470,6 +502,7 @@ impl ImapConnection {
         let _handle = self.client.enqueue_command(cmd);
 
         let mut uids = Vec::new();
+        let mut budget = ResponseBudget::default();
         let timeout = self.command_timeout;
 
         loop {
@@ -486,6 +519,7 @@ impl ImapConnection {
                     if let Data::Fetch { items, .. } = data {
                         for item in items.as_ref() {
                             if let MessageDataItem::Uid(u) = item {
+                                budget.reserve(0)?;
                                 uids.push(u.get());
                             }
                         }
@@ -505,6 +539,7 @@ impl ImapConnection {
                             {
                                 for item in items.as_ref() {
                                     if let MessageDataItem::Uid(u) = item {
+                                        budget.reserve(0)?;
                                         uids.push(u.get());
                                     }
                                 }
@@ -540,6 +575,7 @@ impl ImapConnection {
         let _handle = self.client.enqueue_command(cmd);
 
         let mut uids = Vec::new();
+        let mut budget = ResponseBudget::default();
         let timeout = self.command_timeout;
         tokio::time::timeout(timeout, async {
             loop {
@@ -552,6 +588,7 @@ impl ImapConnection {
                     Event::DataReceived { data } => {
                         if let Data::Search(results, ..) = data {
                             for uid in results {
+                                budget.reserve(0)?;
                                 uids.push(uid.get());
                             }
                         }
@@ -797,7 +834,28 @@ pub struct FetchedMessage {
     pub size: Option<u32>,
 }
 
-fn parse_fetch_response(items: &[MessageDataItem]) -> Option<FetchedMessage> {
+fn parse_fetch_response(
+    items: &[MessageDataItem],
+    budget: &mut ResponseBudget,
+) -> Result<Option<FetchedMessage>> {
+    // Count every response, including malformed/unsolicited responses. Inspect
+    // borrowed bodies before cloning so rejected data never grows our result.
+    let bytes = items.iter().try_fold(0usize, |total, item| {
+        let size = match item {
+            MessageDataItem::BodyExt { data, .. } | MessageDataItem::Rfc822(data) => {
+                data.0.as_ref().map_or(0, |value| value.as_ref().len())
+            }
+            MessageDataItem::Flags(flags) => flags
+                .iter()
+                .map(|flag| flag_fetch_to_string(flag).len())
+                .sum(),
+            _ => 0,
+        };
+        total
+            .checked_add(size)
+            .ok_or_else(|| anyhow::anyhow!("IMAP response size overflow"))
+    })?;
+    budget.reserve(bytes)?;
     let mut uid: Option<u32> = None;
     let mut flags: Vec<String> = Vec::new();
     let mut raw_bytes: Option<Vec<u8>> = None;
@@ -834,15 +892,16 @@ fn parse_fetch_response(items: &[MessageDataItem]) -> Option<FetchedMessage> {
         }
     }
 
-    let uid = uid?;
-    let raw_bytes = raw_bytes?;
+    let (Some(uid), Some(raw_bytes)) = (uid, raw_bytes) else {
+        return Ok(None);
+    };
 
-    Some(FetchedMessage {
+    Ok(Some(FetchedMessage {
         uid,
         flags,
         raw_bytes,
         size,
-    })
+    }))
 }
 
 fn flag_fetch_to_string(ff: &FlagFetch<'_>) -> String {
@@ -878,5 +937,49 @@ fn check_status(status: &Status, operation: &str) -> Result<()> {
         Status::Bye(bye) => {
             bail!("{operation}: server sent BYE: {}", bye.text)
         }
+    }
+}
+
+#[cfg(test)]
+mod response_limit_tests {
+    use super::*;
+    use imap_next::imap_types::core::NString;
+    use std::num::NonZeroU32;
+
+    #[test]
+    fn repeated_small_responses_hit_element_limit() {
+        let mut budget = ResponseBudget::default();
+        for _ in 0..MAX_RESPONSE_ITEMS {
+            budget.reserve(0).unwrap();
+        }
+        assert!(budget.reserve(0).is_err());
+        assert_eq!(budget.items, MAX_RESPONSE_ITEMS);
+    }
+
+    #[test]
+    fn aggregate_bytes_are_checked_before_retaining_message() {
+        let items = [
+            MessageDataItem::Uid(NonZeroU32::new(1).unwrap()),
+            MessageDataItem::Rfc822(NString::try_from("body").unwrap()),
+        ];
+        let mut budget = ResponseBudget {
+            items: 0,
+            bytes: MAX_FETCH_BYTES - 4,
+        };
+        let message = parse_fetch_response(&items, &mut budget).unwrap().unwrap();
+        assert_eq!(message.raw_bytes, b"body");
+        assert!(parse_fetch_response(&items, &mut budget).is_err());
+        assert_eq!(budget.bytes, MAX_FETCH_BYTES);
+        assert_eq!(budget.items, 1);
+    }
+
+    #[test]
+    fn malformed_fetch_responses_also_consume_budget() {
+        let mut budget = ResponseBudget {
+            items: MAX_RESPONSE_ITEMS - 1,
+            bytes: 0,
+        };
+        assert!(parse_fetch_response(&[], &mut budget).unwrap().is_none());
+        assert!(parse_fetch_response(&[], &mut budget).is_err());
     }
 }
