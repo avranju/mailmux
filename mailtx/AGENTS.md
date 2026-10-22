@@ -94,7 +94,7 @@ llm_model = "claude-haiku-4-5-20251001"
 
 [firefly]
 base_url     = "https://firefly.example.com/api"
-access_token = "eyJ..."
+access_token = "${FIREFLY_ACCESS_TOKEN}"
 
 # Optional Firefly settings (shown with their defaults):
 # default_asset_account_id = "12"
@@ -197,3 +197,7 @@ Tests exist for sender normalization, Firefly behavior, transfer state, and pipe
 - Integration-test the LLM and post modules with a mock HTTP server (e.g.
   `wiremock`)
 - Async tests use `#[tokio::test]`
+
+Config loading checks Unix permissions on the opened file and supports an
+exact `${FIREFLY_ACCESS_TOKEN}` reference for `firefly.access_token`; unresolved
+or empty references fail before side effects. Literal tokens remain supported.

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use std::io::Read;
 use std::time::Duration;
 use tracing::warn;
 
@@ -309,7 +310,28 @@ impl Config {
     pub fn load() -> Result<Self> {
         let path = std::env::var("MAILTX_CONFIG")
             .context("MAILTX_CONFIG env var required (path to TOML config file)")?;
-        let content = std::fs::read_to_string(&path)
+        // Check the opened file so symlink/path replacement cannot make us
+        // inspect permissions on a different file from the one being read.
+        let mut file =
+            std::fs::File::open(&path).with_context(|| format!("opening config file: {path}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = file
+                .metadata()
+                .context("reading config file permissions")?
+                .permissions()
+                .mode();
+            if mode & 0o026 != 0 {
+                warn!(
+                    path,
+                    mode = format!("{:04o}", mode & 0o777),
+                    "insecure config file permissions; use 0600 or 0640 to protect credentials"
+                );
+            }
+        }
+        let mut content = String::new();
+        file.read_to_string(&mut content)
             .with_context(|| format!("reading config file: {path}"))?;
         let mut config: Self = toml::from_str(&content).map_err(|e| {
             anyhow::anyhow!(
@@ -319,6 +341,11 @@ impl Config {
                 "unknown"
             )
         })?;
+
+        config.firefly.access_token =
+            resolve_firefly_token(&config.firefly.access_token, |name| {
+                std::env::var(name).ok()
+            })?;
 
         // Normalise allowed_senders to lowercase mailbox addresses and drop invalid entries.
         config.allowed_senders = config
@@ -440,6 +467,32 @@ impl Config {
             .iter()
             .any(|allowed| sender_address == allowed.as_str())
     }
+}
+
+fn resolve_firefly_token(raw: &str, lookup: impl FnOnce(&str) -> Option<String>) -> Result<String> {
+    let raw = raw.trim();
+    let token = if let Some(name) = raw.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+        let mut chars = name.chars();
+        let valid = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            anyhow::bail!("firefly.access_token has an invalid environment reference");
+        }
+        lookup(name).ok_or_else(|| {
+            anyhow::anyhow!("firefly.access_token environment variable {name} is unavailable")
+        })?
+    } else {
+        if raw.contains("${") {
+            anyhow::bail!("firefly.access_token must use one complete environment reference");
+        }
+        raw.to_owned()
+    };
+    if token.trim().is_empty() {
+        anyhow::bail!("firefly.access_token must not be empty");
+    }
+    Ok(token.trim().to_owned())
 }
 
 fn normalize_sender_address(sender: &str) -> Option<String> {
@@ -904,5 +957,40 @@ base_url = "https://llm.example/prefix""#,
     fn loopback_http_host_rejects_domain_names() {
         assert!(!is_loopback_http_host("firefly.local"));
         assert!(!is_loopback_http_host("example.com"));
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+    #[test]
+    fn token_references_resolve_only_the_named_variable_and_errors_are_redacted() {
+        assert_eq!(
+            resolve_firefly_token(" ${FIREFLY_ACCESS_TOKEN} ", |name| {
+                assert_eq!(name, "FIREFLY_ACCESS_TOKEN");
+                Some(" secret-test-token ".into())
+            })
+            .unwrap(),
+            "secret-test-token"
+        );
+        assert_eq!(
+            resolve_firefly_token("literal-token", |_| panic!("literal must not read env"))
+                .unwrap(),
+            "literal-token"
+        );
+        assert!(
+            resolve_firefly_token("${MISSING}", |_| None)
+                .unwrap_err()
+                .to_string()
+                .contains("MISSING")
+        );
+        assert!(resolve_firefly_token("${EMPTY}", |_| Some("  ".into())).is_err());
+        assert!(
+            resolve_firefly_token("${invalid-name}", |_| panic!(
+                "invalid reference must not read env"
+            ))
+            .is_err()
+        );
+        assert!(resolve_firefly_token("prefix-${SECRET}", |_| None).is_err());
     }
 }

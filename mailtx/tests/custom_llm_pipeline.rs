@@ -425,3 +425,57 @@ fn timeout_has_one_safe_completion_log() {
     assert_eq!(ff.finish().len(), 1);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn firefly_token_reference_and_permission_warning_keep_credentials_out_of_logs() {
+    let root = root();
+    let llm = Fixture::start(1, |_| response(r#"{"status":"not_found","amount":null}"#));
+    let ff = firefly(1);
+    let (config, eml) = setup_config(&root, &llm.url, &ff.url, "");
+    let text = fs::read_to_string(&config)
+        .unwrap()
+        .replace("firefly-secret-sentinel", "${MAILTX_TEST_FIREFLY_TOKEN}");
+    fs::write(&config, text).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let out = run(
+        &config,
+        &eml,
+        70,
+        &[("MAILTX_TEST_FIREFLY_TOKEN", "env-firefly-secret-sentinel")],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let logs = String::from_utf8_lossy(&out.stderr);
+    assert!(!logs.contains("env-firefly-secret-sentinel"));
+    #[cfg(unix)]
+    assert!(logs.contains("insecure config file permissions"));
+    assert_eq!(llm.finish().len(), 1);
+    let requests = ff.finish();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("Bearer env-firefly-secret-sentinel"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn missing_firefly_token_fails_before_network_side_effects() {
+    let root = root();
+    let (config, eml) = setup_config(&root, "http://127.0.0.1:1", "http://127.0.0.1:1", "");
+    let text = fs::read_to_string(&config).unwrap().replace(
+        "firefly-secret-sentinel",
+        "${MAILTX_TEST_FIREFLY_MISSING_TOKEN}",
+    );
+    fs::write(&config, text).unwrap();
+    let out = run(&config, &eml, 71, &[]);
+    assert!(!out.status.success());
+    let logs = String::from_utf8_lossy(&out.stderr);
+    assert!(logs.contains("MAILTX_TEST_FIREFLY_MISSING_TOKEN is unavailable"));
+    assert!(!logs.contains("connection"));
+    fs::remove_dir_all(root).unwrap();
+}
