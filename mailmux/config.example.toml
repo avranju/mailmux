@@ -4,6 +4,7 @@
 #
 # SECURITY: Account passwords MUST use ${VAR} environment variable references.
 # Literal passwords in the config file are rejected at startup.
+# Alternatively, use credentials_file and omit username/password.
 # Recommended file permissions: 0600 (owner-only) or 0640 (owner + group).
 
 [general]
@@ -41,6 +42,9 @@ imap_port = 993
 tls = true
 username = "user@gmail.com"
 password = "${GMAIL_APP_PASSWORD}"
+# For hot rotation, remove username/password above and use an atomic secret file:
+# credentials_file = "/run/secrets/personal-imap.toml"
+# credential_reload_interval_secs = 30
 poll_interval_secs = 60
 rate_limit_per_second = 5
 max_connections = 2

@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 mod backfill;
 mod cli;
 mod config;
+mod credentials;
 mod db;
 mod events;
 mod health;

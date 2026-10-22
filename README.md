@@ -560,3 +560,27 @@ Exported metrics:
 ## License
 
 [MIT](LICENSE)
+
+### Rotating IMAP credentials without restarting
+
+For accounts managed by a secret service, omit `username` and `password` and
+configure an atomically replaced credential file:
+
+```toml
+[[accounts]]
+id = "personal"
+imap_host = "imap.example.com"
+mailboxes = ["INBOX"]
+credentials_file = "/run/secrets/personal-imap.toml"
+credential_reload_interval_secs = 30
+```
+
+The secret file contains `username = "..."` and `password = "..."`. Restrict it
+to mode 0600 or 0640. Mailmux reads it before every connection and compares
+its contents at the configured interval, including while IDLE is active. A
+valid change closes that mailbox's old session and authenticates a new one.
+Rejected logins wait for a valid update instead of permanently stopping.
+Temporary missing or malformed files keep an existing session alive. Changes
+are limited to these IMAP credentials; database, processor, other configuration,
+and legacy environment-sourced credential changes still require a restart.
+Do not configure both a credential file and inline username/password fields.

@@ -74,8 +74,13 @@ pub struct AccountConfig {
     pub imap_port: u16,
     #[serde(default = "default_tls")]
     pub tls: bool,
+    #[serde(default)]
     pub username: String,
+    #[serde(default)]
     pub password: String,
+    pub credentials_file: Option<String>,
+    #[serde(default = "default_credential_reload_interval")]
+    pub credential_reload_interval_secs: u64,
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
     #[serde(default = "default_rate_limit")]
@@ -95,6 +100,24 @@ pub struct AccountConfig {
     /// net to catch messages that IDLE silently missed.  Should be larger
     /// than `poll_interval_secs`.  Omit or set to null to disable.
     pub idle_heartbeat_interval_secs: Option<u64>,
+}
+
+fn default_credential_reload_interval() -> u64 {
+    30
+}
+
+impl AccountConfig {
+    pub fn credentials(&self) -> Result<crate::credentials::Credentials> {
+        if let Some(path) = &self.credentials_file {
+            return crate::credentials::Credentials::read(path);
+        }
+        let credentials = crate::credentials::Credentials {
+            username: self.username.clone(),
+            password: self.password.clone(),
+        };
+        credentials.validate()?;
+        Ok(credentials)
+    }
 }
 
 fn default_imap_port() -> u16 {
@@ -239,6 +262,9 @@ impl Config {
             substitute_env_vars(&mut account.imap_host);
             substitute_env_vars(&mut account.username);
             substitute_env_vars(&mut account.password);
+            if let Some(path) = &mut account.credentials_file {
+                substitute_env_vars(path);
+            }
             for mailbox in &mut account.mailboxes {
                 substitute_env_vars(mailbox);
             }
@@ -267,6 +293,12 @@ impl Config {
 
     fn validate_password_references(&self) -> Result<()> {
         for account in &self.accounts {
+            if account.credentials_file.is_some() {
+                if !account.username.is_empty() || !account.password.is_empty() {
+                    bail!("choose credentials_file or username/password, not both");
+                }
+                continue;
+            }
             if !is_env_var_reference(&account.password) {
                 bail!(
                     "account '{}': password must be an environment variable reference (e.g. password = \"${{MY_PASSWORD}}\"). Literal passwords in config files are not allowed.",
@@ -321,7 +353,15 @@ impl Config {
             if account.imap_host.is_empty() {
                 bail!("account '{}': imap_host must not be empty", account.id);
             }
-            if account.username.is_empty() {
+            if account.credential_reload_interval_secs == 0
+                || account.credential_reload_interval_secs > 86_400
+            {
+                bail!("credential_reload_interval_secs must be between 1 and 86400");
+            }
+            if account.credentials_file.is_some() && account.enabled {
+                account.credentials()?;
+            }
+            if account.credentials_file.is_none() && account.username.is_empty() {
                 bail!("account '{}': username must not be empty", account.id);
             }
             if account.mailboxes.is_empty() {
@@ -518,6 +558,35 @@ events = ["email_arrived"]
 timeout_secs = 5
 concurrency = 1
 "#
+    }
+
+    #[test]
+    fn credential_file_is_an_alternative_to_environment_credentials() {
+        let mut secret = NamedTempFile::new().unwrap();
+        write!(secret, "username='user'\npassword='rotatable'\n").unwrap();
+        let text = sample_toml().replace(
+            "username = \"user@example.com\"\npassword = \"${TEST_SECRET}\"",
+            &format!("credentials_file = {:?}", secret.path().to_str().unwrap()),
+        );
+        let config: Config = toml::from_str(&text).unwrap();
+        config.validate_password_references().unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.accounts[0].credentials().unwrap().password,
+            "rotatable"
+        );
+        let mixed = text.replace(
+            "poll_interval_secs = 60",
+            "username = 'extra'\npoll_interval_secs = 60",
+        );
+        let config: Config = toml::from_str(&mixed).unwrap();
+        assert!(config.validate_password_references().is_err());
+        let zero = text.replace(
+            "poll_interval_secs = 60",
+            "credential_reload_interval_secs = 0\npoll_interval_secs = 60",
+        );
+        let config: Config = toml::from_str(&zero).unwrap();
+        assert!(config.validate().is_err());
     }
 
     fn write_temp_config(content: &str) -> NamedTempFile {

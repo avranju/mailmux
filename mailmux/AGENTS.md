@@ -140,3 +140,10 @@ enabled and subscribed to `email_arrived`) over durable `emails` rows:
 - `sqlx` is used with compile-time query checking; the database must be available (or `DATABASE_URL` set) when running `sqlx` macros during a fresh build.
 - Systemd integration uses `sd-notify` (`Type=notify` in the service unit). See `contrib/mailmux.service`.
 - Task 4.4 (flag change + deletion detection) is the only deferred feature; all other planned phases are complete.
+
+IMAP accounts can use `credentials_file` instead of username/password. The
+16 KiB-bounded TOML file contains username and password and is re-read before
+connections and monitored at credential_reload_interval_secs (default 30).
+Valid rotation reconnects only the mailbox session; missing/invalid transient
+updates retain an existing session. Never log credential contents or TOML parse
+errors with source snippets. Legacy environment credentials require restart.

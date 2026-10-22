@@ -63,13 +63,61 @@ impl MailboxWatcher {
                 return Ok(());
             }
 
-            match self.sync_and_idle_cycle(&rate_limiter, poll_interval).await {
+            let snapshot = if self.account.credentials_file.is_some() {
+                match self.account.credentials() {
+                    Ok(credentials) => Some(credentials),
+                    Err(_) => {
+                        warn!(
+                            "IMAP credential file unavailable or invalid; waiting before reconnect"
+                        );
+                        tokio::select! {
+                            _ = self.token.cancelled() => return Ok(()),
+                            _ = tokio::time::sleep(Duration::from_secs(self.account.credential_reload_interval_secs)) => continue,
+                        }
+                    }
+                }
+            } else {
+                None
+            };
+            let result = if let (Some(path), Some(previous)) =
+                (&self.account.credentials_file, &snapshot)
+            {
+                tokio::select! {
+                    result = self.sync_and_idle_cycle(&rate_limiter, poll_interval) => result,
+                    changed = crate::credentials::wait_for_change(path, previous, Duration::from_secs(self.account.credential_reload_interval_secs), &self.token) => {
+                        if !changed { return Ok(()); }
+                        info!("IMAP credentials rotated; reconnecting mailbox session");
+                        retry_attempt = 0;
+                        continue;
+                    }
+                }
+            } else {
+                self.sync_and_idle_cycle(&rate_limiter, poll_interval).await
+            };
+            match result {
                 Ok(()) => {
                     retry_attempt = 0;
                 }
                 Err(e) => {
                     let err_str = format!("{e:#}");
                     if err_str.contains("LOGIN rejected") || err_str.contains("authentication") {
+                        if let (Some(path), Some(previous)) =
+                            (&self.account.credentials_file, &snapshot)
+                        {
+                            warn!("IMAP authentication rejected; waiting for credential rotation");
+                            if !crate::credentials::wait_for_change(
+                                path,
+                                previous,
+                                Duration::from_secs(self.account.credential_reload_interval_secs),
+                                &self.token,
+                            )
+                            .await
+                            {
+                                return Ok(());
+                            }
+                            retry_attempt = 0;
+                            continue;
+                        }
                         error!(
                             account = self.account.id,
                             mailbox = self.mailbox,
@@ -485,5 +533,162 @@ impl MailboxWatcher {
                 Ok(0)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn line(peer: &mut BufReader<TcpStream>) -> String {
+        let mut value = String::new();
+        match peer.read_line(&mut value).await {
+            Ok(_) => value,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                String::new()
+            }
+            Err(error) => panic!("mock IMAP read failed: {error}"),
+        }
+    }
+    async fn reply(peer: &mut BufReader<TcpStream>, command: &str, data: &str) {
+        let tag = command.split_whitespace().next().unwrap();
+        peer.write_all(format!("{data}{tag} OK done\r\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    fn replace_secret(path: &std::path::Path, content: &str) {
+        let next = path.with_extension("next");
+        std::fs::write(&next, content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::fs::rename(next, path).unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn rotated_file_reauthenticates_idle_and_rejected_sessions_without_daemon_restart(
+        pool: PgPool,
+    ) -> Result<()> {
+        for reject_first in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let secret = dir.path().join("credentials.toml");
+            replace_secret(&secret, "username='user1'\npassword='pass1'\n");
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let account: AccountConfig = toml::from_str(&format!(
+                r#"
+                id = "test"
+                imap_host = "127.0.0.1"
+                imap_port = {}
+                tls = false
+                credentials_file = {:?}
+                credential_reload_interval_secs = 1
+                mailboxes = ["INBOX"]
+            "#,
+                listener.local_addr()?.port(),
+                secret.to_str().unwrap()
+            ))?;
+            let token = CancellationToken::new();
+            let server_token = token.clone();
+            let server = tokio::spawn(async move {
+                for session in 0..2 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut peer = BufReader::new(stream);
+                    peer.write_all(b"* OK ready\r\n").await.unwrap();
+                    let login = line(&mut peer).await;
+                    let (user, password) = if session == 0 {
+                        ("user1", "pass1")
+                    } else {
+                        ("user2", "pass2")
+                    };
+                    assert!(login.contains(" LOGIN "));
+                    assert!(
+                        login.contains(user) && login.contains(password),
+                        "wrong credential generation"
+                    );
+                    if session == 0 && reject_first {
+                        let tag = login.split_whitespace().next().unwrap();
+                        peer.write_all(format!("{tag} NO LOGIN rejected\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                        replace_secret(&secret, "username='user2'\npassword='pass2'\n");
+                        continue;
+                    }
+                    reply(&mut peer, &login, "").await;
+                    let select = line(&mut peer).await;
+                    assert!(select.contains(" SELECT "));
+                    reply(
+                        &mut peer,
+                        &select,
+                        "* OK [UIDVALIDITY 123] valid\r\n* 0 EXISTS\r\n",
+                    )
+                    .await;
+                    let fetch = line(&mut peer).await;
+                    assert!(fetch.contains(" UID FETCH "));
+                    reply(&mut peer, &fetch, "").await;
+                    let idle = line(&mut peer).await;
+                    assert!(idle.contains(" IDLE"));
+                    peer.write_all(b"+ idling\r\n").await.unwrap();
+                    if session == 0 {
+                        replace_secret(&secret, "invalid temporary update");
+                        tokio::time::sleep(Duration::from_millis(1100)).await;
+                        assert!(
+                            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                                .await
+                                .is_err(),
+                            "invalid update restarted a healthy session"
+                        );
+                        replace_secret(&secret, "username='user2'\npassword='pass2'\n");
+                        assert!(
+                            line(&mut peer).await.is_empty(),
+                            "rotation must close the old session"
+                        );
+                    } else {
+                        server_token.cancel();
+                        loop {
+                            let command = line(&mut peer).await;
+                            if command.is_empty() {
+                                break;
+                            }
+                            if command == "DONE\r\n" {
+                                let tag = idle.split_whitespace().next().unwrap();
+                                let _ = peer
+                                    .write_all(format!("{tag} OK done\r\n").as_bytes())
+                                    .await;
+                            } else if command.contains(" LOGOUT") {
+                                let tag = command.split_whitespace().next().unwrap();
+                                let _ = peer
+                                    .write_all(
+                                        format!("* BYE closing\r\n{tag} OK done\r\n").as_bytes(),
+                                    )
+                                    .await;
+                                break;
+                            } else {
+                                panic!("unexpected command during shutdown");
+                            }
+                        }
+                    }
+                }
+            });
+            let watcher = MailboxWatcher::new(
+                Arc::new(account),
+                "INBOX".into(),
+                pool.clone(),
+                Arc::new(MessageStore::new(dir.path().to_str().unwrap())),
+                token,
+            );
+            tokio::time::timeout(Duration::from_secs(10), watcher.run()).await??;
+            server.await?;
+        }
+        Ok(())
     }
 }
