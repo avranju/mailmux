@@ -223,6 +223,9 @@ env = { NOTIFY_TOKEN = "${NOTIFY_TOKEN}" }
 | `mailboxes`                 | _required_ | List of mailbox names to monitor                                                                                          |
 | `initial_sync_max_messages` | unlimited  | Cap on messages during first sync                                                                                         |
 | `initial_sync_start_date`   | (none)     | Only download messages on or after this date (e.g. `"2024-01-01"`) during first sync; uses IMAP UID SEARCH SINCE         |
+| `idle_drain_timeout_secs` | `5` | Time to drain IDLE DONE completion; increase for slow servers. |
+| `idle_inactivity_timeout_secs` | `1800` | Maximum IDLE inactivity before forcing a sync; also caps the heartbeat interval. |
+| `fetch_drain_timeout_millis` | `200` | Grace period for FETCH data sent after tagged completion (e.g. Proton Bridge). |
 | `imap_command_timeout_secs` | `60`       | Timeout for individual IMAP command exchanges                                                                             |
 | `tls_ca_file`               | —          | Path to a PEM file with extra CA cert(s) to trust (e.g. for local bridges with self-signed certs). Requires `tls = true`. |
 | `tls_accept_invalid_certs`  | `false`    | Disable TLS certificate verification entirely. Only for local bridges on loopback. Requires `tls = true`.                 |
@@ -560,3 +563,5 @@ Exported metrics:
 ## License
 
 [MIT](LICENSE)
+
+IMAP timeout settings are per account and must be positive values no greater than 86,400,000 in their documented units. Defaults preserve the existing timing.
