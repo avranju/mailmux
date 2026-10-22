@@ -16,6 +16,7 @@ mod matcher;
 mod metrics;
 mod money;
 mod payee;
+mod tagging;
 mod transfer;
 
 #[tokio::main]
@@ -253,6 +254,15 @@ async fn run(m: &mut Metrics) -> Result<()> {
                 .flat_map(|account| account.tags.iter().cloned()),
         ),
     );
+
+    let source_id = config
+        .firefly
+        .asset_accounts
+        .iter()
+        .find(|account| account.firefly_account_id.trim() == resolved.firefly_account_id)
+        .map(|account| account.id.as_str())
+        .unwrap_or(&resolved.account_id);
+    tagging::apply(&mut canonical_tx, source_id, &config.tagging);
 
     let original_narration = canonical_tx.narration.clone();
     canonical_tx.narration = payee::normalize(&original_narration, &config.payee_rules);

@@ -572,3 +572,22 @@ tags = ["bank-hdfc"]
 Tags are trimmed, empty values removed, and duplicates removed in first-seen
 order. They are carried by CanonicalTransaction through posting and pending
 transfer storage, rather than reconstructed by the Firefly transport.
+
+### Automatic source, month, and workflow tags
+
+Default tagging adds `mailmux-<local-account-id>` (lowercase, punctuation collapsed
+to hyphens), `mailmux-YYYY-MM` using the transaction's bank-local booking month,
+and `auto-categorized` when a category was extracted. For example, the account
+`hdfc` and a March 2026 transaction produce `mailmux-hdfc` and `mailmux-2026-03`.
+Individual groups can be disabled:
+
+```toml
+[tagging]
+source = true
+month = true
+workflow = true
+```
+
+`needs-review` is reserved for checks requiring attention, and `reconciled` for
+successful balance verification; ordinary imports do not claim reconciliation.
+Custom tags remain supported independently of these automatic groups.

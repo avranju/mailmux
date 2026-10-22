@@ -72,6 +72,8 @@ pub struct Config {
     pub tag: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub tagging: crate::tagging::TaggingConfig,
     pub firefly: FireflyConfig,
     #[serde(default)]
     pub payee_rules: Vec<PayeeRule>,
@@ -746,6 +748,7 @@ error_if_duplicate_hash = false"#,
             payee_rules: vec![],
             tag: "test-tag".to_string(),
             tags: vec![],
+            tagging: Default::default(),
             firefly: FireflyConfig {
                 base_url: "https://firefly.example/api".to_string(),
                 access_token: "token".to_string(),

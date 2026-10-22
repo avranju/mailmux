@@ -649,7 +649,14 @@ fn configured_payee_cleanup_reaches_firefly_description() {
     let payload: Value = serde_json::from_str(post.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     assert_eq!(
         payload["transactions"][0]["tags"],
-        json!(["mailtx-test-tag", "imports", "bank-custom"])
+        json!([
+            "mailtx-test-tag",
+            "imports",
+            "bank-custom",
+            "mailmux-default",
+            "mailmux-2026-01",
+            "auto-categorized"
+        ])
     );
     assert_eq!(payload["transactions"][0]["description"], "Swiggy delivery");
     assert_eq!(
