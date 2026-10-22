@@ -31,6 +31,16 @@ const IDLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// ceiling ensures we always break out and re-establish a fresh connection.
 const IDLE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+#[derive(Debug)]
+pub struct IdleUnsupported;
+
+impl std::fmt::Display for IdleUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("server does not support IMAP IDLE")
+    }
+}
+impl std::error::Error for IdleUnsupported {}
+
 /// Outcome of an IDLE wait.
 #[derive(Debug, PartialEq, Eq)]
 pub enum IdleOutcome {
@@ -622,7 +632,7 @@ impl ImapConnection {
                         return Ok::<bool, anyhow::Error>(saw_update);
                     }
                     Event::IdleRejected { .. } => {
-                        bail!("IDLE rejected by server");
+                        return Err(IdleUnsupported.into());
                     }
                     Event::DataReceived { data } => match data {
                         Data::Exists(_) | Data::Expunge(_) | Data::Recent(_) => {
