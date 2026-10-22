@@ -49,9 +49,9 @@ pub async fn insert_email_with_event(
     // us distinguish a fresh insert from a re-fetch of an existing message.
     let email_id = sqlx::query_scalar::<_, i64>(
         r#"
-        INSERT INTO emails (account_id, mailbox_name, uid, message_id, subject, sender, recipients, date, flags, raw_message_path, size_bytes)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-        ON CONFLICT (account_id, mailbox_name, uid) DO NOTHING
+        INSERT INTO emails (account_id, mailbox_name, uid, message_id, subject, sender, recipients, date, flags, raw_message_path, size_bytes, uid_validity)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        ON CONFLICT (account_id, mailbox_name, uid_validity, uid) DO NOTHING
         RETURNING id
         "#,
     )
@@ -66,6 +66,7 @@ pub async fn insert_email_with_event(
     .bind(&email.flags)
     .bind(&email.raw_message_path)
     .bind(email.size_bytes)
+    .bind(email.uid_validity)
     .fetch_optional(&mut *tx)
     .await
     .context("inserting email in transaction")?;
@@ -224,6 +225,44 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![without_job]
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod generation_migration_tests {
+    use super::*;
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn generation_migration_preserves_legacy_paths_and_job_identity(
+        pool: PgPool,
+    ) -> Result<()> {
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20240101000000_initial_schema.sql"
+        ))
+        .execute(&pool)
+        .await?;
+        sqlx::query("INSERT INTO mailbox_states (account_id, mailbox_name, uid_validity) VALUES ('test','INBOX',123)").execute(&pool).await?;
+        let email_id: i64 = sqlx::query_scalar("INSERT INTO emails (account_id, mailbox_name, uid, raw_message_path) VALUES ('test','INBOX',1,'/legacy/1.eml') RETURNING id").fetch_one(&pool).await?;
+        let event_id: i64 = sqlx::query_scalar("INSERT INTO events (event_type, account_id, mailbox_name, email_id) VALUES ('email_arrived','test','INBOX',$1) RETURNING id").bind(email_id).fetch_one(&pool).await?;
+        let job_id: i64 = sqlx::query_scalar("INSERT INTO processor_jobs (event_id, processor_name, status) VALUES ($1,'test','in_progress') RETURNING id").bind(event_id).fetch_one(&pool).await?;
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20261022000000_email_uidvalidity.sql"
+        ))
+        .execute(&pool)
+        .await?;
+        let row: (i64, String) =
+            sqlx::query_as("SELECT uid_validity, raw_message_path FROM emails WHERE id=$1")
+                .bind(email_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(row, (123, "/legacy/1.eml".into()));
+        let identity: (i64, i64, String) = sqlx::query_as("SELECT e.email_id, j.event_id, j.status FROM processor_jobs j JOIN events e ON e.id=j.event_id WHERE j.id=$1").bind(job_id).fetch_one(&pool).await?;
+        assert_eq!(identity, (email_id, event_id, "in_progress".into()));
+        let duplicate: Option<i64> = sqlx::query_scalar("INSERT INTO emails (account_id, mailbox_name, uid_validity, uid, raw_message_path) VALUES ('test','INBOX',123,1,'/unused') ON CONFLICT (account_id,mailbox_name,uid_validity,uid) DO NOTHING RETURNING id").fetch_optional(&pool).await?;
+        assert!(duplicate.is_none());
+        sqlx::query("INSERT INTO emails (account_id, mailbox_name, uid_validity, uid, raw_message_path) VALUES ('test','INBOX',124,1,'/new/1.eml')").execute(&pool).await?;
         Ok(())
     }
 }

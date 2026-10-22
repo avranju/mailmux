@@ -560,3 +560,13 @@ Exported metrics:
 ## License
 
 [MIT](LICENSE)
+
+### UIDVALIDITY and archived messages
+
+Email identity includes the account, mailbox, UIDVALIDITY generation, and UID.
+New raw messages are stored at `{data_dir}/{account}/{mailbox}/uv_{uidvalidity}/{uid}.eml`.
+When UIDVALIDITY changes, the mailbox is scanned again; previous emails, raw
+files, events, and processor jobs remain available under their original IDs.
+The migration assigns existing emails their mailbox state's UIDVALIDITY and
+keeps their existing raw file paths. Emails without a mailbox state retain
+generation 0 (unknown) and may be imported again on the next sync.

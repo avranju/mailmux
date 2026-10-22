@@ -16,17 +16,23 @@ impl MessageStore {
     }
 
     /// Save a raw email message to disk.
+    /// Namespace by UIDVALIDITY to preserve messages when a server reuses UIDs.
     /// Returns the path where the message was stored.
     pub async fn save(
         &self,
         account_id: &str,
         mailbox: &str,
+        uid_validity: u32,
         uid: u32,
         raw_bytes: &[u8],
     ) -> Result<PathBuf> {
         let safe_account = sanitize_filename::sanitize(account_id);
         let safe_mailbox = sanitize_filename::sanitize(mailbox);
-        let dir = self.data_dir.join(&safe_account).join(&safe_mailbox);
+        let dir = self
+            .data_dir
+            .join(&safe_account)
+            .join(&safe_mailbox)
+            .join(format!("uv_{uid_validity}"));
 
         // Pre-creation check: verify the logical path stays under data_dir.
         // sanitize_filename strips "..", "/" etc., so this catches anything
@@ -100,7 +106,7 @@ mod tests {
         let store = MessageStore::new(dir.path().to_str().unwrap());
 
         let raw = b"From: test@example.com\r\nSubject: Test\r\n\r\nHello";
-        let path = store.save("acct1", "INBOX", 42, raw).await.unwrap();
+        let path = store.save("acct1", "INBOX", 123, 42, raw).await.unwrap();
 
         assert!(path.exists());
         assert!(path.to_str().unwrap().ends_with("42.eml"));
@@ -115,7 +121,7 @@ mod tests {
         let store = MessageStore::new(dir.path().to_str().unwrap());
 
         let raw = b"test message";
-        let path = store.save("acct1", "INBOX", 1, raw).await.unwrap();
+        let path = store.save("acct1", "INBOX", 123, 1, raw).await.unwrap();
         assert!(path.exists());
 
         store.delete(&path).await.unwrap();
@@ -128,7 +134,7 @@ mod tests {
         let store = MessageStore::new(dir.path().to_str().unwrap());
 
         let raw = b"test message";
-        let path = store.save("acct1", "../../etc", 1, raw).await.unwrap();
+        let path = store.save("acct1", "../../etc", 123, 1, raw).await.unwrap();
 
         // sanitize-filename replaces ".." so the path stays under data_dir
         assert!(path.starts_with(dir.path()));
@@ -141,7 +147,10 @@ mod tests {
         let store = MessageStore::new(dir.path().to_str().unwrap());
 
         let raw = b"test message";
-        let path = store.save("acct1", "Folder/Sub", 1, raw).await.unwrap();
+        let path = store
+            .save("acct1", "Folder/Sub", 123, 1, raw)
+            .await
+            .unwrap();
 
         assert!(path.starts_with(dir.path()));
         assert!(path.exists());

@@ -515,6 +515,7 @@ mod tests {
             account_id: "personal".into(),
             mailbox_name: "INBOX".into(),
             uid: id * 1000,
+            uid_validity: 123,
             message_id: Some(format!("<{id}@example.com>")),
             subject: Some(format!("subject {id}")),
             sender: Some(format!("sender{id}@example.com")),

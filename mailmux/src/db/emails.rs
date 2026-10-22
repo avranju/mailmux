@@ -11,6 +11,7 @@ pub struct EmailRecord {
     pub account_id: String,
     pub mailbox_name: String,
     pub uid: i64,
+    pub uid_validity: i64,
     pub message_id: Option<String>,
     pub subject: Option<String>,
     pub sender: Option<String>,
@@ -29,6 +30,7 @@ pub struct NewEmail {
     pub account_id: String,
     pub mailbox_name: String,
     pub uid: i64,
+    pub uid_validity: i64,
     pub message_id: Option<String>,
     pub subject: Option<String>,
     pub sender: Option<String>,
@@ -109,7 +111,7 @@ pub async fn upsert_mailbox_state(
 
 /// Columns selected for every `emails` read. Kept in one place so new query
 /// paths cannot drift out of sync with the full `EmailRecord` field list.
-const EMAIL_COLUMNS: &str = "id, account_id, mailbox_name, uid, message_id, subject, sender, recipients,\
+const EMAIL_COLUMNS: &str = "id, account_id, mailbox_name, uid, uid_validity, message_id, subject, sender, recipients,\
        date, flags, raw_message_path, size_bytes, created_at, updated_at";
 
 /// Map a database row to a complete `EmailRecord`.
@@ -119,6 +121,7 @@ fn email_record_from_row(row: &sqlx::postgres::PgRow) -> EmailRecord {
         account_id: row.get("account_id"),
         mailbox_name: row.get("mailbox_name"),
         uid: row.get("uid"),
+        uid_validity: row.get("uid_validity"),
         message_id: row.get("message_id"),
         subject: row.get("subject"),
         sender: row.get("sender"),
