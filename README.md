@@ -560,3 +560,21 @@ Exported metrics:
 ## License
 
 [MIT](LICENSE)
+
+### Command processor environment
+
+Commands start with a cleared environment and receive only
+`PATH=/usr/local/bin:/usr/bin:/bin`, `LANG=C.UTF-8`, and the explicit
+`processors.config.env` map (which can override these defaults). Windows also
+passes `SystemRoot`. Pass each processor's required credentials explicitly,
+using `${VAR}` references so secret values stay in the daemon's environment
+file. Database and IMAP credentials are not inherited.
+
+```toml
+[processors.config.env]
+MAILTX_CONFIG = "/etc/mailtx/config.toml"
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}"
+```
+
+When using `mailmux-submit`, explicitly pass `MAILINDEX_URL` and
+`MAILINDEX_API_TOKEN` in that processor's environment map.

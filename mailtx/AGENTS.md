@@ -142,9 +142,10 @@ concurrency = 1
 command = "/usr/local/bin/mailtx"
 ```
 
-The binary inherits mailmux's environment, so all env vars must be set in the
-environment that starts mailmux (systemd `EnvironmentFile`, Docker Compose
-`environment`, etc.).
+Command processors receive a cleared environment plus PATH/LANG and their
+explicit `processors.config.env` map. Set secrets in the environment that starts
+mailmux, then forward only required variables via `${VAR}` entries in that map.
+For mailtx, pass MAILTX_CONFIG and its chosen provider/custom backend key.
 
 ## Important Design Constraints
 
