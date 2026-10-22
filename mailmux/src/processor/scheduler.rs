@@ -179,14 +179,15 @@ impl JobScheduler {
             let _ = arrived.send(());
             barrier.wait().await;
         }
-        match jobs::claim_job(&self.pool, job_id).await {
-            Ok(true) => {}
-            Ok(false) => return,
+        let claim = match jobs::claim_job_with_lease(&self.pool, job_id, timeout_secs, false).await
+        {
+            Ok(Some(claim)) => claim,
+            Ok(None) => return,
             Err(error) => {
                 error!(job_id, error = %error, "failed to claim queued job");
                 return;
             }
-        }
+        };
 
         let timeout = Duration::from_secs(timeout_secs);
         let result = tokio::time::timeout(timeout, processor.process(event, email)).await;
@@ -205,29 +206,20 @@ impl JobScheduler {
                     Ok(v) => v,
                     Err(e) => {
                         error!(job_id, error = %e, "failed to serialize ProcessorOutput");
-                        let _ = jobs::update_job_status(
-                            &self.pool,
-                            job_id,
-                            "completed",
-                            None,
-                            None,
-                            None,
-                            jobs::AttemptsUpdate::None,
-                        )
-                        .await;
+                        let _ = jobs::finish_job(&self.pool, &claim, "completed", None, None, None)
+                            .await;
                         crate::metrics::inc_processor_runs(processor_name, "success");
                         return;
                     }
                 };
 
-                if let Err(e) = jobs::update_job_status(
+                if let Err(e) = jobs::finish_job(
                     &self.pool,
-                    job_id,
+                    &claim,
                     "completed",
                     None,
                     None,
                     Some(&serialized),
-                    jobs::AttemptsUpdate::None,
                 )
                 .await
                 {
@@ -246,7 +238,7 @@ impl JobScheduler {
                     Err(e) => {
                         error!(job_id, error = %e, "failed to serialize ProcessorOutput");
                         self.handle_failure(
-                            job_id,
+                            &claim,
                             processor_name,
                             &output.message.unwrap_or_default(),
                             None,
@@ -257,17 +249,17 @@ impl JobScheduler {
                     }
                 };
                 let msg = output.message.unwrap_or_default();
-                self.handle_failure(job_id, processor_name, &msg, Some(&serialized))
+                self.handle_failure(&claim, processor_name, &msg, Some(&serialized))
                     .await;
                 crate::metrics::inc_processor_runs(processor_name, "failure");
             }
             Ok(Err(e)) => {
-                self.handle_failure(job_id, processor_name, &e.to_string(), None)
+                self.handle_failure(&claim, processor_name, &e.to_string(), None)
                     .await;
                 crate::metrics::inc_processor_runs(processor_name, "error");
             }
             Err(_) => {
-                self.handle_failure(job_id, processor_name, "execution timed out", None)
+                self.handle_failure(&claim, processor_name, "execution timed out", None)
                     .await;
                 crate::metrics::inc_processor_runs(processor_name, "timeout");
             }
@@ -276,11 +268,12 @@ impl JobScheduler {
 
     async fn handle_failure(
         &self,
-        job_id: i64,
+        claim: &jobs::JobClaim,
         processor_name: &str,
         error_msg: &str,
         output: Option<&serde_json::Value>,
     ) {
+        let job_id = claim.id;
         let config = self.processor_configs.get(processor_name);
         let max_retries = config.map(|c| c.max_retries).unwrap_or(0);
         let backoff_secs = config.map(|c| &c.retry_backoff_secs[..]).unwrap_or(&[]);
@@ -305,14 +298,13 @@ impl JobScheduler {
                 error = error_msg,
                 "processor failed, marking as abandoned (max retries exceeded)"
             );
-            if let Err(e) = jobs::update_job_status(
+            if let Err(e) = jobs::finish_job(
                 &self.pool,
-                job_id,
+                claim,
                 "abandoned",
                 Some(error_msg),
                 None,
                 output,
-                jobs::AttemptsUpdate::None,
             )
             .await
             {
@@ -340,14 +332,13 @@ impl JobScheduler {
                 next_retry_secs = delay_secs,
                 "processor failed, scheduling retry"
             );
-            if let Err(e) = jobs::update_job_status(
+            if let Err(e) = jobs::finish_job(
                 &self.pool,
-                job_id,
+                claim,
                 "failed",
                 Some(error_msg),
                 Some(next_retry),
                 output,
-                jobs::AttemptsUpdate::None,
             )
             .await
             {
@@ -358,6 +349,14 @@ impl JobScheduler {
 
     /// Periodically sweep for failed jobs that are ready to retry.
     pub(crate) async fn retry_sweep(&self) {
+        match jobs::recover_expired_jobs(&self.pool, 50).await {
+            Ok(count) if count > 0 => warn!(count, "recovered interrupted processor jobs"),
+            Ok(_) => {}
+            Err(error) => {
+                error!(error = %error, "failed to recover interrupted processor jobs");
+                return;
+            }
+        }
         let retryable = match jobs::get_runnable_jobs(&self.pool, 50).await {
             Ok(jobs) => jobs,
             Err(e) => {
@@ -543,6 +542,54 @@ mod tests {
             concurrency: 1,
             config: HashMap::new(),
         }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn scheduler_restart_recovers_interrupted_and_pending_jobs_once(
+        pool: PgPool,
+    ) -> Result<()> {
+        let event = create_scheduler_test_event(&pool).await?;
+        let interrupted = jobs::create_job(&pool, event, "counting").await?.unwrap();
+        jobs::claim_job_with_lease(&pool, interrupted, 30, false)
+            .await?
+            .unwrap();
+        sqlx::query(
+            "UPDATE processor_jobs SET lease_expires_at=now()-interval '1 second' WHERE id=$1",
+        )
+        .bind(interrupted)
+        .execute(&pool)
+        .await?;
+        let second_event = create_scheduler_test_event(&pool).await?;
+        let pending = jobs::create_job(&pool, second_event, "counting")
+            .await?
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let config = test_processor_config("counting", 3, vec![0]);
+        let registry = Arc::new(ProcessorRegistry::for_tests_with_configs(vec![(
+            Box::new(CountingProcessor {
+                name: "counting".into(),
+                events: vec!["email_arrived".into()],
+                calls: calls.clone(),
+            }),
+            config.clone(),
+        )]));
+        let scheduler = JobScheduler::new(
+            pool.clone(),
+            registry,
+            tokio::sync::mpsc::channel(16).1,
+            CancellationToken::new(),
+            vec![config],
+        );
+        scheduler.retry_sweep().await;
+        scheduler.retry_sweep().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        for (id, attempts) in [(interrupted, 2), (pending, 1)] {
+            let job = jobs::get_job_by_id(&pool, id).await?.unwrap();
+            assert_eq!(job.status, "completed");
+            assert_eq!(job.attempts, attempts);
+        }
+        Ok(())
     }
 
     #[sqlx::test(migrations = "./migrations")]

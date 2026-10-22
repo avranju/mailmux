@@ -271,9 +271,9 @@ async fn replay_event(
             .map(|c| c.timeout_secs)
             .unwrap_or(30);
         let timeout = std::time::Duration::from_secs(timeout_secs);
-        match db::jobs::reset_and_claim_job_for_replay(pool, job_id).await {
-            Ok(true) => {}
-            Ok(false) => {
+        let claim = match db::jobs::claim_job_with_lease(pool, job_id, timeout_secs, true).await {
+            Ok(Some(claim)) => claim,
+            Ok(None) => {
                 warn!(
                     job_id,
                     processor = proc_name,
@@ -285,7 +285,7 @@ async fn replay_event(
                 error!(job_id, error = %e, "failed to reset and claim replay job");
                 continue;
             }
-        }
+        };
         match tokio::time::timeout(timeout, proc.process(&event, email.as_ref())).await {
             Ok(Ok(output)) => {
                 let status = if output.success {
@@ -295,43 +295,21 @@ async fn replay_event(
                 };
                 let serialized = serde_json::to_value(&output).ok();
                 let message = output.message.as_deref();
-                if let Err(e) = db::jobs::update_job_status(
-                    pool,
-                    job_id,
-                    status,
-                    message,
-                    None,
-                    serialized.as_ref(),
-                    db::jobs::AttemptsUpdate::None,
-                )
-                .await
+                if let Err(e) =
+                    db::jobs::finish_job(pool, &claim, status, message, None, serialized.as_ref())
+                        .await
                 {
                     error!(job_id, error = %e, "failed to persist replay output");
                 }
             }
             Ok(Err(e)) => {
-                let _ = db::jobs::update_job_status(
-                    pool,
-                    job_id,
-                    "failed",
-                    Some(&e.to_string()),
-                    None,
-                    None,
-                    db::jobs::AttemptsUpdate::None,
-                )
-                .await;
+                let _ =
+                    db::jobs::finish_job(pool, &claim, "failed", Some(&e.to_string()), None, None)
+                        .await;
             }
             Err(_) => {
-                let _ = db::jobs::update_job_status(
-                    pool,
-                    job_id,
-                    "failed",
-                    Some("timed out"),
-                    None,
-                    None,
-                    db::jobs::AttemptsUpdate::None,
-                )
-                .await;
+                let _ = db::jobs::finish_job(pool, &claim, "failed", Some("timed out"), None, None)
+                    .await;
             }
         }
     }

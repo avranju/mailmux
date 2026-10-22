@@ -560,3 +560,13 @@ Exported metrics:
 ## License
 
 [MIT](LICENSE)
+
+### Processor crash recovery
+
+Scheduler and replay claims carry an execution lease lasting the processor
+timeout plus 30 seconds for persisting the result. The 10-second retry sweep
+requeues expired claims and legacy in-progress jobs without leases; pending
+jobs are also recovered. A monotonically increasing claim version prevents
+a late result from overwriting a newer attempt. Recovery can repeat external
+side effects after a crash, so processors still need downstream idempotency.
+Stop old daemon versions before upgrading: they do not participate in leases.

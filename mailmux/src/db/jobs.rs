@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 
 /// Controls how the `attempts` column is updated when changing a job's status.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub enum AttemptsUpdate {
     /// Leave the attempts count unchanged.
@@ -91,6 +92,7 @@ pub async fn register_event_dispatch(
 ///
 /// Pass `Some(&serialized_output)` to persist a ProcessorOutput, or `None` to
 /// clear output (e.g. when entering `in_progress` before a retry/replay).
+#[cfg(test)]
 pub async fn update_job_status(
     pool: &PgPool,
     job_id: i64,
@@ -147,22 +149,100 @@ pub async fn update_job_status(
 /// Reset and claim an existing job for explicit replay in one row-locked
 /// operation. A scheduler sweep that already claimed the job wins; replay
 /// never overwrites an in-progress execution.
+#[cfg(test)]
 pub async fn reset_and_claim_job_for_replay(pool: &PgPool, job_id: i64) -> Result<bool> {
-    let mut tx = pool.begin().await.context("beginning replay claim")?;
-    let result = sqlx::query(
-        r#"
-        UPDATE processor_jobs
-        SET status = 'in_progress', attempts = 1, last_error = NULL,
-            next_retry_at = NULL, output = NULL, updated_at = now()
-        WHERE id = $1 AND status <> 'in_progress'
-        "#,
+    Ok(claim_job_with_lease(pool, job_id, 30, true)
+        .await?
+        .is_some())
+}
+
+/// Ownership of one execution attempt. Versions never reset, including replay.
+#[derive(Debug, Clone, Copy)]
+pub struct JobClaim {
+    pub id: i64,
+    pub version: i64,
+}
+
+pub async fn claim_job_with_lease(
+    pool: &PgPool,
+    job_id: i64,
+    timeout_secs: u64,
+    replay: bool,
+) -> Result<Option<JobClaim>> {
+    // Allow time for persisting the outcome after the processor deadline.
+    let lease_secs = i32::try_from(timeout_secs.saturating_add(30))
+        .context("processor timeout exceeds supported lease duration")?;
+    let version: Option<i64> = sqlx::query_scalar(
+        "UPDATE processor_jobs SET status='in_progress',
+         attempts=CASE WHEN $3 THEN 1 ELSE attempts+1 END,
+         claim_version=claim_version+1,
+         lease_expires_at=now()+make_interval(secs => $2::integer),
+         last_error=NULL, next_retry_at=NULL, output=NULL, updated_at=now()
+         WHERE id=$1 AND (($3 AND status <> 'in_progress') OR
+         (NOT $3 AND (status='pending' OR (status='failed' AND next_retry_at <= now()))))
+         RETURNING claim_version",
     )
     .bind(job_id)
-    .execute(&mut *tx)
+    .bind(lease_secs)
+    .bind(replay)
+    .fetch_optional(pool)
     .await
-    .context("resetting and claiming job for replay")?;
-    tx.commit().await.context("committing replay claim")?;
-    Ok(result.rows_affected() == 1)
+    .context("claiming processor job with execution lease")?;
+    Ok(version.map(|version| JobClaim {
+        id: job_id,
+        version,
+    }))
+}
+
+/// An expired lease means the bounded processor attempt has been interrupted.
+/// Legacy in-progress jobs have no lease and become recoverable on upgrade.
+pub async fn recover_expired_jobs(pool: &PgPool, limit: i64) -> Result<u64> {
+    let result = sqlx::query(
+        "WITH expired AS (
+            SELECT id FROM processor_jobs
+            WHERE status='in_progress' AND (lease_expires_at IS NULL OR lease_expires_at <= now())
+            ORDER BY lease_expires_at ASC NULLS FIRST, id ASC
+            LIMIT $1 FOR UPDATE SKIP LOCKED
+         )
+         UPDATE processor_jobs j SET status='pending', lease_expires_at=NULL,
+         last_error='execution interrupted: expired lease', next_retry_at=NULL, updated_at=now()
+         FROM expired WHERE j.id=expired.id",
+    )
+    .bind(limit)
+    .execute(pool)
+    .await
+    .context("recovering expired processor jobs")?;
+    Ok(result.rows_affected())
+}
+
+/// Fence late outcomes: a worker whose lease was recovered cannot overwrite
+/// either queued work or the outcome of a subsequent execution/replay.
+pub async fn finish_job(
+    pool: &PgPool,
+    claim: &JobClaim,
+    status: &str,
+    error: Option<&str>,
+    next_retry_at: Option<DateTime<Utc>>,
+    output: Option<&serde_json::Value>,
+) -> Result<()> {
+    let result = sqlx::query(
+        "UPDATE processor_jobs SET status=$3, last_error=$4, next_retry_at=$5,
+         output=$6, lease_expires_at=NULL, updated_at=now()
+         WHERE id=$1 AND claim_version=$2 AND status='in_progress'",
+    )
+    .bind(claim.id)
+    .bind(claim.version)
+    .bind(status)
+    .bind(error)
+    .bind(next_retry_at)
+    .bind(output)
+    .execute(pool)
+    .await
+    .context("persisting claimed job outcome")?;
+    if result.rows_affected() == 0 {
+        anyhow::bail!("job {} execution claim is no longer current", claim.id);
+    }
+    Ok(())
 }
 
 /// Legacy reset helper retained for the focused state-reset test.
@@ -247,9 +327,11 @@ pub async fn get_runnable_jobs(pool: &PgPool, limit: i64) -> Result<Vec<Processo
 }
 
 /// Atomically claim pending or due failed work.
+#[cfg(test)]
 pub async fn claim_job(pool: &PgPool, job_id: i64) -> Result<bool> {
-    let result = sqlx::query("UPDATE processor_jobs SET status='in_progress', attempts=attempts+1, last_error=NULL, next_retry_at=NULL, output=NULL, updated_at=now() WHERE id=$1 AND (status='pending' OR (status='failed' AND next_retry_at IS NOT NULL AND next_retry_at <= now()))").bind(job_id).execute(pool).await.context("claiming processor job")?;
-    Ok(result.rows_affected() == 1)
+    Ok(claim_job_with_lease(pool, job_id, 30, false)
+        .await?
+        .is_some())
 }
 
 /// Abandon queued work that is no longer eligible without incrementing attempts.
@@ -580,6 +662,81 @@ mod tests {
         // replay behavior.
         assert_eq!(job.last_error, Some("replayed successfully".to_string()));
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn expired_and_legacy_claims_recover_without_stealing_live_work(
+        pool: PgPool,
+    ) -> Result<()> {
+        let event: i64 = sqlx::query_scalar("INSERT INTO events(event_type,account_id,mailbox_name) VALUES ('email_arrived','test','INBOX') RETURNING id").fetch_one(&pool).await?;
+        let expired = create_job(&pool, event, "expired").await?.unwrap();
+        let live = create_job(&pool, event, "live").await?.unwrap();
+        let legacy = create_job(&pool, event, "legacy").await?.unwrap();
+        let pending = create_job(&pool, event, "pending").await?.unwrap();
+        let old_claim = claim_job_with_lease(&pool, expired, 1, false)
+            .await?
+            .unwrap();
+        let live_claim = claim_job_with_lease(&pool, live, 600, true).await?.unwrap();
+        sqlx::query(
+            "UPDATE processor_jobs SET lease_expires_at=now()-interval '1 second' WHERE id=$1",
+        )
+        .bind(expired)
+        .execute(&pool)
+        .await?;
+        sqlx::query("UPDATE processor_jobs SET status='in_progress', attempts=3 WHERE id=$1")
+            .bind(legacy)
+            .execute(&pool)
+            .await?;
+        let (a, b) = tokio::join!(
+            recover_expired_jobs(&pool, 50),
+            recover_expired_jobs(&pool, 50)
+        );
+        assert_eq!(a? + b?, 2);
+        assert_eq!(
+            get_job_by_id(&pool, live).await?.unwrap().status,
+            "in_progress"
+        );
+        assert_eq!(get_job_by_id(&pool, pending).await?.unwrap().attempts, 0);
+        assert_eq!(get_job_by_id(&pool, legacy).await?.unwrap().attempts, 3);
+        assert!(
+            finish_job(&pool, &old_claim, "completed", None, None, None)
+                .await
+                .is_err()
+        );
+        let new_claim = claim_job_with_lease(&pool, expired, 30, false)
+            .await?
+            .unwrap();
+        assert!(new_claim.version > old_claim.version);
+        assert_eq!(get_job_by_id(&pool, expired).await?.unwrap().attempts, 2);
+        finish_job(&pool, &new_claim, "completed", None, None, None).await?;
+        assert!(
+            finish_job(&pool, &old_claim, "failed", Some("stale"), None, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            get_job_by_id(&pool, expired).await?.unwrap().status,
+            "completed"
+        );
+        finish_job(&pool, &live_claim, "completed", None, None, None).await?;
+        let replay = claim_job_with_lease(&pool, expired, 30, true)
+            .await?
+            .unwrap();
+        assert!(replay.version > new_claim.version);
+        assert_eq!(get_job_by_id(&pool, expired).await?.unwrap().attempts, 1);
+        assert!(
+            finish_job(&pool, &new_claim, "completed", None, None, None)
+                .await
+                .is_err()
+        );
+        finish_job(&pool, &replay, "completed", None, None, None).await?;
         Ok(())
     }
 }
