@@ -15,6 +15,7 @@ mod llm;
 mod matcher;
 mod metrics;
 mod money;
+mod payee;
 mod transfer;
 
 #[tokio::main]
@@ -242,16 +243,15 @@ async fn run(m: &mut Metrics) -> Result<()> {
         .clone()
         .or_else(|| config.firefly.currency_code.clone());
 
+    let original_narration = canonical_tx.narration.clone();
+    canonical_tx.narration = payee::normalize(&original_narration, &config.payee_rules);
+
     // --- Transfer detection -------------------------------------------------
     // Check whether this transaction is a leg of a configured transfer route.
     let tx_type = tx.transaction_type.as_deref().unwrap_or("");
     if let Some(leg) = transfer::leg_from_tx_type(tx_type)
-        && let Some(rule_match) = transfer::detect_transfer_rule(
-            &config,
-            &resolved.account_id,
-            &leg,
-            &canonical_tx.narration,
-        )
+        && let Some(rule_match) =
+            transfer::detect_transfer_rule(&config, &resolved.account_id, &leg, &original_narration)
     {
         let store = pending_store.as_ref().ok_or_else(|| {
             anyhow::anyhow!(

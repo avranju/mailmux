@@ -529,3 +529,19 @@ Cross-currency transfer rules are rejected: Firefly needs both native and foreig
 amounts, which mailtx does not invent. Pending legs match only within the same
 currency; legacy legs without a currency expire separately using the account's
 configured currency. Configure every account's currency when mixing currencies.
+
+### Payee display names
+
+Common whole-token payees (`Swiggy`, `Zomato`, `Amazon`) are normalized to readable
+names. Other descriptions retain their text with whitespace collapsed. Add ordered,
+case-insensitive literal rules at the top level, before `[firefly]` or `[llm]`:
+
+```toml
+[[payee_rules]]
+contains = "SWIGGY*ORDER"
+name = "Swiggy"
+```
+
+Explicit rules take precedence over built-ins; the first matching rule wins.
+Transfer keywords match the original extracted narration before cleanup. The
+original email remains the source record under mailmux's retention policy.

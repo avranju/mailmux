@@ -620,3 +620,32 @@ fn us_banks_post_native_usd_to_matched_accounts_with_inr_global_default() {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[test]
+fn configured_payee_cleanup_reaches_firefly_description() {
+    let root = root();
+    let llm = Fixture::start(1, |_| {
+        response(
+            r#"{"status":"found","amount":12.34,"transaction_type":"withdrawal","narration":"UPI/DR/12345/SWIGGY*ORDER","transaction_date":"2026-01-05","category":"Food"}"#,
+        )
+    });
+    let ff = firefly(3);
+    let (config, eml) = setup_config(&root, &llm.url, &ff.url, "");
+    let text = fs::read_to_string(&config).unwrap().replace(
+        "[llm]",
+        "[[payee_rules]]\ncontains='swiggy'\nname='Swiggy delivery'\n[llm]",
+    );
+    fs::write(&config, text).unwrap();
+    let output = run(&config, &eml, 107, &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    llm.finish();
+    let requests = ff.finish();
+    let post = requests.iter().find(|r| r.starts_with("POST ")).unwrap();
+    let payload: Value = serde_json::from_str(post.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(payload["transactions"][0]["description"], "Swiggy delivery");
+    fs::remove_dir_all(root).unwrap();
+}

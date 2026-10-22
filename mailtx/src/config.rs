@@ -71,6 +71,8 @@ pub struct Config {
     #[serde(default = "default_tag")]
     pub tag: String,
     pub firefly: FireflyConfig,
+    #[serde(default)]
+    pub payee_rules: Vec<PayeeRule>,
 
     /// Path to the SQLite database used to hold pending transfer legs.
     /// Required when any transfer_rules are defined.
@@ -82,6 +84,13 @@ pub struct Config {
     /// a single Firefly III "transfer" transaction.
     #[serde(default)]
     pub transfer_rules: Vec<TransferRule>,
+}
+
+/// Ordered literal, case-insensitive payee cleanup rules.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PayeeRule {
+    pub contains: String,
+    pub name: String,
 }
 
 /// A directional rule describing one transfer route between two asset accounts.
@@ -367,6 +376,13 @@ impl Config {
         normalize_currency(&mut config.firefly.currency_code)?;
         for account in &mut config.firefly.asset_accounts {
             normalize_currency(&mut account.currency_code)?;
+        }
+        if config
+            .payee_rules
+            .iter()
+            .any(|rule| rule.contains.trim().is_empty() || rule.name.trim().is_empty())
+        {
+            anyhow::bail!("payee rules require nonempty contains and name");
         }
         config.validate_transfer_rules()?;
         crate::transfer::window_seconds(config.transfer_match_window_hours)?;
@@ -723,6 +739,7 @@ error_if_duplicate_hash = false"#,
             allowed_senders,
             llm_model: Some("test-model".to_string()),
             llm: None,
+            payee_rules: vec![],
             tag: "test-tag".to_string(),
             firefly: FireflyConfig {
                 base_url: "https://firefly.example/api".to_string(),
