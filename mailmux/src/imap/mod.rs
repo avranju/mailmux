@@ -135,6 +135,10 @@ impl AccountManager {
 
         join_set.spawn(async move {
             if let Err(e) = watcher.run().await {
+                if e.is::<connection::AuthenticationFailure>() {
+                    error!("mailbox watcher stopped after IMAP authentication failure");
+                    return;
+                }
                 error!(
                     account = acct_id,
                     mailbox = mailbox,
@@ -163,4 +167,107 @@ fn rand_simple(max: u64) -> u64 {
         .unwrap_or_default()
         .subsec_nanos() as u64;
     nanos % max
+}
+
+#[cfg(test)]
+mod auth_privacy_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn authentication_errors_and_watcher_logs_do_not_expose_account_or_server_text() {
+        let captured = Capture::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let account: AccountConfig = toml::from_str(&format!(
+                        r#"
+                    id = "PRIVATE-ACCOUNT"
+                    username = "PRIVATE-USERNAME"
+                    password = "PRIVATE-PASSWORD"
+                    imap_host = "127.0.0.1"
+                    imap_port = {}
+                    tls = false
+                    mailboxes = ["PRIVATE-MAILBOX"]
+                "#,
+                        listener.local_addr().unwrap().port()
+                    ))
+                    .unwrap();
+                    let server = tokio::spawn(async move {
+                        for _ in 0..2 {
+                            let (stream, _) = listener.accept().await.unwrap();
+                            let mut peer = BufReader::new(stream);
+                            peer.write_all(b"* OK ready\r\n").await.unwrap();
+                            let mut line = String::new();
+                            peer.read_line(&mut line).await.unwrap();
+                            let tag = line.split_whitespace().next().unwrap();
+                            peer.write_all(
+                                format!(
+                                    "{tag} NO PRIVATE-USERNAME PRIVATE-PASSWORD server detail\r\n"
+                                )
+                                .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                        }
+                    });
+                    let error = match connection::ImapConnection::connect(&account).await {
+                        Ok(_) => panic!("authentication unexpectedly succeeded"),
+                        Err(error) => error,
+                    };
+                    assert!(error.is::<connection::AuthenticationFailure>());
+                    assert_eq!(format!("{error:#}"), "IMAP authentication failed");
+                    let pool = sqlx::postgres::PgPoolOptions::new()
+                        .connect_lazy("postgres://unused@localhost/unused")
+                        .unwrap();
+                    let manager = AccountManager::new(
+                        account,
+                        pool,
+                        Arc::new(MessageStore::new("/tmp/unused-auth-test")),
+                        CancellationToken::new(),
+                    );
+                    let mut watchers = JoinSet::new();
+                    manager.spawn_watcher(&mut watchers, "PRIVATE-MAILBOX".into());
+                    tokio::time::timeout(Duration::from_secs(2), watchers.join_next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                    server.await.unwrap();
+                });
+        });
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("authentication fail"), "{logs}");
+        for private in [
+            "PRIVATE-ACCOUNT",
+            "PRIVATE-USERNAME",
+            "PRIVATE-PASSWORD",
+            "PRIVATE-MAILBOX",
+            "server detail",
+        ] {
+            assert!(!logs.contains(private), "private data leaked: {private}");
+        }
+    }
 }

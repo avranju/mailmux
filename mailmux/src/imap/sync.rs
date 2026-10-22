@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::AccountConfig;
 use crate::db::emails::NewEmail;
 use crate::db::events::NewEvent;
-use crate::imap::connection::{FetchedMessage, IdleOutcome, ImapConnection};
+use crate::imap::connection::{AuthenticationFailure, FetchedMessage, IdleOutcome, ImapConnection};
 use crate::store::MessageStore;
 
 const FETCH_BATCH_SIZE: usize = 500;
@@ -69,12 +69,9 @@ impl MailboxWatcher {
                 }
                 Err(e) => {
                     let err_str = format!("{e:#}");
-                    if err_str.contains("LOGIN rejected") || err_str.contains("authentication") {
+                    if e.is::<AuthenticationFailure>() {
                         error!(
-                            account = self.account.id,
-                            mailbox = self.mailbox,
-                            error = %e,
-                            "authentication failure, stopping watcher"
+                            "IMAP authentication failed; watcher stopped, check configured credentials"
                         );
                         return Err(e);
                     }

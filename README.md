@@ -560,3 +560,8 @@ Exported metrics:
 ## License
 
 [MIT](LICENSE)
+
+IMAP authentication failures use a typed, redacted error. Failure logs omit
+account IDs, mailbox names, usernames, and server-provided rejection text, since
+servers can echo credentials. Watchers stop after rejection; operators should
+check their configured credentials.
