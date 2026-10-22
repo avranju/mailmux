@@ -21,6 +21,10 @@ pub fn init() -> Option<metrics_exporter_prometheus::PrometheusHandle> {
 
 fn describe_all() {
     describe_counter!(
+        "mailmux_oversized_headers_total",
+        "Email headers truncated or omitted for exceeding size limits"
+    );
+    describe_counter!(
         "mailmux_messages_ingested_total",
         "Total number of email messages ingested"
     );
@@ -51,6 +55,10 @@ fn describe_all() {
 }
 
 // --- Convenience functions for recording metrics ---
+
+pub fn inc_oversized_header(header: &'static str) {
+    counter!("mailmux_oversized_headers_total", "header" => header).increment(1);
+}
 
 pub fn inc_messages_ingested(account: &str, mailbox: &str) {
     counter!("mailmux_messages_ingested_total", "account" => account.to_owned(), "mailbox" => mailbox.to_owned())
