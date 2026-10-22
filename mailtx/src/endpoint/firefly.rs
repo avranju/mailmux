@@ -100,7 +100,7 @@ impl FireflyEndpoint {
                 source_id: Some(tx.asset_account_id.as_str()),
                 source_name: None,
                 destination_id: None,
-                destination_name: None,
+                destination_name: Some(description),
                 currency_code: tx
                     .currency_code
                     .as_deref()
@@ -115,7 +115,7 @@ impl FireflyEndpoint {
                 amount,
                 description,
                 source_id: None,
-                source_name: None,
+                source_name: Some(description),
                 destination_id: Some(tx.asset_account_id.as_str()),
                 destination_name: None,
                 currency_code: tx
@@ -491,5 +491,36 @@ mod tests {
         let instance = endpoint();
         let payload = serde_json::to_value(instance.request_payload(&tx).unwrap()).unwrap();
         assert_eq!(payload["transactions"][0]["amount"], "90071992547409.91");
+    }
+    #[test]
+    fn payload_names_counterparties_and_keeps_transfer_asset_ids() {
+        let instance = endpoint();
+        for kind in [
+            TransactionKind::Withdrawal,
+            TransactionKind::Deposit,
+            TransactionKind::Transfer,
+        ] {
+            let mut tx = transaction("named-counterparty");
+            tx.kind = kind;
+            tx.narration = "Swiggy".into();
+            tx.transfer_destination_account_id = Some("2".into());
+            let payload = serde_json::to_value(instance.request_payload(&tx).unwrap()).unwrap();
+            let split = &payload["transactions"][0];
+            match kind {
+                TransactionKind::Withdrawal => {
+                    assert_eq!(split["destination_name"], "Swiggy");
+                    assert_eq!(split["source_id"], tx.asset_account_id);
+                }
+                TransactionKind::Deposit => {
+                    assert_eq!(split["source_name"], "Swiggy");
+                    assert_eq!(split["destination_id"], tx.asset_account_id);
+                }
+                TransactionKind::Transfer => {
+                    assert!(split["source_name"].is_null());
+                    assert!(split["destination_name"].is_null());
+                    assert_eq!(split["destination_id"], "2");
+                }
+            }
+        }
     }
 }

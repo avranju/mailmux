@@ -545,3 +545,11 @@ name = "Swiggy"
 Explicit rules take precedence over built-ins; the first matching rule wins.
 Transfer keywords match the original extracted narration before cleanup. The
 original email remains the source record under mailmux's retention policy.
+
+### Counterparties and the Firefly cash label
+
+Withdrawals send the cleaned narration as `destination_name` (expense account);
+deposits send it as `source_name` (revenue account). Previously both were omitted,
+leaving Firefly to use its anonymous/cash counterparty. Firefly can create or reuse
+the named account. Transfers retain both explicit asset-account IDs. This affects
+new imports; it does not rewrite existing transactions or their counterparties.

@@ -647,5 +647,9 @@ fn configured_payee_cleanup_reaches_firefly_description() {
     let post = requests.iter().find(|r| r.starts_with("POST ")).unwrap();
     let payload: Value = serde_json::from_str(post.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     assert_eq!(payload["transactions"][0]["description"], "Swiggy delivery");
+    assert_eq!(
+        payload["transactions"][0]["destination_name"],
+        "Swiggy delivery"
+    );
     fs::remove_dir_all(root).unwrap();
 }
