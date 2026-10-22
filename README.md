@@ -560,3 +560,12 @@ Exported metrics:
 ## License
 
 [MIT](LICENSE)
+
+### Processor concurrency
+
+`concurrency` must be positive and bounds active executions per processor across
+both new dispatches and retries. Slow processors do not block other processors
+or the scheduler's retry timer. The scheduler allows at most 16 batch workers
+in memory; additional dispatches apply channel backpressure, while pending jobs
+remain durable in PostgreSQL. Shutdown drains active work within the daemon's
+configured grace period.
