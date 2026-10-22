@@ -560,3 +560,14 @@ Exported metrics:
 ## License
 
 [MIT](LICENSE)
+
+### Health listener exposure
+
+The health server binds to `127.0.0.1` by default. Set
+`general.health_bind_addr` to an explicit IP address for network access (for
+example `0.0.0.0` inside Docker), and use a firewall or private network.
+Set `general.health_metrics_token_env = "MAILMUX_METRICS_TOKEN"` to require
+`Authorization: Bearer <token>` on `/metrics`; the secret comes only from that
+environment variable. Missing or empty configured secrets fail startup.
+`/health` and `/ready` remain available to local health checks. External binds
+without metrics authentication emit a startup warning.

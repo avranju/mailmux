@@ -72,6 +72,12 @@ async fn cmd_run(config: config::Config) -> Result<()> {
         "mailmux starting"
     );
 
+    let metrics_token = if config.general.health_port.is_some() {
+        config.general.metrics_token()?
+    } else {
+        None
+    };
+
     // Connect to database
     let pool = db::connect(&config.database).await?;
     info!("connected to database");
@@ -105,12 +111,13 @@ async fn cmd_run(config: config::Config) -> Result<()> {
     let mut system_tasks = JoinSet::new();
 
     // Health check server
-    let health_state = health::HealthState::new(pool.clone(), metrics_handle);
+    let health_state = health::HealthState::new(pool.clone(), metrics_handle, metrics_token);
     if let Some(port) = config.general.health_port {
         let hs = health_state.clone();
         let t = token.clone();
+        let addr = std::net::SocketAddr::new(config.general.health_bind_addr, port);
         system_tasks.spawn(async move {
-            health::serve(port, hs, t).await;
+            health::serve(addr, hs, t).await;
         });
     }
 

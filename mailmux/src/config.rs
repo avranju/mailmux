@@ -32,8 +32,30 @@ pub struct GeneralConfig {
     pub shutdown_grace_period_secs: u64,
     #[serde(default)]
     pub health_port: Option<u16>,
+    #[serde(default = "default_health_bind_addr")]
+    pub health_bind_addr: std::net::IpAddr,
+    #[serde(default)]
+    pub health_metrics_token_env: Option<String>,
     #[serde(default = "default_event_retention_days")]
     pub event_retention_days: u64,
+}
+
+fn default_health_bind_addr() -> std::net::IpAddr {
+    std::net::Ipv4Addr::LOCALHOST.into()
+}
+
+impl GeneralConfig {
+    pub fn metrics_token(&self) -> Result<Option<String>> {
+        let Some(name) = &self.health_metrics_token_env else {
+            return Ok(None);
+        };
+        let token = std::env::var(name)
+            .map_err(|_| anyhow::anyhow!("health_metrics_token_env variable is unavailable"))?;
+        if token.trim().is_empty() {
+            bail!("health_metrics_token_env variable must not be empty");
+        }
+        Ok(Some(token))
+    }
 }
 
 fn default_event_retention_days() -> u64 {
@@ -425,6 +447,14 @@ impl Config {
         }
 
         // Validate general
+        if self.general.health_port.is_some() {
+            self.general.metrics_token()?;
+            if !self.general.health_bind_addr.is_loopback()
+                && self.general.health_metrics_token_env.is_none()
+            {
+                warn!(address = %self.general.health_bind_addr, "health/metrics listener is exposed without metrics authentication");
+            }
+        }
         if self.general.data_dir.is_empty() {
             bail!("general.data_dir must not be empty");
         }
@@ -518,6 +548,32 @@ events = ["email_arrived"]
 timeout_secs = 5
 concurrency = 1
 "#
+    }
+
+    #[test]
+    fn health_listener_defaults_to_loopback_and_resolves_only_explicit_token() {
+        let mut config: Config = toml::from_str(sample_toml()).unwrap();
+        assert_eq!(
+            config.general.health_bind_addr,
+            std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST)
+        );
+        assert!(config.general.metrics_token().unwrap().is_none());
+        config.general.health_metrics_token_env = Some("MAILMUX_TEST_METRICS_TOKEN_41".into());
+        temp_env::with_vars(
+            [("MAILMUX_TEST_METRICS_TOKEN_41", Some("test-secret"))],
+            || {
+                assert_eq!(
+                    config.general.metrics_token().unwrap().as_deref(),
+                    Some("test-secret")
+                );
+            },
+        );
+        temp_env::with_vars([("MAILMUX_TEST_METRICS_TOKEN_41", Some(""))], || {
+            assert!(config.general.metrics_token().is_err());
+        });
+        temp_env::with_vars([("MAILMUX_TEST_METRICS_TOKEN_41", None::<&str>)], || {
+            assert!(config.general.metrics_token().is_err());
+        });
     }
 
     fn write_temp_config(content: &str) -> NamedTempFile {
