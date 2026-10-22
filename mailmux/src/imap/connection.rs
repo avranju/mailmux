@@ -261,7 +261,7 @@ impl ImapConnection {
         let tag = self.next_tag()?;
         // Clone into owned strings so the Command is 'static
         let cmd = Command {
-            tag,
+            tag: tag.clone(),
             body: CommandBody::login(username.to_owned(), password.to_owned())
                 .context("building LOGIN command")?,
         };
@@ -277,7 +277,10 @@ impl ImapConnection {
                     .context("during LOGIN")?;
                 match event {
                     Event::StatusReceived { status } => {
-                        return check_status(&status, "LOGIN");
+                        check_status(&status, "LOGIN")?;
+                        if is_command_completion(&status, &tag) {
+                            return Ok(());
+                        }
                     }
                     Event::CommandSent { .. } => {
                         debug!("LOGIN command sent");
@@ -297,7 +300,7 @@ impl ImapConnection {
     pub async fn select(&mut self, mailbox: &str) -> Result<(u32, u32)> {
         let tag = self.next_tag()?;
         let cmd = Command {
-            tag,
+            tag: tag.clone(),
             body: CommandBody::select(mailbox.to_owned()).context("building SELECT command")?,
         };
         let _handle = self.client.enqueue_command(cmd);
@@ -330,7 +333,7 @@ impl ImapConnection {
                         // Only the tagged response terminates SELECT. Untagged
                         // status lines (e.g. * OK [UNSEEN n]) may arrive
                         // before the tagged completion — keep looping.
-                        if matches!(status, Status::Tagged(_)) {
+                        if is_command_completion(&status, &tag) {
                             break;
                         }
                     }
@@ -377,7 +380,7 @@ impl ImapConnection {
         ]);
 
         let cmd = Command {
-            tag,
+            tag: tag.clone(),
             body: CommandBody::Fetch {
                 sequence_set,
                 macro_or_item_names: fetch_attrs,
@@ -413,7 +416,7 @@ impl ImapConnection {
                     // Only the tagged response terminates the FETCH. Untagged
                     // status lines (e.g. * OK [UIDNEXT n]) may arrive before
                     // the server has finished streaming data — keep looping.
-                    if matches!(status, Status::Tagged(_)) {
+                    if is_command_completion(&status, &tag) {
                         // Some servers (e.g. Proton Mail Bridge) send the
                         // tagged OK before the FETCH data. If nothing has
                         // arrived yet, drain briefly for trailing responses.
@@ -458,7 +461,7 @@ impl ImapConnection {
             .map_err(|_| anyhow::anyhow!("invalid UID range: {range}"))?;
 
         let cmd = Command {
-            tag,
+            tag: tag.clone(),
             body: CommandBody::Fetch {
                 sequence_set,
                 macro_or_item_names: MacroOrMessageDataItemNames::MessageDataItemNames(vec![
@@ -493,7 +496,7 @@ impl ImapConnection {
                 }
                 Event::StatusReceived { status } => {
                     check_status(&status, "UID FETCH (uid list)")?;
-                    if matches!(status, Status::Tagged(_)) {
+                    if is_command_completion(&status, &tag) {
                         if uids.is_empty() {
                             while let Ok(Ok(Event::DataReceived {
                                 data: Data::Fetch { items, .. },
@@ -534,7 +537,7 @@ impl ImapConnection {
             .context("converting date for UID SEARCH SINCE")?;
         let criteria = Vec1::from(SearchKey::Since(imap_date));
         let cmd = Command {
-            tag,
+            tag: tag.clone(),
             body: CommandBody::search(None, criteria, true),
         };
         let _handle = self.client.enqueue_command(cmd);
@@ -558,7 +561,7 @@ impl ImapConnection {
                     }
                     Event::StatusReceived { status } => {
                         check_status(&status, "UID SEARCH SINCE")?;
-                        if matches!(status, Status::Tagged(_)) {
+                        if is_command_completion(&status, &tag) {
                             break;
                         }
                     }
@@ -592,7 +595,7 @@ impl ImapConnection {
     ) -> Result<IdleOutcome> {
         let tag = self.next_tag()?;
         let cmd = Command {
-            tag,
+            tag: tag.clone(),
             body: CommandBody::Idle,
         };
         let _handle = self.client.enqueue_command(cmd);
@@ -645,129 +648,71 @@ impl ImapConnection {
         .await
         .unwrap_or_else(|_| bail!("IMAP IDLE setup timed out after {}s", timeout.as_secs()))?;
 
-        // If a mailbox update arrived before IDLE was accepted, exit IDLE
-        // immediately so the caller can run an incremental sync.
-        if got_update_during_setup {
-            self.client.set_idle_done();
-            let _ = tokio::time::timeout(IDLE_DRAIN_TIMEOUT, async {
-                loop {
-                    match self.stream.next(&mut self.client).await {
-                        Ok(Event::StatusReceived { .. }) => break,
-                        Ok(_) => continue,
-                        Err(_) => break,
-                    }
-                }
-            })
-            .await;
-            return Ok(IdleOutcome::Update);
-        }
+        let effective_heartbeat = heartbeat_interval
+            .unwrap_or(IDLE_INACTIVITY_TIMEOUT)
+            .min(IDLE_INACTIVITY_TIMEOUT);
 
-        // Now in IDLE mode — wait for updates, heartbeat, or cancellation.
-        // IMPORTANT: when an update arrives we queue DONE but must keep
-        // looping until the server's tagged OK is received.  Breaking
-        // immediately after set_idle_done() leaves the DONE acknowledgment
-        // unread; the next command's response loop then consumes it and
-        // returns early with an empty result, causing every post-IDLE sync
-        // to report "no new messages" even when new mail is present.
-        let effective_heartbeat = match heartbeat_interval {
-            Some(d) if d > IDLE_INACTIVITY_TIMEOUT => {
-                tracing::warn!(
-                    requested_secs = d.as_secs(),
-                    max_secs = IDLE_INACTIVITY_TIMEOUT.as_secs(),
-                    "heartbeat interval exceeds maximum IDLE inactivity timeout, clamping"
-                );
-                IDLE_INACTIVITY_TIMEOUT
-            }
-            Some(d) => d,
-            None => IDLE_INACTIVITY_TIMEOUT,
-        };
-        let mut heartbeat: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
-            Box::pin(tokio::time::sleep(effective_heartbeat));
-
-        let mut saw_update = false;
-        let outcome = loop {
-            tokio::select! {
-                event = self.stream.next(&mut self.client) => {
-                    match event.context("during IDLE")? {
-                        Event::DataReceived { data } => {
-                            match data {
-                                Data::Exists(_) | Data::Expunge(_) | Data::Recent(_) => {
-                                    debug!(data = ?data, "IDLE received mailbox update");
-                                    if !saw_update {
-                                        self.client.set_idle_done();
-                                        saw_update = true;
-                                    }
-                                    // Keep looping to drain the DONE acknowledgment.
-                                }
-                                _ => {
-                                    trace!(data = ?data, "IDLE received non-update data");
-                                }
-                            }
-                        }
-                        Event::IdleDoneSent { .. } => {
-                            debug!("IDLE DONE sent");
-                        }
-                        Event::StatusReceived { status } => {
-                            // Only the tagged OK terminates IDLE; untagged * OK
-                            // keepalives can arrive at any time and must not
-                            // cause an early exit.
-                            if matches!(status, Status::Tagged(_)) {
+        let outcome = if got_update_during_setup {
+            IdleOutcome::Update
+        } else {
+            let heartbeat = tokio::time::sleep(effective_heartbeat);
+            tokio::pin!(heartbeat);
+            loop {
+                tokio::select! {
+                    event = self.stream.next(&mut self.client) => {
+                        match event.context("during IDLE")? {
+                            Event::DataReceived { data: Data::Exists(_) | Data::Expunge(_) | Data::Recent(_) } => {
                                 break IdleOutcome::Update;
                             }
-                        }
-                        other => {
-                            trace!(event = ?other, "ignoring event during IDLE");
-                        }
-                    }
-                }
-                _ = &mut heartbeat => {
-                    debug!("IDLE heartbeat fired, exiting IDLE for periodic sync");
-                    if !saw_update {
-                        self.client.set_idle_done();
-                    }
-                    let _ = tokio::time::timeout(IDLE_DRAIN_TIMEOUT, async {
-                        loop {
-                            match self.stream.next(&mut self.client).await {
-                                Ok(Event::StatusReceived { .. }) => break,
-                                Ok(Event::IdleDoneSent { .. }) => continue,
-                                Ok(_) => continue,
-                                Err(_) => break,
+                            Event::StatusReceived { status } => {
+                                check_status(&status, "IDLE")?;
+                                if is_command_completion(&status, &tag) {
+                                    // The server ended IDLE itself; no DONE remains to drain.
+                                    return Ok(IdleOutcome::Update);
+                                }
                             }
+                            _ => {}
                         }
-                    })
-                    .await;
-                    break IdleOutcome::Heartbeat;
-                }
-                _ = token.cancelled() => {
-                    debug!("IDLE cancelled by shutdown");
-                    if !saw_update {
-                        self.client.set_idle_done();
                     }
-                    // Drain until we get the tagged response, with a short timeout
-                    // to avoid blocking shutdown indefinitely.
-                    let _ = tokio::time::timeout(IDLE_DRAIN_TIMEOUT, async {
-                        loop {
-                            match self.stream.next(&mut self.client).await {
-                                Ok(Event::StatusReceived { .. }) => break,
-                                Ok(Event::IdleDoneSent { .. }) => continue,
-                                Ok(_) => continue,
-                                Err(_) => break,
-                            }
-                        }
-                    }).await;
-                    break IdleOutcome::Shutdown;
+                    _ = &mut heartbeat => break IdleOutcome::Heartbeat,
+                    _ = token.cancelled() => break IdleOutcome::Shutdown,
                 }
             }
         };
 
+        // All exits use the same bounded drain. A timeout/error must force a
+        // reconnect: reusing this stream would let a stale DONE response end
+        // the next command before its actual results arrive.
+        self.client.set_idle_done();
+        self.drain_idle_done(&tag).await?;
         Ok(outcome)
+    }
+
+    async fn drain_idle_done(&mut self, tag: &Tag<'_>) -> Result<()> {
+        tokio::time::timeout(IDLE_DRAIN_TIMEOUT, async {
+            loop {
+                if let Event::StatusReceived { status } = self
+                    .stream
+                    .next(&mut self.client)
+                    .await
+                    .context("draining IDLE DONE")?
+                {
+                    check_status(&status, "IDLE DONE")?;
+                    if is_command_completion(&status, tag) {
+                        return Ok(());
+                    }
+                }
+            }
+        })
+        .await
+        .context("IMAP IDLE DONE timed out; connection must be discarded")?
     }
 
     /// Send LOGOUT.
     pub async fn logout(&mut self) -> Result<()> {
         let tag = self.next_tag()?;
         let cmd = Command {
-            tag,
+            tag: tag.clone(),
             body: CommandBody::Logout,
         };
         let _handle = self.client.enqueue_command(cmd);
@@ -863,6 +808,10 @@ fn flag_to_string(flag: &Flag<'_>) -> String {
     }
 }
 
+fn is_command_completion(status: &Status<'_>, tag: &Tag<'_>) -> bool {
+    matches!(status, Status::Tagged(response) if response.tag == *tag)
+}
+
 fn check_status(status: &Status, operation: &str) -> Result<()> {
     match status {
         Status::Tagged(tagged) => match tagged.body.kind {
@@ -878,5 +827,126 @@ fn check_status(status: &Status, operation: &str) -> Result<()> {
         Status::Bye(bye) => {
             bail!("{operation}: server sent BYE: {}", bye.text)
         }
+    }
+}
+
+#[cfg(test)]
+mod command_completion_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    async fn pair() -> (ImapConnection, BufReader<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        let mut options = Options::default();
+        options.discard_greeting = true;
+        (
+            ImapConnection {
+                stream: Stream::insecure(tcp),
+                client: Client::new(options),
+                tag_counter: 0,
+                command_timeout: Duration::from_secs(1),
+            },
+            BufReader::new(peer),
+        )
+    }
+
+    async fn read_line(peer: &mut BufReader<TcpStream>) -> String {
+        let mut line = String::new();
+        peer.read_line(&mut line).await.unwrap();
+        line
+    }
+
+    #[tokio::test]
+    async fn login_drains_keepalive_before_select() {
+        let (mut conn, mut peer) = pair().await;
+        let server = tokio::spawn(async move {
+            assert!(read_line(&mut peer).await.starts_with("M1 LOGIN"));
+            peer.write_all(b"* OK keepalive\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            peer.write_all(b"M1 OK logged in\r\n").await.unwrap();
+            assert!(read_line(&mut peer).await.starts_with("M2 SELECT"));
+            peer.write_all(b"* OK [UIDVALIDITY 123] valid\r\n* 2 EXISTS\r\nM2 OK selected\r\n")
+                .await
+                .unwrap();
+        });
+        conn.login("user", "secret").await.unwrap();
+        assert_eq!(conn.select("INBOX").await.unwrap(), (123, 2));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn untagged_ok_cannot_hide_login_rejection() {
+        let (mut conn, mut peer) = pair().await;
+        let server = tokio::spawn(async move {
+            read_line(&mut peer).await;
+            peer.write_all(b"* OK keepalive\r\nM1 NO authentication failed\r\n")
+                .await
+                .unwrap();
+        });
+        assert!(conn.login("user", "secret").await.is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_idle_exit_drains_keepalives_before_next_command() {
+        for mode in ["setup_update", "update", "heartbeat", "shutdown"] {
+            let (mut conn, mut peer) = pair().await;
+            let server = tokio::spawn(async move {
+                assert_eq!(read_line(&mut peer).await, "M1 IDLE\r\n");
+                if mode == "setup_update" {
+                    peer.write_all(b"* 1 EXISTS\r\n").await.unwrap();
+                }
+                peer.write_all(b"+ idling\r\n").await.unwrap();
+                if mode == "update" {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    peer.write_all(b"* 1 EXISTS\r\n").await.unwrap();
+                }
+                assert_eq!(read_line(&mut peer).await, "DONE\r\n");
+                peer.write_all(b"* OK keepalive\r\n").await.unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                peer.write_all(b"M1 OK idle done\r\n").await.unwrap();
+                assert!(read_line(&mut peer).await.starts_with("M2 SELECT"));
+                peer.write_all(b"* OK [UIDVALIDITY 123] valid\r\n* 2 EXISTS\r\nM2 OK selected\r\n")
+                    .await
+                    .unwrap();
+            });
+            let token = CancellationToken::new();
+            if mode == "shutdown" {
+                token.cancel();
+            }
+            let outcome = conn
+                .idle(&token, Some(Duration::from_millis(50)))
+                .await
+                .unwrap();
+            let expected = match mode {
+                "heartbeat" => IdleOutcome::Heartbeat,
+                "shutdown" => IdleOutcome::Shutdown,
+                _ => IdleOutcome::Update,
+            };
+            assert_eq!(outcome, expected, "{mode}");
+            assert_eq!(conn.select("INBOX").await.unwrap(), (123, 2), "{mode}");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_idle_drain_is_an_error() {
+        let (mut conn, mut peer) = pair().await;
+        let server = tokio::spawn(async move {
+            read_line(&mut peer).await;
+            peer.write_all(b"+ idling\r\n").await.unwrap();
+            assert_eq!(read_line(&mut peer).await, "DONE\r\n");
+            peer.write_all(b"* OK keepalive\r\n").await.unwrap();
+            // Closing without the tagged completion must not produce success.
+        });
+        let token = CancellationToken::new();
+        token.cancel();
+        assert!(conn.idle(&token, None).await.is_err());
+        server.await.unwrap();
     }
 }
