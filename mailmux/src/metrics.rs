@@ -21,6 +21,10 @@ pub fn init() -> Option<metrics_exporter_prometheus::PrometheusHandle> {
 
 fn describe_all() {
     describe_counter!(
+        "mailmux_health_rate_limited_total",
+        "Health HTTP requests rejected by the shared rate limiter"
+    );
+    describe_counter!(
         "mailmux_messages_ingested_total",
         "Total number of email messages ingested"
     );

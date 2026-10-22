@@ -560,3 +560,10 @@ Exported metrics:
 ## License
 
 [MIT](LICENSE)
+
+The health server shares a 10-request/second token bucket with a burst of 20
+across `/health`, `/ready`, and `/metrics`. Excess requests receive HTTP 429
+and `Retry-After: 1` before database access or metrics rendering. The global
+budget uses constant memory and applies across clients; it does not trust
+forwarded IP headers. Monitor `mailmux_health_rate_limited_total` to detect
+excessive scrape/probe traffic.
