@@ -214,6 +214,8 @@ In `auto` mode, genai infers provider keys from the environment. In custom mode,
 ```toml
 # Senders matched as exact normalized mailbox addresses.
 allowed_senders = ["alerts@mybank.com", "noreply@anotherbank.com"]
+# Required: authentication service IDs stamped by your receiving provider.
+trusted_authserv_ids = ["mx.receiver.example"]
 
 # Model name passed to genai. Provider (and required API key) is inferred from
 # the name. Default: "claude-haiku-4-5-20251001"
@@ -453,3 +455,25 @@ echo '{"event":{"id":1},"email":{"subject":"Test","sender":"alerts@mybank.com","
     ANTHROPIC_API_KEY=sk-ant-... \
     ./target/debug/mailtx
 ```
+
+### Sender authentication
+
+Configure `trusted_authserv_ids` with the exact receiving service IDs found in
+your provider's `Authentication-Results` headers. The list is required. The
+provider must verify DMARC and strip incoming headers that forge its own IDs,
+as required by [RFC 8601 section 5](https://www.rfc-editor.org/rfc/rfc8601.html#section-5).
+A hostname in a header alone does not establish trust.
+
+Mailtx checks only the topmost result, requires an unambiguous `dmarc=pass`
+with `header.from` matching the raw message's From domain, and verifies the raw
+From address against the allowed sender selected by mailmux. Missing, failed,
+untrusted, oversized, malformed, or ambiguous results are skipped with outcome
+`skipped_authentication`, before LLM/Firefly requests or transfer-state access.
+Older pass headers cannot override a newer failure. Subject and body are read
+from the same authenticated raw message.
+
+This uses the receiving provider's verdict; it does not perform independent
+DNS/DKIM verification. Historical messages without trusted results are skipped.
+Use a receiver that supplies and sanitizes these results. Treat model output
+as untrusted even for authenticated mail; retain downstream idempotency and
+transaction validation.

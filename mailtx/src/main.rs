@@ -6,6 +6,7 @@ use tracing::{info, warn};
 use crate::matcher::AccountMatcher;
 use crate::metrics::Metrics;
 
+mod auth;
 mod config;
 mod email;
 mod endpoint;
@@ -56,6 +57,53 @@ async fn run(m: &mut Metrics) -> Result<()> {
     let llm_config = config.resolve_llm()?;
     let endpoint = endpoint::build_endpoint(&config);
     let http_client = reqwest::Client::new();
+
+    let account_matcher = matcher::DeterministicAccountMatcher::new(
+        &config.firefly.asset_accounts,
+        config.firefly.default_asset_account_id.clone(),
+    )?;
+
+    let mut raw = String::new();
+    std::io::stdin()
+        .read_to_string(&mut raw)
+        .map_err(|e| anyhow::anyhow!("reading stdin: {e}"))?;
+
+    let input: input::Input =
+        serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("parsing stdin JSON: {e}"))?;
+    let email = match &input.email {
+        Some(e) => e,
+        None => {
+            warn!(
+                event_id = input.event.id,
+                "no email record attached to event, skipping"
+            );
+            m.result = Some("skipped_sender");
+            return Ok(());
+        }
+    };
+
+    let external_id = input.external_id()?;
+
+    let sender = email.sender.as_deref().unwrap_or("");
+    if !config.sender_allowed(sender) {
+        info!(sender, "sender not in allow-list, skipping");
+        m.result = Some("skipped_sender");
+        return Ok(());
+    }
+
+    let Some(authenticated) = email::extract_authenticated(
+        &email.raw_message_path,
+        sender,
+        &config.trusted_authserv_ids,
+    )?
+    else {
+        warn!("email lacks a trusted aligned DMARC pass; skipping");
+        m.result = Some("skipped_authentication");
+        return Ok(());
+    };
+    let subject = authenticated.subject.as_str();
+    let body = authenticated.body;
+    info!(sender, "processing authenticated bank transaction email");
 
     // Open the pending transfer store (only when transfer_rules are configured).
     let pending_store = config
@@ -115,44 +163,6 @@ async fn run(m: &mut Metrics) -> Result<()> {
             }
         }
     }
-
-    let account_matcher = matcher::DeterministicAccountMatcher::new(
-        &config.firefly.asset_accounts,
-        config.firefly.default_asset_account_id.clone(),
-    )?;
-
-    let mut raw = String::new();
-    std::io::stdin()
-        .read_to_string(&mut raw)
-        .map_err(|e| anyhow::anyhow!("reading stdin: {e}"))?;
-
-    let input: input::Input =
-        serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("parsing stdin JSON: {e}"))?;
-    let email = match &input.email {
-        Some(e) => e,
-        None => {
-            warn!(
-                event_id = input.event.id,
-                "no email record attached to event, skipping"
-            );
-            m.result = Some("skipped_sender");
-            return Ok(());
-        }
-    };
-
-    let external_id = input.external_id()?;
-
-    let sender = email.sender.as_deref().unwrap_or("");
-    if !config.sender_allowed(sender) {
-        info!(sender, "sender not in allow-list, skipping");
-        m.result = Some("skipped_sender");
-        return Ok(());
-    }
-
-    let subject = email.subject.as_deref().unwrap_or("");
-    info!(sender, subject, "processing bank transaction email");
-
-    let body = email::extract_body(&email.raw_message_path)?;
 
     let llm_client = llm::LlmClient::from_config(&llm_config)?;
 

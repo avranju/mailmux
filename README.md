@@ -560,3 +560,8 @@ Exported metrics:
 ## License
 
 [MIT](LICENSE)
+
+The mailtx bank processor requires a configured list of receiving
+`trusted_authserv_ids` and a trusted aligned DMARC pass before processing mail.
+See [sender authentication](mailtx/README.md#sender-authentication) for the
+receiving-provider requirements and migration guidance.

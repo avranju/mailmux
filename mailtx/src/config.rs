@@ -62,6 +62,9 @@ pub struct ResolvedOpenAiCompatibleConfig {
 pub struct Config {
     /// Lowercase email addresses that are accepted as bank senders.
     pub allowed_senders: Vec<String>,
+    /// Receiving services trusted to stamp sanitized Authentication-Results.
+    #[serde(default)]
+    pub trusted_authserv_ids: Vec<String>,
     /// Model name passed to genai, e.g. "claude-haiku-4-5-20251001" or "gpt-4o-mini".
     /// genai infers the provider from the model name and reads the corresponding
     /// API key from the environment automatically (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.).
@@ -319,6 +322,17 @@ impl Config {
                 "unknown"
             )
         })?;
+
+        if config.trusted_authserv_ids.is_empty()
+            || config
+                .trusted_authserv_ids
+                .iter()
+                .any(|id| !crate::auth::valid_authserv_id(id))
+        {
+            anyhow::bail!(
+                "trusted_authserv_ids must list the receiving server's authentication service IDs"
+            );
+        }
 
         // Normalise allowed_senders to lowercase mailbox addresses and drop invalid entries.
         config.allowed_senders = config
@@ -620,6 +634,7 @@ error_if_duplicate_hash = false"#,
     fn test_config(allowed_senders: Vec<String>) -> Config {
         Config {
             allowed_senders,
+            trusted_authserv_ids: vec!["mx.receiver.test".into()],
             llm_model: Some("test-model".to_string()),
             llm: None,
             tag: "test-tag".to_string(),

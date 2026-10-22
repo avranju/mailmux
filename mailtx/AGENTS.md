@@ -86,6 +86,8 @@ Configuration is split between a TOML file (most settings) and a few env vars
 ```toml
 # Senders matched as exact normalized mailbox addresses.
 allowed_senders = ["alerts@mybank.com", "noreply@anotherbank.com"]
+# Required: authentication service IDs stamped by your receiving provider.
+trusted_authserv_ids = ["mx.receiver.example"]
 
 # Model name passed to genai. Provider is inferred from the name.
 # Default: "claude-haiku-4-5-20251001"
@@ -197,3 +199,10 @@ Tests exist for sender normalization, Firefly behavior, transfer state, and pipe
 - Integration-test the LLM and post modules with a mock HTTP server (e.g.
   `wiremock`)
 - Async tests use `#[tokio::test]`
+
+Sender authentication is mandatory. `trusted_authserv_ids` names receiving
+services that sanitize inbound Authentication-Results. `auth.rs` requires the
+topmost result to report aligned DMARC pass for a single raw From address.
+Unauthenticated mail exits successfully as skipped_authentication before any
+LLM, Firefly, or transfer-store activity. Use raw subject/body from that same
+message. Tests must include realistic trusted authentication results.
