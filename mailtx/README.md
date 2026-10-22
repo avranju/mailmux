@@ -453,3 +453,8 @@ echo '{"event":{"id":1},"email":{"subject":"Test","sender":"alerts@mybank.com","
     ANTHROPIC_API_KEY=sk-ant-... \
     ./target/debug/mailtx
 ```
+
+Email text sent to the LLM is capped at 32 KiB, with a truncation marker and a
+warning for oversized messages. Firefly requests have a 10-second connection
+deadline and a 30-second total deadline, including response reads. Keep the
+outer mailmux processor timeout longer than LLM work plus these requests.

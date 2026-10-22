@@ -335,6 +335,13 @@ impl Config {
                     bail!("account '{}': mailbox name must not be empty", account.id);
                 }
             }
+            if !account.tls && !is_loopback_host(&account.imap_host) {
+                warn!(
+                    account = account.id,
+                    host = account.imap_host,
+                    "plaintext IMAP sends credentials and email without transport encryption; enable tls"
+                );
+            }
             if account.tls_ca_file.is_some() && !account.tls {
                 bail!("account '{}': tls_ca_file requires tls = true", account.id);
             }
@@ -445,13 +452,19 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 /// Substitute `${VAR}` patterns in a string with environment variable values.
-/// If the variable is not set, the pattern is left as-is.
+/// If the variable is unavailable, warn with its name and retain the reference.
 fn substitute_env_vars(value: &mut String) {
     let re = Regex::new(r"\$\{([^}]+)\}").expect("valid regex");
     let replaced = re
         .replace_all(value, |caps: &regex::Captures| {
             let var_name = &caps[1];
-            std::env::var(var_name).unwrap_or_else(|_| caps[0].to_string())
+            std::env::var(var_name).unwrap_or_else(|_| {
+                warn!(
+                    variable = var_name,
+                    "unresolved configuration environment variable"
+                );
+                caps[0].to_string()
+            })
         })
         .into_owned();
     *value = replaced;
@@ -518,6 +531,41 @@ events = ["email_arrived"]
 timeout_secs = 5
 concurrency = 1
 "#
+    }
+
+    #[test]
+    fn security_warnings_identify_plaintext_transport_and_missing_variable_without_values() {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Capture(Default::default());
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut value =
+                "private-prefix-${MAILMUX_TEST_MISSING_ENV_62}-private-suffix".to_owned();
+            substitute_env_vars(&mut value);
+            let config: Config =
+                toml::from_str(&sample_toml().replace("tls = true", "tls = false")).unwrap();
+            config.validate().unwrap();
+        });
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("MAILMUX_TEST_MISSING_ENV_62"));
+        assert!(logs.contains("plaintext IMAP"));
+        assert!(!logs.contains("private-prefix"));
+        assert!(!logs.contains("private-suffix"));
     }
 
     fn write_temp_config(content: &str) -> NamedTempFile {

@@ -560,3 +560,8 @@ Exported metrics:
 ## License
 
 [MIT](LICENSE)
+
+Plaintext IMAP (`tls = false`) to a non-loopback host emits a startup warning.
+Missing `${VAR}` substitutions also emit warnings naming only the unresolved
+variable; the reference remains unchanged so existing optional/disabled
+configuration can still load.
