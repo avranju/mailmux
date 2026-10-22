@@ -567,3 +567,56 @@ fn successful_transfer_survives_cleanup_failure_and_replay_does_not_post_again()
     drop(db);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn us_banks_post_native_usd_to_matched_accounts_with_inr_global_default() {
+    for (kind, body, account, side) in [
+        (
+            "withdrawal",
+            "Capital One credit card ending in 1234: purchase USD 12.34 at Market.",
+            "42",
+            "source_id",
+        ),
+        (
+            "deposit",
+            "Bank of America account ending in 5678: deposit USD 12.34.",
+            "43",
+            "destination_id",
+        ),
+    ] {
+        let root = root();
+        let llm = Fixture::start(1, move |_| {
+            response(&format!(
+                r#"{{"status":"found","amount":12.34,"transaction_type":"{kind}","narration":"Market","transaction_date":"2026-01-05","category":"Food"}}"#
+            ))
+        });
+        let ff = firefly(3);
+        let (config, eml) = setup_config(&root, &llm.url, &ff.url, "");
+        fs::write(
+            &eml,
+            format!("From: allowed@example.test\nContent-Type: text/plain\n\n{body}\n"),
+        )
+        .unwrap();
+        let mut text = fs::read_to_string(&config)
+            .unwrap()
+            .replace("[firefly]", "[firefly]\ncurrency_code = 'INR'");
+        text.push_str("\n[[firefly.asset_accounts]]\nid='capital-one'\nfirefly_account_id='42'\ncard_last4=['1234']\ncurrency=' usd '\ntimezone='America/New_York'\n[[firefly.asset_accounts]]\nid='bofa'\nfirefly_account_id='43'\naccount_suffixes=['5678']\ncurrency_code='USD'\ntimezone='America/New_York'\n");
+        fs::write(&config, text).unwrap();
+        let out = run(&config, &eml, 106, &[]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(llm.finish().len(), 1);
+        let requests = ff.finish();
+        let post = requests.iter().find(|r| r.starts_with("POST ")).unwrap();
+        let payload: Value = serde_json::from_str(post.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let tx = &payload["transactions"][0];
+        assert_eq!(tx["currency_code"], "USD");
+        assert_eq!(tx[side], account);
+        assert_eq!(tx["amount"], "12.34");
+        assert_eq!(tx["date"], "2026-01-05T00:00:00-05:00");
+        fs::remove_dir_all(root).unwrap();
+    }
+}

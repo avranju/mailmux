@@ -120,6 +120,7 @@ pub struct InsertLeg<'a> {
     pub rule_id: &'a str,
     pub leg: &'a Leg,
     pub amount_units: i64,
+    pub currency_code: Option<&'a str>,
     pub narration: &'a str,
     pub category: Option<&'a str>,
     pub source_firefly_id: &'a str,
@@ -136,6 +137,7 @@ pub struct ExpiredLeg {
     pub id: i64,
     pub leg: Leg,
     pub amount: Decimal,
+    pub currency_code: Option<String>,
     pub narration: String,
     pub category: Option<String>,
     pub source_firefly_id: String,
@@ -176,7 +178,8 @@ impl PendingStore {
                 occurred_at            TEXT    NOT NULL,
                 inserted_at            INTEGER NOT NULL,
                 tags                   TEXT    NOT NULL,
-                external_id            TEXT
+                external_id            TEXT,
+                currency_code          TEXT
             );",
         )
         .context("initialising pending_transfers table")?;
@@ -192,6 +195,13 @@ impl PendingStore {
                 [],
             )
             .context("adding external_id to pending_transfers")?;
+        }
+        if !columns.iter().any(|column| column == "currency_code") {
+            conn.execute(
+                "ALTER TABLE pending_transfers ADD COLUMN currency_code TEXT",
+                [],
+            )
+            .context("adding pending transfer currency")?;
         }
         // A replay of a first transfer leg must not create another pending row.
         // SQLite permits multiple NULLs, preserving compatibility with legacy rows.
@@ -223,7 +233,7 @@ impl PendingStore {
         let cutoff = self.cutoff_unix();
         let mut stmt = self.conn.prepare(
             "SELECT id, leg, amount_units, narration, category,
-                    source_firefly_id, destination_firefly_id, occurred_at, tags, external_id
+                    source_firefly_id, destination_firefly_id, occurred_at, tags, external_id, currency_code
              FROM pending_transfers
              WHERE inserted_at < ?1
              ORDER BY inserted_at ASC",
@@ -242,6 +252,7 @@ impl PendingStore {
                     row.get::<_, String>(7)?,
                     row.get::<_, String>(8)?,
                     row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -259,6 +270,7 @@ impl PendingStore {
             occurred_at_str,
             tags_json,
             external_id,
+            currency_code,
         ) in rows
         {
             let leg = if leg_str == "withdrawal" {
@@ -273,6 +285,7 @@ impl PendingStore {
                 id,
                 leg,
                 amount: Decimal::new(amount_units, 2),
+                currency_code,
                 narration,
                 category,
                 source_firefly_id: src,
@@ -308,15 +321,16 @@ impl PendingStore {
         rule_id: &str,
         opposite_leg: &str,
         amount_units: i64,
+        currency_code: Option<&str>,
     ) -> Result<Option<PendingLeg>> {
         let cutoff = self.cutoff_unix();
         let result = self.conn.query_row(
             "SELECT id
              FROM pending_transfers
-             WHERE rule_id = ?1 AND leg = ?2 AND amount_units = ?3 AND inserted_at >= ?4
+             WHERE rule_id = ?1 AND leg = ?2 AND amount_units = ?3 AND inserted_at >= ?4 AND currency_code IS ?5
              ORDER BY inserted_at ASC
              LIMIT 1",
-            params![rule_id, opposite_leg, amount_units, cutoff],
+            params![rule_id, opposite_leg, amount_units, cutoff, currency_code],
             |row| Ok(PendingLeg { id: row.get(0)? }),
         );
         match result {
@@ -335,8 +349,8 @@ impl PendingStore {
                 "INSERT OR IGNORE INTO pending_transfers
                      (rule_id, leg, amount_units, narration, category,
                       source_firefly_id, destination_firefly_id,
-                      occurred_at, inserted_at, tags, external_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                      occurred_at, inserted_at, tags, external_id, currency_code)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     args.rule_id,
                     args.leg.as_str(),
@@ -349,6 +363,7 @@ impl PendingStore {
                     Utc::now().timestamp(),
                     tags_json,
                     args.external_id,
+                    args.currency_code,
                 ],
             )
             .context("inserting pending transfer leg")?;
@@ -370,6 +385,7 @@ mod tests {
             rule_id: "rule",
             leg: &Leg::Withdrawal,
             amount_units: 1234,
+            currency_code: None,
             narration: "transfer",
             category: None,
             source_firefly_id: "1",
@@ -387,6 +403,7 @@ mod tests {
                     rule_id: "rule",
                     leg: &Leg::Withdrawal,
                     amount_units: 1234,
+                    currency_code: None,
                     narration: "transfer",
                     category: None,
                     source_firefly_id: "1",
@@ -408,6 +425,7 @@ mod tests {
                 rule_id: "test",
                 leg: &Leg::Withdrawal,
                 amount_units: 9_007_199_254_740_991,
+                currency_code: None,
                 narration: "transfer",
                 category: None,
                 source_firefly_id: "1",
@@ -439,6 +457,7 @@ mod tests {
                 rule_id: "legacy",
                 leg: &Leg::Withdrawal,
                 amount_units: 29,
+                currency_code: None,
                 narration: "legacy",
                 category: None,
                 source_firefly_id: "1",
@@ -464,5 +483,50 @@ mod tests {
         );
         drop(reopened);
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn pending_matches_require_same_currency_and_expiry_preserves_it() {
+        let store = PendingStore::open(":memory:", 48).unwrap();
+        store
+            .insert(InsertLeg {
+                rule_id: "rule",
+                leg: &Leg::Deposit,
+                amount_units: 1234,
+                currency_code: Some("USD"),
+                narration: "transfer",
+                category: None,
+                source_firefly_id: "1",
+                destination_firefly_id: "2",
+                occurred_at: &Utc::now().fixed_offset(),
+                tags: &[],
+                external_id: Some("usd:1"),
+            })
+            .unwrap();
+        assert!(
+            store
+                .find_match("rule", "deposit", 1234, Some("INR"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .find_match("rule", "deposit", 1234, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .find_match("rule", "deposit", 1234, Some("USD"))
+                .unwrap()
+                .is_some()
+        );
+        store
+            .conn
+            .execute("UPDATE pending_transfers SET inserted_at=0", [])
+            .unwrap();
+        assert_eq!(
+            store.drain_expired().unwrap()[0].currency_code.as_deref(),
+            Some("USD")
+        );
     }
 }

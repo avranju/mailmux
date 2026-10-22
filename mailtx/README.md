@@ -489,3 +489,43 @@ bounded to 64 endpoint/token entries of at most 1 MiB each. Expired or failed
 cache reads fetch fresh data, and cache write errors do not fail the email.
 Transfer account references are validated at startup, and invalid sender-list
 entries emit a warning identifying their index.
+
+### US bank accounts and native currencies
+
+Capital One and Bank of America notifications use the same extractor. Configure
+exact sender mailboxes from your authenticated bank emails in `allowed_senders`,
+then match the account/card identifiers actually present in those notifications:
+
+```toml
+[firefly]
+# Keep the other required Firefly settings here.
+currency_code = "INR" # fallback for accounts without an override
+
+[[firefly.asset_accounts]]
+id = "capital-one"
+firefly_account_id = "42" # an existing USD asset account in Firefly
+card_last4 = ["1234"] # alias of debit_card_last4; credit cards also match
+currency = "USD" # alias of currency_code
+timezone = "America/New_York" # choose the bank booking timezone
+
+[[firefly.asset_accounts]]
+id = "bank-of-america"
+firefly_account_id = "43"
+account_suffixes = ["5678"]
+currency_code = "USD"
+timezone = "America/New_York"
+```
+
+The matched account's currency overrides the global fallback for deposits,
+withdrawals, and persisted pending legs. Currency codes are normalized to three
+uppercase ASCII letters. Enable USD in Firefly and use USD asset accounts for
+these native amounts. For INR equivalents in reports, configure INR as Firefly's
+primary currency, enable exchange rates and primary-currency display, and supply
+appropriate historical rates; `currency_code` alone does not enable conversion.
+See the official [currency documentation](https://github.com/firefly-iii/docs/blob/main/docs/docs/how-to/firefly-iii/features/currencies.md)
+and [exchange-rate documentation](https://github.com/firefly-iii/docs/blob/main/docs/docs/explanation/financial-concepts/exchange-rates.md).
+
+Cross-currency transfer rules are rejected: Firefly needs both native and foreign
+amounts, which mailtx does not invent. Pending legs match only within the same
+currency; legacy legs without a currency expire separately using the account's
+configured currency. Configure every account's currency when mixing currencies.

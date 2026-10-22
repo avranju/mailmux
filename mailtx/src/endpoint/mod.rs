@@ -20,6 +20,7 @@ pub enum TransactionKind {
 #[derive(Debug, Clone)]
 pub struct CanonicalTransaction {
     pub amount: Decimal,
+    pub currency_code: Option<String>,
     pub kind: TransactionKind,
     pub narration: String,
     pub occurred_at: DateTime<FixedOffset>,
@@ -111,6 +112,7 @@ pub fn canonical_from_llm(
 
     Ok(CanonicalTransaction {
         amount,
+        currency_code: None,
         kind,
         narration,
         occurred_at,

@@ -10,6 +10,7 @@ pub struct MatchedAssetAccount {
     pub method: &'static str,
     pub matched_value: Option<String>,
     pub timezone: Option<chrono_tz::Tz>,
+    pub currency_code: Option<String>,
 }
 
 pub trait AccountMatcher: Send + Sync {
@@ -36,7 +37,7 @@ impl DeterministicAccountMatcher {
             accounts,
             default_asset_account_id,
             card_re: Regex::new(
-                r"(?i)(?:debit\s*card(?:\s*ending)?|card\s*ending)\D{0,20}(\d{4})",
+                r"(?i)(?:(?:debit|credit)\s*card(?:\s*ending)?|card\s*ending)\D{0,20}(\d{4})\b",
             )?,
             account_re: Regex::new(
                 r"(?i)(?:account|a/c|acct)(?:\s*ending(?:\s*in)?|\s*ending)?\D{0,30}(?:xx+)?(\d{4,8})",
@@ -92,6 +93,11 @@ impl AccountMatcher for DeterministicAccountMatcher {
                 firefly_account_id: default_id.clone(),
                 method: "default_fallback",
                 matched_value: None,
+                currency_code: self
+                    .accounts
+                    .iter()
+                    .find(|account| &account.firefly_account_id == default_id)
+                    .and_then(|account| account.currency_code.clone()),
                 timezone: self
                     .accounts
                     .iter()
@@ -112,6 +118,7 @@ struct NormalizedAccount {
     debit_card_last4: Vec<String>,
     aliases: Vec<String>,
     timezone: Option<chrono_tz::Tz>,
+    currency_code: Option<String>,
 }
 
 impl NormalizedAccount {
@@ -119,6 +126,7 @@ impl NormalizedAccount {
         Self {
             id: config.id.trim().to_string(),
             timezone: config.timezone,
+            currency_code: config.currency_code.clone(),
             firefly_account_id: config.firefly_account_id.trim().to_string(),
             account_suffixes: config
                 .account_suffixes
@@ -158,6 +166,7 @@ impl NormalizedAccount {
             method,
             matched_value,
             timezone: self.timezone,
+            currency_code: self.currency_code.clone(),
         }
     }
 }
@@ -180,6 +189,7 @@ mod tests {
                     account_suffixes: vec!["9772".to_string()],
                     debit_card_last4: vec!["7406".to_string()],
                     timezone: None,
+                    currency_code: None,
                     aliases: vec!["hdfc savings".to_string()],
                 },
                 FireflyAssetAccountConfig {
@@ -188,6 +198,7 @@ mod tests {
                     account_suffixes: vec!["3989".to_string()],
                     debit_card_last4: vec![],
                     timezone: None,
+                    currency_code: None,
                     aliases: vec!["sbm bank".to_string()],
                 },
             ],

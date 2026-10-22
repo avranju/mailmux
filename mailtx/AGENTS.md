@@ -204,3 +204,8 @@ sub-cent amounts are rejected. Bank date-only timestamps use transaction_timezon
 (default UTC), overridable per asset-account timezone, and preserve fixed offsets
 through pending transfer state. Category cache state is private, credential-scoped,
 TTL-bounded SQLite; FetchedCategories reports real request counts for metrics.
+
+Asset accounts may set currency_code (alias currency), overriding firefly.currency_code.
+card_last4 aliases debit_card_last4 and accepts credit-card notifications too.
+Canonical and pending transactions preserve the native currency. Do not coalesce
+cross-currency transfers without explicit amounts in both currencies.

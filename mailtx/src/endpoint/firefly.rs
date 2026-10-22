@@ -101,7 +101,10 @@ impl FireflyEndpoint {
                 source_name: None,
                 destination_id: None,
                 destination_name: None,
-                currency_code: self.currency_code.as_deref(),
+                currency_code: tx
+                    .currency_code
+                    .as_deref()
+                    .or(self.currency_code.as_deref()),
                 tags: tx.tags.as_slice(),
                 category_name: tx.category_name.as_deref(),
                 external_id: tx.external_id.as_deref(),
@@ -115,7 +118,10 @@ impl FireflyEndpoint {
                 source_name: None,
                 destination_id: Some(tx.asset_account_id.as_str()),
                 destination_name: None,
-                currency_code: self.currency_code.as_deref(),
+                currency_code: tx
+                    .currency_code
+                    .as_deref()
+                    .or(self.currency_code.as_deref()),
                 tags: tx.tags.as_slice(),
                 category_name: tx.category_name.as_deref(),
                 external_id: tx.external_id.as_deref(),
@@ -138,7 +144,10 @@ impl FireflyEndpoint {
                     source_name: None,
                     destination_id: Some(destination_id),
                     destination_name: None,
-                    currency_code: self.currency_code.as_deref(),
+                    currency_code: tx
+                        .currency_code
+                        .as_deref()
+                        .or(self.currency_code.as_deref()),
                     tags: tx.tags.as_slice(),
                     category_name: tx.category_name.as_deref(),
                     external_id: tx.external_id.as_deref(),
@@ -358,6 +367,7 @@ mod tests {
     fn transaction(external_id: &str) -> CanonicalTransaction {
         CanonicalTransaction {
             amount: rust_decimal::Decimal::new(1234, 2),
+            currency_code: None,
             kind: TransactionKind::Withdrawal,
             narration: "Test purchase".to_string(),
             occurred_at: Utc::now().fixed_offset(),

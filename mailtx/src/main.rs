@@ -83,7 +83,12 @@ async fn run(m: &mut Metrics) -> Result<()> {
             };
             let mut tags = expired.tags.clone();
             tags.push("unmatched-transfer".to_string());
+            let currency_code = expired
+                .currency_code
+                .clone()
+                .or_else(|| config.currency_for_account(&asset_account_id));
             let fallback = endpoint::CanonicalTransaction {
+                currency_code,
                 amount: expired.amount,
                 kind,
                 narration: expired.narration.clone(),
@@ -220,7 +225,7 @@ async fn run(m: &mut Metrics) -> Result<()> {
 
     // Build the canonical transaction. For transfers this is reused as a base
     // (struct update) to keep all the shared fields (narration, occurred_at, etc.).
-    let canonical_tx = endpoint::canonical_from_llm(
+    let mut canonical_tx = endpoint::canonical_from_llm(
         &tx,
         resolved.firefly_account_id.clone(),
         config.tag.clone(),
@@ -231,6 +236,11 @@ async fn run(m: &mut Metrics) -> Result<()> {
             .timezone
             .unwrap_or(config.firefly.transaction_timezone),
     )?;
+
+    canonical_tx.currency_code = resolved
+        .currency_code
+        .clone()
+        .or_else(|| config.firefly.currency_code.clone());
 
     // --- Transfer detection -------------------------------------------------
     // Check whether this transaction is a leg of a configured transfer route.
@@ -252,9 +262,12 @@ async fn run(m: &mut Metrics) -> Result<()> {
 
         let amount_units = money::minor_units(canonical_tx.amount)?;
 
-        if let Some(pending) =
-            store.find_match(&rule_match.rule_id, leg.opposite_str(), amount_units)?
-        {
+        if let Some(pending) = store.find_match(
+            &rule_match.rule_id,
+            leg.opposite_str(),
+            amount_units,
+            canonical_tx.currency_code.as_deref(),
+        )? {
             // Both legs are in — post a Firefly transfer transaction.
             let transfer_tx = endpoint::CanonicalTransaction {
                 kind: endpoint::TransactionKind::Transfer,
@@ -290,6 +303,7 @@ async fn run(m: &mut Metrics) -> Result<()> {
                 rule_id: &rule_match.rule_id,
                 leg: &rule_match.leg,
                 amount_units,
+                currency_code: canonical_tx.currency_code.as_deref(),
                 narration: &canonical_tx.narration,
                 category: canonical_tx.category_name.as_deref(),
                 source_firefly_id: &rule_match.source_firefly_id,

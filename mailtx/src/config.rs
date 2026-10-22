@@ -311,12 +311,15 @@ pub struct FireflyAssetAccountConfig {
     pub account_suffixes: Vec<String>,
     /// Optional debit-card last4 hints mapped to this asset account.
     #[serde(default)]
+    #[serde(alias = "card_last4")]
     pub debit_card_last4: Vec<String>,
     /// Optional free-text aliases for fuzzy-ish deterministic name matching.
     #[serde(default)]
     pub aliases: Vec<String>,
     #[serde(default)]
     pub timezone: Option<chrono_tz::Tz>,
+    #[serde(default, alias = "currency")]
+    pub currency_code: Option<String>,
 }
 
 impl Config {
@@ -361,6 +364,10 @@ impl Config {
         if config.firefly.categories_cache_ttl_secs > 3600 {
             anyhow::bail!("categories_cache_ttl_secs must be at most 3600");
         }
+        normalize_currency(&mut config.firefly.currency_code)?;
+        for account in &mut config.firefly.asset_accounts {
+            normalize_currency(&mut account.currency_code)?;
+        }
         config.validate_transfer_rules()?;
         crate::transfer::window_seconds(config.transfer_match_window_hours)?;
         if !config.transfer_rules.is_empty() && config.state_db.is_none() {
@@ -387,11 +394,47 @@ impl Config {
             if !ids.contains(&rule.source_account) || !ids.contains(&rule.destination_account) {
                 anyhow::bail!("transfer rule references an unknown asset account");
             }
+            let source = self
+                .firefly
+                .asset_accounts
+                .iter()
+                .find(|account| account.id == rule.source_account)
+                .unwrap();
+            let destination = self
+                .firefly
+                .asset_accounts
+                .iter()
+                .find(|account| account.id == rule.destination_account)
+                .unwrap();
+            let source_currency = source
+                .currency_code
+                .as_ref()
+                .or(self.firefly.currency_code.as_ref());
+            let destination_currency = destination
+                .currency_code
+                .as_ref()
+                .or(self.firefly.currency_code.as_ref());
+            if let (Some(source), Some(destination)) = (source_currency, destination_currency)
+                && source != destination
+            {
+                anyhow::bail!(
+                    "cross-currency transfer rules require explicit foreign amounts and cannot be coalesced"
+                );
+            }
             if rule.source_account == rule.destination_account {
                 anyhow::bail!("transfer rule accounts must differ");
             }
         }
         Ok(())
+    }
+
+    pub fn currency_for_account(&self, firefly_id: &str) -> Option<String> {
+        self.firefly
+            .asset_accounts
+            .iter()
+            .find(|account| account.firefly_account_id.trim() == firefly_id.trim())
+            .and_then(|account| account.currency_code.clone())
+            .or_else(|| self.firefly.currency_code.clone())
     }
 
     pub fn resolve_llm(&self) -> Result<ResolvedLlmConfig> {
@@ -488,6 +531,16 @@ impl Config {
             .iter()
             .any(|allowed| sender_address == allowed.as_str())
     }
+}
+
+fn normalize_currency(code: &mut Option<String>) -> Result<()> {
+    if let Some(value) = code {
+        *value = value.trim().to_ascii_uppercase();
+        if value.len() != 3 || !value.bytes().all(|byte| byte.is_ascii_uppercase()) {
+            anyhow::bail!("currency codes must contain three ASCII letters");
+        }
+    }
+    Ok(())
 }
 
 fn normalize_sender_address(sender: &str) -> Option<String> {
@@ -976,5 +1029,50 @@ base_url = "https://llm.example/prefix""#,
     fn loopback_http_host_rejects_domain_names() {
         assert!(!is_loopback_http_host("firefly.local"));
         assert!(!is_loopback_http_host("example.com"));
+    }
+    #[test]
+    fn currency_config_normalizes_aliases_and_rejects_cross_currency_coalescing() {
+        let mut currency = Some(" usd ".into());
+        super::normalize_currency(&mut currency).unwrap();
+        assert_eq!(currency.as_deref(), Some("USD"));
+        for invalid in ["", "US", "USDD", "12$"] {
+            assert!(super::normalize_currency(&mut Some(invalid.into())).is_err());
+        }
+        let mut config = test_config(vec![]);
+        config.firefly.currency_code = Some("INR".into());
+        config.firefly.asset_accounts = toml::from_str::<super::FireflyConfig>(
+            r#"
+base_url="https://firefly.example/api"
+access_token="token"
+[[asset_accounts]]
+id="india"
+firefly_account_id="1"
+[[asset_accounts]]
+id="us"
+firefly_account_id="2"
+currency="USD"
+card_last4=["1234"]
+"#,
+        )
+        .unwrap()
+        .asset_accounts;
+        assert_eq!(config.currency_for_account("1").as_deref(), Some("INR"));
+        assert_eq!(config.currency_for_account("2").as_deref(), Some("USD"));
+        assert_eq!(config.firefly.asset_accounts[1].debit_card_last4, ["1234"]);
+        config.transfer_rules.push(super::TransferRule {
+            source_account: "india".into(),
+            destination_account: "us".into(),
+            withdrawal_keywords: vec![],
+            deposit_keywords: vec![],
+        });
+        assert!(
+            config
+                .validate_transfer_rules()
+                .unwrap_err()
+                .to_string()
+                .contains("cross-currency")
+        );
+        config.firefly.asset_accounts[0].currency_code = Some("USD".into());
+        config.validate_transfer_rules().unwrap();
     }
 }
