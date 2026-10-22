@@ -3,7 +3,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::config::FireflyConfig;
-use crate::endpoint::{CanonicalTransaction, PostReceipt, TransactionEndpoint, TransactionKind};
+use crate::endpoint::{
+    CanonicalTransaction, FetchedCategories, PostReceipt, TransactionEndpoint, TransactionKind,
+};
 
 pub struct FireflyEndpoint {
     base_url: String,
@@ -12,6 +14,7 @@ pub struct FireflyEndpoint {
     apply_rules: bool,
     fire_webhooks: bool,
     error_if_duplicate_hash: bool,
+    categories_cache: Option<crate::category_cache::CategoryCache>,
 }
 
 impl FireflyEndpoint {
@@ -23,6 +26,12 @@ impl FireflyEndpoint {
             apply_rules: config.apply_rules,
             fire_webhooks: config.fire_webhooks,
             error_if_duplicate_hash: config.error_if_duplicate_hash,
+            categories_cache: crate::category_cache::CategoryCache::new(
+                config.categories_cache_path.as_deref(),
+                config.base_url.trim_end_matches('/'),
+                config.access_token.trim(),
+                config.categories_cache_ttl_secs,
+            ),
         }
     }
 
@@ -74,6 +83,10 @@ impl FireflyEndpoint {
     }
 
     fn request_payload<'a>(&'a self, tx: &'a CanonicalTransaction) -> Result<TransactionStore<'a>> {
+        if tx.amount.is_zero() {
+            anyhow::bail!("transaction amount must be nonzero");
+        }
+        crate::money::minor_units(tx.amount)?;
         let occurred_at = tx.occurred_at.to_rfc3339();
         let amount = format!("{:.2}", tx.amount.abs());
         let description = tx.narration.as_str();
@@ -148,7 +161,19 @@ impl TransactionEndpoint for FireflyEndpoint {
         "firefly"
     }
 
-    async fn fetch_categories(&self, client: &reqwest::Client) -> Result<Vec<String>> {
+    async fn fetch_categories(&self, client: &reqwest::Client) -> Result<FetchedCategories> {
+        if let Some(cache) = &self.categories_cache {
+            match cache.read() {
+                Ok(Some(categories)) => {
+                    return Ok(FetchedCategories {
+                        names: categories,
+                        request_count: 0,
+                    });
+                }
+                Ok(None) => {}
+                Err(_) => tracing::warn!("category cache unavailable; fetching from Firefly"),
+            }
+        }
         let mut categories = Vec::new();
         let mut page = 1u32;
 
@@ -184,7 +209,15 @@ impl TransactionEndpoint for FireflyEndpoint {
             page += 1;
         }
 
-        Ok(categories)
+        if let Some(cache) = &self.categories_cache
+            && cache.write(&categories).is_err()
+        {
+            tracing::warn!("category cache write failed; continuing with fresh categories");
+        }
+        Ok(FetchedCategories {
+            names: categories,
+            request_count: page as usize,
+        })
     }
 
     async fn post_transaction(
@@ -313,6 +346,9 @@ mod tests {
             asset_accounts: vec![],
             default_asset_account_id: None,
             currency_code: None,
+            transaction_timezone: chrono_tz::UTC,
+            categories_cache_ttl_secs: 0,
+            categories_cache_path: None,
             apply_rules: false,
             fire_webhooks: true,
             error_if_duplicate_hash: true,
@@ -321,10 +357,10 @@ mod tests {
 
     fn transaction(external_id: &str) -> CanonicalTransaction {
         CanonicalTransaction {
-            amount: 12.34,
+            amount: rust_decimal::Decimal::new(1234, 2),
             kind: TransactionKind::Withdrawal,
             narration: "Test purchase".to_string(),
-            occurred_at: Utc::now(),
+            occurred_at: Utc::now().fixed_offset(),
             asset_account_id: "42".to_string(),
             transfer_destination_account_id: None,
             tags: vec!["mailmux-mailtx".to_string()],
@@ -362,6 +398,9 @@ mod tests {
             asset_accounts: vec![],
             default_asset_account_id: None,
             currency_code: None,
+            transaction_timezone: chrono_tz::UTC,
+            categories_cache_ttl_secs: 0,
+            categories_cache_path: None,
             apply_rules: false,
             fire_webhooks: true,
             error_if_duplicate_hash: true,
@@ -390,5 +429,57 @@ mod tests {
         let json = serde_json::to_value(payload).unwrap();
         assert_eq!(json["transactions"][0]["external_id"], "mailmux:event:42");
         assert_eq!(json["error_if_duplicate_hash"], true);
+    }
+    #[tokio::test]
+    async fn categories_cache_survives_endpoint_restart_and_avoids_a_second_http_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 2048];
+            assert!(socket.read(&mut bytes).await.unwrap() > 0);
+            let body = r#"{"data":[{"attributes":{"name":"Food"}}],"meta":{"pagination":{"current_page":1,"total_pages":1}}}"#;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "cache hit made an HTTP request"
+            );
+        });
+        let root = std::env::temp_dir().join(format!(
+            "mailtx-cache-http-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("cache.sqlite");
+        let client = reqwest::Client::new();
+        for request_count in [1, 0] {
+            let mut instance = endpoint();
+            instance.base_url = format!("http://{address}/api");
+            instance.categories_cache = crate::category_cache::CategoryCache::new(
+                Some(path.to_str().unwrap()),
+                &instance.base_url,
+                "test-token",
+                300,
+            );
+            let categories = instance.fetch_categories(&client).await.unwrap();
+            assert_eq!(categories.names, vec!["Food"]);
+            assert_eq!(categories.request_count, request_count);
+        }
+        server.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn payload_keeps_large_decimal_amount_exact() {
+        let mut tx = transaction("money-exact");
+        tx.amount = rust_decimal::Decimal::from_str_exact("90071992547409.91").unwrap();
+        let instance = endpoint();
+        let payload = serde_json::to_value(instance.request_payload(&tx).unwrap()).unwrap();
+        assert_eq!(payload["transactions"][0]["amount"], "90071992547409.91");
     }
 }

@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use tracing::debug;
@@ -71,22 +71,6 @@ impl MessageStore {
         debug!(path = %path.display(), size = raw_bytes.len(), "saved raw message");
         Ok(path)
     }
-
-    /// Load a raw email message from disk.
-    #[allow(dead_code)]
-    pub async fn load(&self, path: &Path) -> Result<Vec<u8>> {
-        tokio::fs::read(path)
-            .await
-            .with_context(|| format!("reading message from: {}", path.display()))
-    }
-
-    /// Delete a raw email message from disk.
-    #[allow(dead_code)]
-    pub async fn delete(&self, path: &Path) -> Result<()> {
-        tokio::fs::remove_file(path)
-            .await
-            .with_context(|| format!("deleting message: {}", path.display()))
-    }
 }
 
 #[cfg(test)]
@@ -105,21 +89,8 @@ mod tests {
         assert!(path.exists());
         assert!(path.to_str().unwrap().ends_with("42.eml"));
 
-        let loaded = store.load(&path).await.unwrap();
+        let loaded = tokio::fs::read(&path).await.unwrap();
         assert_eq!(loaded, raw);
-    }
-
-    #[tokio::test]
-    async fn test_delete() {
-        let dir = TempDir::new().unwrap();
-        let store = MessageStore::new(dir.path().to_str().unwrap());
-
-        let raw = b"test message";
-        let path = store.save("acct1", "INBOX", 1, raw).await.unwrap();
-        assert!(path.exists());
-
-        store.delete(&path).await.unwrap();
-        assert!(!path.exists());
     }
 
     #[tokio::test]

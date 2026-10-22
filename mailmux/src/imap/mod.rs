@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
+use nonzero_ext::nonzero;
 use sqlx::PgPool;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +28,7 @@ pub struct AccountManager {
     pool: PgPool,
     store: Arc<MessageStore>,
     token: CancellationToken,
+    rate_limiter: Arc<DefaultDirectRateLimiter>,
 }
 
 impl AccountManager {
@@ -35,11 +38,15 @@ impl AccountManager {
         store: Arc<MessageStore>,
         token: CancellationToken,
     ) -> Self {
+        let rate =
+            std::num::NonZeroU32::new(account.rate_limit_per_second).unwrap_or(nonzero!(1u32));
+        let rate_limiter = Arc::new(RateLimiter::direct(Quota::per_second(rate)));
         Self {
             account: Arc::new(account),
             pool,
             store,
             token,
+            rate_limiter,
         }
     }
 
@@ -123,14 +130,19 @@ impl AccountManager {
         }
     }
 
-    fn spawn_watcher(&self, join_set: &mut JoinSet<()>, mailbox: String) {
-        let watcher = sync::MailboxWatcher::new(
+    fn watcher(&self, mailbox: String) -> sync::MailboxWatcher {
+        sync::MailboxWatcher::new(
             self.account.clone(),
-            mailbox.clone(),
+            mailbox,
             self.pool.clone(),
             self.store.clone(),
             self.token.clone(),
-        );
+            self.rate_limiter.clone(),
+        )
+    }
+
+    fn spawn_watcher(&self, join_set: &mut JoinSet<()>, mailbox: String) {
+        let watcher = self.watcher(mailbox.clone());
         let acct_id = self.account.id.clone();
 
         join_set.spawn(async move {

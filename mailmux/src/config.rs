@@ -64,7 +64,6 @@ fn default_max_connections() -> u32 {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct AccountConfig {
     pub id: String,
     #[serde(default = "default_enabled")]
@@ -80,8 +79,6 @@ pub struct AccountConfig {
     pub poll_interval_secs: u64,
     #[serde(default = "default_rate_limit")]
     pub rate_limit_per_second: u32,
-    #[serde(default = "default_account_max_connections")]
-    pub max_connections: u32,
     pub mailboxes: Vec<String>,
     pub initial_sync_max_messages: Option<u64>,
     pub initial_sync_start_date: Option<NaiveDate>,
@@ -111,10 +108,6 @@ fn default_poll_interval() -> u64 {
 
 fn default_rate_limit() -> u32 {
     5
-}
-
-fn default_account_max_connections() -> u32 {
-    2
 }
 
 fn default_imap_command_timeout() -> u64 {
@@ -323,6 +316,9 @@ impl Config {
             }
             if account.username.is_empty() {
                 bail!("account '{}': username must not be empty", account.id);
+            }
+            if account.rate_limit_per_second == 0 {
+                bail!("account rate_limit_per_second must be positive");
             }
             if account.mailboxes.is_empty() {
                 bail!(

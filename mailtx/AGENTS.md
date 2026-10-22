@@ -197,3 +197,10 @@ Tests exist for sender normalization, Firefly behavior, transfer state, and pipe
 - Integration-test the LLM and post modules with a mock HTTP server (e.g.
   `wiremock`)
 - Async tests use `#[tokio::test]`
+
+Transaction amounts are rust_decimal::Decimal, parsed from original JSON numeric
+text without f64 conversion. Integer minor-unit conversions are checked and
+sub-cent amounts are rejected. Bank date-only timestamps use transaction_timezone
+(default UTC), overridable per asset-account timezone, and preserve fixed offsets
+through pending transfer state. Category cache state is private, credential-scoped,
+TTL-bounded SQLite; FetchedCategories reports real request counts for metrics.

@@ -2,9 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use governor::{Quota, RateLimiter};
+use governor::DefaultDirectRateLimiter;
 use mail_parser::MessageParser;
-use nonzero_ext::nonzero;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -25,6 +24,7 @@ pub struct MailboxWatcher {
     pool: PgPool,
     store: Arc<MessageStore>,
     token: CancellationToken,
+    rate_limiter: Arc<DefaultDirectRateLimiter>,
 }
 
 impl MailboxWatcher {
@@ -34,6 +34,7 @@ impl MailboxWatcher {
         pool: PgPool,
         store: Arc<MessageStore>,
         token: CancellationToken,
+        rate_limiter: Arc<DefaultDirectRateLimiter>,
     ) -> Self {
         Self {
             account,
@@ -41,14 +42,12 @@ impl MailboxWatcher {
             pool,
             store,
             token,
+            rate_limiter,
         }
     }
 
     pub async fn run(&self) -> Result<()> {
-        let rate_limit = self.account.rate_limit_per_second.max(1);
-        let rate_limiter = Arc::new(RateLimiter::direct(Quota::per_second(
-            std::num::NonZeroU32::new(rate_limit).unwrap_or(nonzero!(1u32)),
-        )));
+        let rate_limiter = self.rate_limiter.clone();
 
         let poll_interval = Duration::from_secs(self.account.poll_interval_secs);
         let mut retry_attempt: u32 = 0;
@@ -106,13 +105,7 @@ impl MailboxWatcher {
     /// the connection is lost or shutdown is requested.
     async fn sync_and_idle_cycle(
         &self,
-        rate_limiter: &Arc<
-            RateLimiter<
-                governor::state::NotKeyed,
-                governor::state::InMemoryState,
-                governor::clock::DefaultClock,
-            >,
-        >,
+        rate_limiter: &Arc<DefaultDirectRateLimiter>,
         poll_interval: Duration,
     ) -> Result<()> {
         debug!(
@@ -122,7 +115,11 @@ impl MailboxWatcher {
         );
 
         let mut conn = ImapConnection::connect(&self.account).await?;
-        let (uid_validity, _exists) = conn.select(&self.mailbox).await?;
+        let (uid_validity, exists) = conn.select(&self.mailbox).await?;
+        debug!(
+            exists,
+            uid_validity, "selected mailbox; scanning UIDs to cover concurrent arrivals"
+        );
 
         let heartbeat_interval = self
             .account
@@ -198,17 +195,15 @@ impl MailboxWatcher {
     /// Polling fallback when IDLE is not available.
     async fn poll_cycle(
         &self,
-        rate_limiter: &Arc<
-            RateLimiter<
-                governor::state::NotKeyed,
-                governor::state::InMemoryState,
-                governor::clock::DefaultClock,
-            >,
-        >,
+        rate_limiter: &Arc<DefaultDirectRateLimiter>,
         poll_interval: Duration,
     ) -> Result<()> {
         let mut conn = ImapConnection::connect(&self.account).await?;
-        let (uid_validity, _exists) = conn.select(&self.mailbox).await?;
+        let (uid_validity, exists) = conn.select(&self.mailbox).await?;
+        debug!(
+            exists,
+            uid_validity, "selected mailbox; scanning UIDs to cover concurrent arrivals"
+        );
 
         self.do_incremental_sync(&mut conn, uid_validity, rate_limiter)
             .await?;
@@ -232,13 +227,7 @@ impl MailboxWatcher {
         &self,
         conn: &mut ImapConnection,
         uid_validity: u32,
-        rate_limiter: &Arc<
-            RateLimiter<
-                governor::state::NotKeyed,
-                governor::state::InMemoryState,
-                governor::clock::DefaultClock,
-            >,
-        >,
+        rate_limiter: &Arc<DefaultDirectRateLimiter>,
     ) -> Result<u64> {
         let stored_state =
             crate::db::emails::get_mailbox_state(&self.pool, &self.account.id, &self.mailbox)
@@ -256,7 +245,7 @@ impl MailboxWatcher {
                     );
                     0
                 } else {
-                    state.last_seen_uid as u32
+                    u32::try_from(state.last_seen_uid).context("invalid stored UID checkpoint")?
                 }
             }
             None => 0,
@@ -264,8 +253,12 @@ impl MailboxWatcher {
 
         // Step 1: UID-only scan to discover new message UIDs without
         // downloading bodies. This is cheap even for large mailboxes.
+        let Some(next_uid) = last_seen_uid.checked_add(1) else {
+            // UIDs cannot advance within this UIDVALIDITY generation.
+            return Ok(0);
+        };
         rate_limiter.until_ready().await;
-        let all_uids = conn.uid_fetch_uid_list(last_seen_uid + 1).await?;
+        let all_uids = conn.uid_fetch_uid_list(next_uid).await?;
 
         if all_uids.is_empty() {
             debug!(
@@ -309,7 +302,10 @@ impl MailboxWatcher {
             let skip = self
                 .account
                 .initial_sync_max_messages
-                .map(|max| uids.len().saturating_sub(max as usize))
+                .map(|max| {
+                    uids.len()
+                        .saturating_sub(usize::try_from(max).unwrap_or(usize::MAX))
+                })
                 .unwrap_or(0);
             uids[skip..].to_vec()
         } else {
@@ -485,5 +481,107 @@ impl MailboxWatcher {
                 Ok(0)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod account_limit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn peer_mailboxes_share_one_account_request_budget() {
+        let account: AccountConfig = toml::from_str(
+            r#"
+            id='test'
+            imap_host='localhost'
+            username='test'
+            password='test'
+            rate_limit_per_second=1
+            mailboxes=['INBOX','Archive']
+        "#,
+        )
+        .unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@localhost/unused")
+            .unwrap();
+        let manager = crate::imap::AccountManager::new(
+            account,
+            pool,
+            Arc::new(MessageStore::new("/unused")),
+            CancellationToken::new(),
+        );
+        let first = manager.watcher("INBOX".into());
+        let second = manager.watcher("Archive".into());
+        assert!(Arc::ptr_eq(&first.rate_limiter, &second.rate_limiter));
+        assert!(first.rate_limiter.check().is_ok());
+        assert!(second.rate_limiter.check().is_err());
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_boundary_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn maximum_uid_checkpoint_does_not_wrap_or_issue_another_fetch(
+        pool: PgPool,
+    ) -> Result<()> {
+        crate::db::emails::upsert_mailbox_state(&pool, "test", "INBOX", 123, i64::from(u32::MAX))
+            .await?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let account: AccountConfig = toml::from_str(&format!(
+            r#"
+            id='test'
+            imap_host='127.0.0.1'
+            imap_port={}
+            tls=false
+            username='test'
+            password='test'
+            mailboxes=['INBOX']
+        "#,
+            listener.local_addr()?.port()
+        ))?;
+        let server = tokio::spawn(async move {
+            let (peer, _) = listener.accept().await.unwrap();
+            let mut peer = BufReader::new(peer);
+            peer.write_all(b"* OK ready\r\n").await.unwrap();
+            let mut login = String::new();
+            peer.read_line(&mut login).await.unwrap();
+            let tag = login.split_whitespace().next().unwrap();
+            peer.write_all(format!("{tag} OK done\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut command = String::new();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), peer.read_line(&mut command))
+                    .await
+                    .is_err(),
+                "UID overflow generated a new command"
+            );
+        });
+        let mut connection = ImapConnection::connect(&account).await?;
+        let manager = crate::imap::AccountManager::new(
+            account,
+            pool.clone(),
+            Arc::new(MessageStore::new("/unused")),
+            CancellationToken::new(),
+        );
+        let watcher = manager.watcher("INBOX".into());
+        assert_eq!(
+            watcher
+                .do_incremental_sync(&mut connection, 123, &manager.rate_limiter)
+                .await?,
+            0
+        );
+        assert_eq!(
+            crate::db::emails::get_mailbox_state(&pool, "test", "INBOX")
+                .await?
+                .unwrap()
+                .last_seen_uid,
+            i64::from(u32::MAX)
+        );
+        server.await?;
+        Ok(())
     }
 }

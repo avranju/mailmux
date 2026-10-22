@@ -345,7 +345,8 @@ impl ImapConnection {
         .await
         .unwrap_or_else(|_| bail!("IMAP SELECT timed out after {}s", timeout.as_secs()))?;
 
-        let uid_validity = uid_validity.unwrap_or(0);
+        let uid_validity =
+            uid_validity.context("SELECT omitted required UIDVALIDITY; refusing to sync")?;
         Ok((uid_validity, exists))
     }
 
@@ -441,6 +442,10 @@ impl ImapConnection {
             }
         }
 
+        messages.retain(|message| {
+            message.uid >= uid_start && uid_end.is_none_or(|end| message.uid <= end)
+        });
+        messages.sort_unstable_by_key(|message| message.uid);
         Ok(messages)
     }
 
@@ -523,6 +528,8 @@ impl ImapConnection {
         // Guard against servers that normalise an inverted range (e.g. `101:*`
         // when `*`=100) and return UIDs below the requested start.
         uids.retain(|&uid| uid >= uid_start);
+        uids.sort_unstable();
+        uids.dedup();
 
         Ok(uids)
     }
@@ -578,6 +585,8 @@ impl ImapConnection {
             )
         })?;
 
+        uids.sort_unstable();
+        uids.dedup();
         Ok(uids)
     }
 
@@ -878,5 +887,94 @@ fn check_status(status: &Status, operation: &str) -> Result<()> {
         Status::Bye(bye) => {
             bail!("{operation}: server sent BYE: {}", bye.text)
         }
+    }
+}
+
+#[cfg(test)]
+mod uid_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    async fn pair() -> (ImapConnection, BufReader<TcpStream>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        let mut options = Options::default();
+        options.discard_greeting = true;
+        (
+            ImapConnection {
+                stream: Stream::insecure(client),
+                client: Client::new(options),
+                tag_counter: 0,
+                command_timeout: Duration::from_secs(1),
+            },
+            BufReader::new(peer),
+        )
+    }
+    async fn command(peer: &mut BufReader<TcpStream>, expected: &str, data: &str) {
+        let mut line = String::new();
+        peer.read_line(&mut line).await.unwrap();
+        assert!(line.contains(expected));
+        let tag = line.split_whitespace().next().unwrap();
+        peer.write_all(format!("{data}{tag} OK done\r\n").as_bytes())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn select_without_uidvalidity_is_rejected() {
+        let (mut connection, mut peer) = pair().await;
+        let server = tokio::spawn(async move {
+            command(&mut peer, " SELECT ", "* 5 EXISTS\r\n").await;
+        });
+        assert!(
+            connection
+                .select("INBOX")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("UIDVALIDITY")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetched_uids_are_sorted_and_deduplicated_and_unsolicited_bodies_are_excluded() {
+        let (mut connection, mut peer) = pair().await;
+        let server = tokio::spawn(async move {
+            command(&mut peer, " UID FETCH ", "* 1 FETCH (UID 3)\r\n* 2 FETCH (UID 1)\r\n* 3 FETCH (UID 2)\r\n* 4 FETCH (UID 3)\r\n").await;
+            let mut bodies = String::new();
+            for uid in [3, 1, 99, 2] {
+                let body = format!("Subject: {uid}\r\n\r\nBody");
+                bodies.push_str(&format!(
+                    "* {uid} FETCH (UID {uid} BODY[] {{{}}}\r\n{body})\r\n",
+                    body.len()
+                ));
+            }
+            command(&mut peer, " UID FETCH ", &bodies).await;
+            command(&mut peer, " UID SEARCH ", "* SEARCH 5 3 5\r\n").await;
+        });
+        assert_eq!(
+            connection.uid_fetch_uid_list(1).await.unwrap(),
+            vec![1, 2, 3]
+        );
+        let messages = connection.uid_fetch_range(1, Some(3)).await.unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.uid)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            connection
+                .uid_search_since(chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap())
+                .await
+                .unwrap(),
+            vec![3, 5]
+        );
+        server.await.unwrap();
     }
 }

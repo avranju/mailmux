@@ -166,7 +166,6 @@ username = "user@gmail.com"
 password = "${GMAIL_APP_PASSWORD}"
 poll_interval_secs = 60
 rate_limit_per_second = 5
-max_connections = 2
 mailboxes = ["INBOX"]
 initial_sync_max_messages = 1000
 idle_heartbeat_interval_secs = 600  # optional safety net; omit to disable
@@ -181,7 +180,6 @@ username = "user@company.com"
 password = "${WORK_PASSWORD}"
 poll_interval_secs = 120
 rate_limit_per_second = 3
-max_connections = 2
 mailboxes = ["INBOX", "Sent"]
 
 [[processors]]
@@ -218,8 +216,7 @@ env = { NOTIFY_TOKEN = "${NOTIFY_TOKEN}" }
 | `username`                  | _required_ | IMAP username                                                                                                             |
 | `password`                  | _required_ | IMAP password (supports `${VAR}`)                                                                                         |
 | `poll_interval_secs`        | `60`       | Polling interval when IDLE is unavailable                                                                                 |
-| `rate_limit_per_second`     | `5`        | Max IMAP fetches per second                                                                                               |
-| `max_connections`           | `2`        | Connection pool size for this account                                                                                     |
+| `rate_limit_per_second`     | `5`        | Max IMAP synchronization fetch/search requests per second across all mailboxes of this account                                                                                               |
 | `mailboxes`                 | _required_ | List of mailbox names to monitor                                                                                          |
 | `initial_sync_max_messages` | unlimited  | Cap on messages during first sync                                                                                         |
 | `initial_sync_start_date`   | (none)     | Only download messages on or after this date (e.g. `"2024-01-01"`) during first sync; uses IMAP UID SEARCH SINCE         |
@@ -560,3 +557,11 @@ Exported metrics:
 ## License
 
 [MIT](LICENSE)
+
+Per-account `max_connections` was removed: every configured mailbox owns one
+connection, and all mailboxes of an account share its synchronization request
+budget. `database.max_connections` still controls the PostgreSQL pool. UID
+responses are sorted defensively; missing UIDVALIDITY aborts sync, and a
+checkpoint at the maximum UID waits for a new UIDVALIDITY generation. SELECT
+message counts are included in diagnostics, without treating a changing
+EXISTS count as a completeness guarantee.

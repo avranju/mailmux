@@ -39,7 +39,8 @@ use openai_compatible::OpenAiCompatibleClient;
 #[serde(deny_unknown_fields)]
 pub struct TransactionData {
     pub status: String,
-    pub amount: Option<f64>,
+    #[serde(default, deserialize_with = "crate::money::deserialize_optional")]
+    pub amount: Option<rust_decimal::Decimal>,
     pub transaction_type: Option<String>,
     pub narration: Option<String>,
     pub transaction_date: Option<String>,
@@ -104,7 +105,7 @@ pub fn parse_transaction(text: &str) -> Result<TransactionData, String> {
         }
         "found" => {
             let a = tx.amount.ok_or("invalid_transaction")?;
-            if !a.is_finite() || a == 0.0 {
+            if a.is_zero() || crate::money::minor_units(a).is_err() {
                 return Err("invalid_transaction".into());
             }
             if !matches!(

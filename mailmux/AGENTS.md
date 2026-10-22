@@ -140,3 +140,8 @@ enabled and subscribed to `email_arrived`) over durable `emails` rows:
 - `sqlx` is used with compile-time query checking; the database must be available (or `DATABASE_URL` set) when running `sqlx` macros during a fresh build.
 - Systemd integration uses `sd-notify` (`Type=notify` in the service unit). See `contrib/mailmux.service`.
 - Task 4.4 (flag change + deletion detection) is the only deferred feature; all other planned phases are complete.
+
+AccountManager owns the shared synchronization RateLimiter for all its mailbox
+watchers. There is no account max_connections setting; the PostgreSQL pool's
+max_connections remains supported. UID lists and fetched messages are sorted,
+SELECT must supply UIDVALIDITY, and the maximum UID checkpoint must not wrap.

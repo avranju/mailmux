@@ -43,7 +43,6 @@ username = "user@gmail.com"
 password = "${GMAIL_APP_PASSWORD}"
 poll_interval_secs = 60
 rate_limit_per_second = 5
-max_connections = 2
 mailboxes = ["INBOX"]
 
 # Limit how far back the very first sync goes (optional)
@@ -75,7 +74,6 @@ initial_sync_max_messages = 1000
 # password = "${WORK_PASSWORD}"
 # poll_interval_secs = 120
 # rate_limit_per_second = 3
-# max_connections = 2
 # mailboxes = ["INBOX", "Sent"]
 
 # ---------------------------------------------------------------------------

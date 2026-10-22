@@ -6,6 +6,7 @@ use tracing::{info, warn};
 use crate::matcher::AccountMatcher;
 use crate::metrics::Metrics;
 
+mod category_cache;
 mod config;
 mod email;
 mod endpoint;
@@ -13,6 +14,7 @@ mod input;
 mod llm;
 mod matcher;
 mod metrics;
+mod money;
 mod transfer;
 
 #[tokio::main]
@@ -96,11 +98,11 @@ async fn run(m: &mut Metrics) -> Result<()> {
                 Ok(receipt) => {
                     warn!(
                         id = receipt.id.as_deref(),
-                        amount = expired.amount,
+                        amount = %expired.amount,
                         narration = expired.narration.as_str(),
                         "expired transfer leg flushed as unmatched transaction"
                     );
-                    store.delete(expired.id)?;
+                    store.delete_after_post(expired.id);
                     m.firefly_requests.push(("post_transaction", "success"));
                     m.transfers_expired += 1;
                 }
@@ -159,9 +161,15 @@ async fn run(m: &mut Metrics) -> Result<()> {
     // Fetch existing categories from Firefly so the LLM can reuse them.
     let categories = match endpoint.fetch_categories(&http_client).await {
         Ok(cats) => {
-            info!(count = cats.len(), "cached Firefly categories");
-            m.firefly_requests.push(("get_categories", "success"));
-            cats
+            info!(
+                count = cats.names.len(),
+                cache_hit = cats.request_count == 0,
+                "loaded Firefly categories"
+            );
+            for _ in 0..cats.request_count {
+                m.firefly_requests.push(("get_categories", "success"));
+            }
+            cats.names
         }
         Err(e) => {
             m.firefly_requests.push(("get_categories", "error"));
@@ -219,6 +227,9 @@ async fn run(m: &mut Metrics) -> Result<()> {
         email.date,
         category_name,
         Some(external_id.clone()),
+        resolved
+            .timezone
+            .unwrap_or(config.firefly.transaction_timezone),
     )?;
 
     // --- Transfer detection -------------------------------------------------
@@ -239,7 +250,7 @@ async fn run(m: &mut Metrics) -> Result<()> {
             )
         })?;
 
-        let amount_units = (canonical_tx.amount.abs() * 100.0).round() as i64;
+        let amount_units = money::minor_units(canonical_tx.amount)?;
 
         if let Some(pending) =
             store.find_match(&rule_match.rule_id, leg.opposite_str(), amount_units)?
@@ -253,14 +264,14 @@ async fn run(m: &mut Metrics) -> Result<()> {
             };
             match endpoint.post_transaction(&http_client, &transfer_tx).await {
                 Ok(receipt) => {
-                    store.delete(pending.id)?;
+                    store.delete_after_post(pending.id);
                     m.firefly_requests.push(("post_transaction", "success"));
                     m.transfers_coalesced += 1;
                     m.result = Some("transfer_coalesced");
                     m.firefly_transaction_id = receipt.id.clone();
                     info!(
                         endpoint_transaction_id = receipt.id.as_deref(),
-                        amount = transfer_tx.amount,
+                        amount = %transfer_tx.amount,
                         source_firefly_account_id = transfer_tx.asset_account_id.as_str(),
                         destination_firefly_account_id =
                             transfer_tx.transfer_destination_account_id.as_deref(),
@@ -293,7 +304,7 @@ async fn run(m: &mut Metrics) -> Result<()> {
                 info!(
                     rule_id = rule_match.rule_id.as_str(),
                     leg = leg.as_str(),
-                    amount = canonical_tx.amount,
+                    amount = %canonical_tx.amount,
                     narration = canonical_tx.narration.as_str(),
                     "first transfer leg stored, waiting for counterpart"
                 );
@@ -318,7 +329,7 @@ async fn run(m: &mut Metrics) -> Result<()> {
             info!(
                 endpoint = endpoint.name(),
                 endpoint_transaction_id = receipt.id.as_deref(),
-                amount = canonical_tx.amount,
+                amount = %canonical_tx.amount,
                 transaction_type = match canonical_tx.kind {
                     endpoint::TransactionKind::Deposit => "deposit",
                     endpoint::TransactionKind::Withdrawal => "withdrawal",

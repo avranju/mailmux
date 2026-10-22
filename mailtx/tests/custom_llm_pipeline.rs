@@ -178,6 +178,7 @@ allow_insecure_http = true
 [firefly]
 base_url = "{}/api"
 access_token = "firefly-secret-sentinel"
+categories_cache_ttl_secs = 0
 allow_insecure_http = true
 default_asset_account_id = "acct1"
 [[firefly.asset_accounts]]
@@ -423,5 +424,146 @@ fn timeout_has_one_safe_completion_log() {
     assert!(!stderr.contains("secret-sentinel"));
     assert_eq!(llm.finish().len(), 1);
     assert_eq!(ff.finish().len(), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn exact_decimal_and_bank_timezone_reach_the_firefly_payload() {
+    let root = root();
+    let llm = Fixture::start(1, |_| {
+        response(
+            r#"{"status":"found","amount":0.29,"transaction_type":"withdrawal","narration":"Market","transaction_date":"2026-01-05","category":"Food"}"#,
+        )
+    });
+    let ff = firefly(3);
+    let (config, eml) = setup_config(&root, &llm.url, &ff.url, "");
+    let text = fs::read_to_string(&config).unwrap().replace(
+        "firefly_account_id = \"acct1\"",
+        "firefly_account_id = \"acct1\"\ntimezone = \"Asia/Kolkata\"",
+    );
+    fs::write(&config, text).unwrap();
+    let output = run(&config, &eml, 101, &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(llm.finish().len(), 1);
+    let requests = ff.finish();
+    let post = requests
+        .iter()
+        .find(|request| request.starts_with("POST "))
+        .unwrap();
+    let payload: Value = serde_json::from_str(post.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(payload["transactions"][0]["amount"], "0.29");
+    assert_eq!(
+        payload["transactions"][0]["date"],
+        "2026-01-05T00:00:00+05:30"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn categories_cache_is_shared_across_real_mailtx_processes() {
+    let root = root();
+    let llm = Fixture::start(2, |_| response(r#"{"status":"not_found","amount":null}"#));
+    let ff = firefly(1);
+    let (config, eml) = setup_config(&root, &llm.url, &ff.url, "");
+    let cache = root.join("private-cache/categories.sqlite");
+    let text = fs::read_to_string(&config).unwrap().replace(
+        "categories_cache_ttl_secs = 0",
+        &format!(
+            "categories_cache_ttl_secs = 300\ncategories_cache_path = \"{}\"",
+            cache.display()
+        ),
+    );
+    fs::write(&config, text).unwrap();
+    for (id, expected_requests) in [(102, 1), (103, 0)] {
+        let output = run(&config, &eml, id, &[]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let requests = output["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|metric| metric["name"] == "firefly_requests_total")
+            .count();
+        assert_eq!(requests, expected_requests);
+    }
+    assert_eq!(llm.finish().len(), 2);
+    assert_eq!(ff.finish().len(), 1);
+    assert!(cache.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn invalid_allowed_sender_entry_is_reported_without_printing_its_value() {
+    let root = root();
+    let llm = Fixture::start(1, |_| response(r#"{"status":"not_found","amount":null}"#));
+    let ff = firefly(1);
+    let (config, eml) = setup_config(&root, &llm.url, &ff.url, "");
+    let text = fs::read_to_string(&config).unwrap().replace(
+        "allowed_senders = [\"allowed@example.test\"]",
+        "allowed_senders = [\"allowed@example.test\",\"private-invalid-sender\"]",
+    );
+    fs::write(&config, text).unwrap();
+    let output = run(&config, &eml, 104, &[]);
+    assert!(output.status.success());
+    let logs = String::from_utf8_lossy(&output.stderr);
+    assert!(logs.contains("invalid allowed_senders entry ignored"));
+    assert!(!logs.contains("private-invalid-sender"));
+    assert_eq!(llm.finish().len(), 1);
+    assert_eq!(ff.finish().len(), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn successful_transfer_survives_cleanup_failure_and_replay_does_not_post_again() {
+    let root = root();
+    let llm = Fixture::start(2, |_| {
+        response(
+            r#"{"status":"found","amount":12.34,"transaction_type":"withdrawal","narration":"transfer","transaction_date":"2026-01-05","category":"Food"}"#,
+        )
+    });
+    let ff = firefly(5);
+    let (config, eml) = setup_config(&root, &llm.url, &ff.url, "");
+    let state = root.join("pending.sqlite");
+    let mut text = fs::read_to_string(&config).unwrap().replace("tag = \"mailtx-test-tag\"", &format!("tag = \"mailtx-test-tag\"\nstate_db = \"{}\"\ntransfer_rules = [{{source_account='default',destination_account='other'}}]",state.display()));
+    text.push_str("\n[[firefly.asset_accounts]]\nid='other'\nfirefly_account_id='acct2'\n");
+    fs::write(&config, text).unwrap();
+    let db = rusqlite::Connection::open(&state).unwrap();
+    db.execute_batch("CREATE TABLE pending_transfers(id INTEGER PRIMARY KEY,rule_id TEXT,leg TEXT,amount_units INTEGER,narration TEXT,category TEXT,source_firefly_id TEXT,destination_firefly_id TEXT,occurred_at TEXT,inserted_at INTEGER,tags TEXT,external_id TEXT); CREATE TRIGGER reject_delete BEFORE DELETE ON pending_transfers BEGIN SELECT RAISE(FAIL,'injected cleanup failure'); END;").unwrap();
+    db.execute("INSERT INTO pending_transfers VALUES (1,'default:other','deposit',1234,'transfer',NULL,'acct1','acct2','2026-01-05T00:00:00+00:00',?1,'[]','old-event')",[chrono::Utc::now().timestamp()]).unwrap();
+    for _ in 0..2 {
+        let output = run(&config, &eml, 105, &[]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["metadata"]["outcome"], "transfer_coalesced");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("posted transfer cleanup failed"));
+    }
+    assert_eq!(llm.finish().len(), 2);
+    let requests = ff.finish();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.starts_with("POST "))
+            .count(),
+        1
+    );
+    let count: i64 = db
+        .query_row("SELECT count(*) FROM pending_transfers", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1);
+    drop(db);
     fs::remove_dir_all(root).unwrap();
 }

@@ -18,9 +18,13 @@ reqwest = { version = "0.13", default-features = false, features = [
   "rustls",
 ] }
 regex = "1"
+rust_decimal = { version = "1.43", default-features = false, features = ["std"] }
+chrono-tz = { version = "0.10", features = ["serde"] }
+sha2 = "0.10"
+libc = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["arbitrary_precision", "raw_value"] }
 toml = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 tracing = "0.1"

@@ -453,3 +453,39 @@ echo '{"event":{"id":1},"email":{"subject":"Test","sender":"alerts@mybank.com","
     ANTHROPIC_API_KEY=sk-ant-... \
     ./target/debug/mailtx
 ```
+
+### Amounts, booking dates, and category caching
+
+Amounts use decimal arithmetic from LLM JSON through Firefly posting. Transfer
+state retains checked integer minor units. Zero, out-of-range, and sub-cent
+amounts are rejected rather than silently rounded. Existing SQLite amounts
+remain compatible. Cleanup failures after a successful transfer POST emit a
+warning and preserve success; stable external IDs protect replayed posts.
+Legacy expired legs without an external ID receive a stable ID derived from
+persistent store identity and row ID.
+
+Date-only transactions use an IANA bank timezone and retain its offset in the
+Firefly payload. Configure a global default and optional account overrides:
+
+```toml
+[firefly]
+transaction_timezone = "Asia/Kolkata" # default: UTC
+categories_cache_ttl_secs = 300       # 0 disables; maximum 3600
+# Optional persistent path; the parent directory must be private to this user.
+# categories_cache_path = "/var/lib/mailtx/private-cache/categories.sqlite"
+
+[[firefly.asset_accounts]]
+id = "usd-account"
+firefly_account_id = "42"
+timezone = "America/New_York"
+```
+
+Explicit RFC3339 offsets are preserved. A nonexistent or ambiguous local date
+is rejected. Category results are cached across mailtx invocations for five
+minutes by default, isolated by Firefly URL and a digest of its access token;
+the token itself is not stored. On Unix, the default cache lives in a private
+user-owned directory under the system temporary directory. The cache is
+bounded to 64 endpoint/token entries of at most 1 MiB each. Expired or failed
+cache reads fetch fresh data, and cache write errors do not fail the email.
+Transfer account references are validated at startup, and invalid sender-list
+entries emit a warning identifying their index.

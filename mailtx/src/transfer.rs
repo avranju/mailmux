@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 use rusqlite::{Connection, params};
+use rust_decimal::Decimal;
 
 use crate::config::Config;
 
@@ -123,7 +124,7 @@ pub struct InsertLeg<'a> {
     pub category: Option<&'a str>,
     pub source_firefly_id: &'a str,
     pub destination_firefly_id: &'a str,
-    pub occurred_at: &'a DateTime<Utc>,
+    pub occurred_at: &'a DateTime<FixedOffset>,
     pub tags: &'a [String],
     /// Stable mailmux event ID used if this leg is later flushed unmatched.
     pub external_id: Option<&'a str>,
@@ -134,12 +135,12 @@ pub struct InsertLeg<'a> {
 pub struct ExpiredLeg {
     pub id: i64,
     pub leg: Leg,
-    pub amount: f64,
+    pub amount: Decimal,
     pub narration: String,
     pub category: Option<String>,
     pub source_firefly_id: String,
     pub destination_firefly_id: String,
-    pub occurred_at: DateTime<Utc>,
+    pub occurred_at: DateTime<FixedOffset>,
     pub tags: Vec<String>,
     pub external_id: Option<String>,
 }
@@ -147,10 +148,19 @@ pub struct ExpiredLeg {
 pub struct PendingStore {
     conn: Connection,
     window_secs: i64,
+    identity: String,
+}
+
+pub fn window_seconds(hours: u64) -> Result<i64> {
+    hours
+        .checked_mul(3600)
+        .and_then(|seconds| i64::try_from(seconds).ok())
+        .ok_or_else(|| anyhow::anyhow!("transfer match window exceeds supported duration"))
 }
 
 impl PendingStore {
     pub fn open(path: &str, window_hours: u64) -> Result<Self> {
+        let window_secs = window_seconds(window_hours)?;
         let conn =
             Connection::open(path).with_context(|| format!("opening transfer state DB: {path}"))?;
         conn.execute_batch(
@@ -190,14 +200,21 @@ impl PendingStore {
              ON pending_transfers(external_id) WHERE external_id IS NOT NULL;",
         )
         .context("creating pending transfer external-ID index")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS mailtx_state_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT OR IGNORE INTO mailtx_state_metadata(key,value) VALUES ('transfer-store-id',lower(hex(randomblob(16))));")?;
+        let identity: String = conn.query_row(
+            "SELECT value FROM mailtx_state_metadata WHERE key='transfer-store-id'",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(Self {
             conn,
-            window_secs: (window_hours * 3600) as i64,
+            window_secs,
+            identity,
         })
     }
 
     fn cutoff_unix(&self) -> i64 {
-        Utc::now().timestamp() - self.window_secs
+        Utc::now().timestamp().saturating_sub(self.window_secs)
     }
 
     /// Return all legs whose `inserted_at` is older than the window.
@@ -250,20 +267,20 @@ impl PendingStore {
                 Leg::Deposit
             };
             let occurred_at = DateTime::parse_from_rfc3339(&occurred_at_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
+                .context("invalid stored transfer date")?;
             let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
             out.push(ExpiredLeg {
                 id,
                 leg,
-                amount: amount_units as f64 / 100.0,
+                amount: Decimal::new(amount_units, 2),
                 narration,
                 category,
                 source_firefly_id: src,
                 destination_firefly_id: dst,
                 occurred_at,
                 tags,
-                external_id,
+                external_id: external_id
+                    .or_else(|| Some(format!("mailtx:pending:{}:{id}", self.identity))),
             });
         }
         Ok(out)
@@ -275,6 +292,13 @@ impl PendingStore {
             .execute("DELETE FROM pending_transfers WHERE id = ?1", params![id])
             .context("deleting pending transfer leg")?;
         Ok(())
+    }
+
+    /// A successful external POST remains successful if local cleanup fails.
+    pub fn delete_after_post(&self, id: i64) {
+        if let Err(error) = self.delete(id) {
+            tracing::warn!(pending_id = id, %error, "posted transfer cleanup failed; downstream external ID protects retries");
+        }
     }
 
     /// Find the oldest pending counterpart leg for this rule and amount that
@@ -350,13 +374,13 @@ mod tests {
             category: None,
             source_firefly_id: "1",
             destination_firefly_id: "2",
-            occurred_at: &Utc::now(),
+            occurred_at: &Utc::now().fixed_offset(),
             tags: &tags,
             external_id: Some("mailmux:event:42"),
         };
         assert!(store.insert(args).unwrap());
 
-        let occurred_at = Utc::now();
+        let occurred_at = Utc::now().fixed_offset();
         assert!(
             !store
                 .insert(InsertLeg {
@@ -373,5 +397,72 @@ mod tests {
                 })
                 .unwrap()
         );
+    }
+    #[test]
+    fn transfer_window_overflow_and_failed_cleanup_are_safe() {
+        assert!(PendingStore::open(":memory:", u64::MAX).is_err());
+        assert!(super::window_seconds((i64::MAX as u64 / 3600) + 1).is_err());
+        let store = PendingStore::open(":memory:", 48).unwrap();
+        store
+            .insert(InsertLeg {
+                rule_id: "test",
+                leg: &Leg::Withdrawal,
+                amount_units: 9_007_199_254_740_991,
+                narration: "transfer",
+                category: None,
+                source_firefly_id: "1",
+                destination_firefly_id: "2",
+                occurred_at: &Utc::now().fixed_offset(),
+                tags: &[],
+                external_id: Some("event:original"),
+            })
+            .unwrap();
+        store.conn.execute_batch("UPDATE pending_transfers SET inserted_at=0; CREATE TRIGGER reject_delete BEFORE DELETE ON pending_transfers BEGIN SELECT RAISE(FAIL,'injected cleanup failure'); END;").unwrap();
+        let expired = store.drain_expired().unwrap();
+        assert_eq!(expired[0].amount.to_string(), "90071992547409.91");
+        store.delete_after_post(expired[0].id);
+        assert_eq!(store.drain_expired().unwrap().len(), 1);
+    }
+    #[test]
+    fn legacy_expired_leg_gets_a_stable_identity_across_database_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "mailtx-legacy-transfer-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = PendingStore::open(path.to_str().unwrap(), 48).unwrap();
+        store
+            .insert(InsertLeg {
+                rule_id: "legacy",
+                leg: &Leg::Withdrawal,
+                amount_units: 29,
+                narration: "legacy",
+                category: None,
+                source_firefly_id: "1",
+                destination_firefly_id: "2",
+                occurred_at: &Utc::now().fixed_offset(),
+                tags: &[],
+                external_id: None,
+            })
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE pending_transfers SET inserted_at=0", [])
+            .unwrap();
+        let first = store.drain_expired().unwrap()[0]
+            .external_id
+            .clone()
+            .unwrap();
+        drop(store);
+        let reopened = PendingStore::open(path.to_str().unwrap(), 48).unwrap();
+        assert_eq!(
+            reopened.drain_expired().unwrap()[0].external_id.as_deref(),
+            Some(first.as_str())
+        );
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
     }
 }

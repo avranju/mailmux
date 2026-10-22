@@ -9,6 +9,7 @@ pub struct MatchedAssetAccount {
     pub firefly_account_id: String,
     pub method: &'static str,
     pub matched_value: Option<String>,
+    pub timezone: Option<chrono_tz::Tz>,
 }
 
 pub trait AccountMatcher: Send + Sync {
@@ -91,6 +92,11 @@ impl AccountMatcher for DeterministicAccountMatcher {
                 firefly_account_id: default_id.clone(),
                 method: "default_fallback",
                 matched_value: None,
+                timezone: self
+                    .accounts
+                    .iter()
+                    .find(|a| &a.firefly_account_id == default_id)
+                    .and_then(|a| a.timezone),
             });
         }
 
@@ -105,12 +111,14 @@ struct NormalizedAccount {
     account_suffixes: Vec<String>,
     debit_card_last4: Vec<String>,
     aliases: Vec<String>,
+    timezone: Option<chrono_tz::Tz>,
 }
 
 impl NormalizedAccount {
     fn from_config(config: &FireflyAssetAccountConfig) -> Self {
         Self {
             id: config.id.trim().to_string(),
+            timezone: config.timezone,
             firefly_account_id: config.firefly_account_id.trim().to_string(),
             account_suffixes: config
                 .account_suffixes
@@ -149,6 +157,7 @@ impl NormalizedAccount {
             firefly_account_id: self.firefly_account_id.clone(),
             method,
             matched_value,
+            timezone: self.timezone,
         }
     }
 }
@@ -170,6 +179,7 @@ mod tests {
                     firefly_account_id: "12".to_string(),
                     account_suffixes: vec!["9772".to_string()],
                     debit_card_last4: vec!["7406".to_string()],
+                    timezone: None,
                     aliases: vec!["hdfc savings".to_string()],
                 },
                 FireflyAssetAccountConfig {
@@ -177,6 +187,7 @@ mod tests {
                     firefly_account_id: "42".to_string(),
                     account_suffixes: vec!["3989".to_string()],
                     debit_card_last4: vec![],
+                    timezone: None,
                     aliases: vec!["sbm bank".to_string()],
                 },
             ],

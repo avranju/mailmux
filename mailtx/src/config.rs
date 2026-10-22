@@ -268,6 +268,11 @@ pub struct FireflyConfig {
     pub default_asset_account_id: Option<String>,
     /// Optional transaction currency code (e.g. "USD", "EUR").
     pub currency_code: Option<String>,
+    #[serde(default = "default_transaction_timezone")]
+    pub transaction_timezone: chrono_tz::Tz,
+    #[serde(default = "default_categories_cache_ttl")]
+    pub categories_cache_ttl_secs: u32,
+    pub categories_cache_path: Option<String>,
     /// Whether Firefly should apply rules for the new transaction.
     #[serde(default)]
     pub apply_rules: bool,
@@ -277,6 +282,14 @@ pub struct FireflyConfig {
     /// Whether Firefly should reject duplicate transaction hashes. Defaults to true.
     #[serde(default = "default_error_if_duplicate_hash")]
     pub error_if_duplicate_hash: bool,
+}
+
+fn default_categories_cache_ttl() -> u32 {
+    300
+}
+
+fn default_transaction_timezone() -> chrono_tz::Tz {
+    chrono_tz::UTC
 }
 
 fn default_fire_webhooks() -> bool {
@@ -302,6 +315,8 @@ pub struct FireflyAssetAccountConfig {
     /// Optional free-text aliases for fuzzy-ish deterministic name matching.
     #[serde(default)]
     pub aliases: Vec<String>,
+    #[serde(default)]
+    pub timezone: Option<chrono_tz::Tz>,
 }
 
 impl Config {
@@ -324,7 +339,14 @@ impl Config {
         config.allowed_senders = config
             .allowed_senders
             .into_iter()
-            .filter_map(|s| normalize_sender_address(&s))
+            .enumerate()
+            .filter_map(|(index, sender)| {
+                let normalized = normalize_sender_address(&sender);
+                if normalized.is_none() {
+                    warn!(entry_index = index, "invalid allowed_senders entry ignored");
+                }
+                normalized
+            })
             .collect();
 
         // Validate and normalize firefly.base_url at startup.
@@ -336,6 +358,11 @@ impl Config {
             anyhow::bail!("firefly.asset_accounts must contain at least one entry");
         }
 
+        if config.firefly.categories_cache_ttl_secs > 3600 {
+            anyhow::bail!("categories_cache_ttl_secs must be at most 3600");
+        }
+        config.validate_transfer_rules()?;
+        crate::transfer::window_seconds(config.transfer_match_window_hours)?;
         if !config.transfer_rules.is_empty() && config.state_db.is_none() {
             anyhow::bail!(
                 "transfer_rules are configured but state_db is not set; \
@@ -344,6 +371,27 @@ impl Config {
         }
 
         Ok(config)
+    }
+
+    fn validate_transfer_rules(&self) -> Result<()> {
+        let mut ids = std::collections::HashSet::new();
+        for account in &self.firefly.asset_accounts {
+            if account.id.trim().is_empty()
+                || account.firefly_account_id.trim().is_empty()
+                || !ids.insert(&account.id)
+            {
+                anyhow::bail!("asset account identifiers must be nonempty and unique");
+            }
+        }
+        for rule in &self.transfer_rules {
+            if !ids.contains(&rule.source_account) || !ids.contains(&rule.destination_account) {
+                anyhow::bail!("transfer rule references an unknown asset account");
+            }
+            if rule.source_account == rule.destination_account {
+                anyhow::bail!("transfer rule accounts must differ");
+            }
+        }
+        Ok(())
     }
 
     pub fn resolve_llm(&self) -> Result<ResolvedLlmConfig> {
@@ -630,6 +678,9 @@ error_if_duplicate_hash = false"#,
                 asset_accounts: vec![],
                 default_asset_account_id: None,
                 currency_code: None,
+                transaction_timezone: chrono_tz::UTC,
+                categories_cache_ttl_secs: 0,
+                categories_cache_path: None,
                 apply_rules: false,
                 fire_webhooks: true,
                 error_if_duplicate_hash: false,
@@ -638,6 +689,24 @@ error_if_duplicate_hash = false"#,
             transfer_match_window_hours: 48,
             transfer_rules: vec![],
         }
+    }
+
+    #[test]
+    fn transfer_rules_reject_missing_account_references_at_startup() {
+        let mut config = test_config(vec![]);
+        config.transfer_rules.push(super::TransferRule {
+            source_account: "missing".into(),
+            destination_account: "also-missing".into(),
+            withdrawal_keywords: vec![],
+            deposit_keywords: vec![],
+        });
+        assert!(
+            config
+                .validate_transfer_rules()
+                .unwrap_err()
+                .to_string()
+                .contains("unknown asset account")
+        );
     }
 
     #[test]
@@ -783,6 +852,9 @@ base_url = "https://llm.example/prefix""#,
             asset_accounts: vec![],
             default_asset_account_id: None,
             currency_code: None,
+            transaction_timezone: chrono_tz::UTC,
+            categories_cache_ttl_secs: 0,
+            categories_cache_path: None,
             apply_rules: false,
             fire_webhooks: true,
             error_if_duplicate_hash: false,
