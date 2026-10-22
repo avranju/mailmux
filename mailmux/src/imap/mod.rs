@@ -1,23 +1,17 @@
 pub mod connection;
 pub mod sync;
 
-use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use sqlx::PgPool;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::info;
 
 use crate::config::AccountConfig;
 use crate::store::MessageStore;
-
-const CIRCUIT_BREAKER_FAILURES: usize = 10;
-const CIRCUIT_BREAKER_WINDOW: Duration = Duration::from_secs(300); // 5 minutes
-const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(900); // 15 minutes
-const RESTART_DELAY: Duration = Duration::from_secs(5);
 
 /// Manages all IMAP tasks for a single account.
 /// Supervises watchers and restarts them on failure.
@@ -43,12 +37,21 @@ impl AccountManager {
         }
     }
 
-    pub async fn run(self) -> Result<()> {
+    pub async fn run_supervised(&self) {
+        crate::supervision::supervise(
+            "account manager",
+            &self.token,
+            crate::supervision::RestartPolicy::default(),
+            || self.run(),
+        )
+        .await;
+    }
+
+    async fn run(&self) -> Result<()> {
         let account_id = &self.account.id;
         info!(account = account_id, "starting account manager");
 
         let mut join_set = JoinSet::new();
-        let mut failure_times: VecDeque<Instant> = VecDeque::new();
 
         // Report monitored mailboxes
         crate::metrics::set_mailboxes_monitored(account_id, self.account.mailboxes.len() as f64);
@@ -58,68 +61,22 @@ impl AccountManager {
             self.spawn_watcher(&mut join_set, mailbox.clone());
         }
 
-        // Monitor and restart failed watchers
-        loop {
-            tokio::select! {
+        // Watcher supervisors run until cancellation or an unexpected exit.
+        tokio::select! {
                 _ = self.token.cancelled() => {
                     info!(account = account_id, "account manager shutting down");
                     join_set.abort_all();
                     while join_set.join_next().await.is_some() {}
-                    return Ok(());
+                    Ok(())
                 }
 
                 result = join_set.join_next() => {
-                    match result {
-                        Some(Ok(())) => {
-                            // A watcher exited cleanly
-                        }
-                        Some(Err(e)) => {
-                            warn!(account = account_id, error = %e, "watcher task panicked");
-
-                            // Track failure for circuit breaker
-                            let now = Instant::now();
-                            failure_times.push_back(now);
-
-                            // Remove failures outside the window
-                            while failure_times.front().is_some_and(|t| now.duration_since(*t) > CIRCUIT_BREAKER_WINDOW) {
-                                failure_times.pop_front();
-                            }
-
-                            // Check circuit breaker
-                            if failure_times.len() >= CIRCUIT_BREAKER_FAILURES {
-                                warn!(
-                                    account = account_id,
-                                    failures = failure_times.len(),
-                                    cooldown_secs = CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                                    "circuit breaker triggered, entering cooldown"
-                                );
-                                failure_times.clear();
-
-                                tokio::select! {
-                                    _ = tokio::time::sleep(CIRCUIT_BREAKER_COOLDOWN) => {}
-                                    _ = self.token.cancelled() => return Ok(()),
-                                }
-                            }
-                        }
-                        None => {
-                            // All watchers have exited — restart them
-                            if self.token.is_cancelled() {
-                                return Ok(());
-                            }
-
-                            warn!(account = account_id, "all watchers exited, restarting after delay");
-                            tokio::select! {
-                                _ = tokio::time::sleep(RESTART_DELAY) => {}
-                                _ = self.token.cancelled() => return Ok(()),
-                            }
-
-                            for mailbox in &self.account.mailboxes {
-                                self.spawn_watcher(&mut join_set, mailbox.clone());
-                            }
-                        }
-                    }
+                    // Watchers have their own restart loops. An exit here is
+                    // a failure of supervision itself: restart this manager,
+                    // dropping its JoinSet so no old watchers survive.
+                    if self.token.is_cancelled() { return Ok(()); }
+                    anyhow::bail!("supervised watcher terminated unexpectedly: {result:?}");
                 }
-            }
         }
     }
 
@@ -131,17 +88,15 @@ impl AccountManager {
             self.store.clone(),
             self.token.clone(),
         );
-        let acct_id = self.account.id.clone();
-
+        let token = self.token.clone();
         join_set.spawn(async move {
-            if let Err(e) = watcher.run().await {
-                error!(
-                    account = acct_id,
-                    mailbox = mailbox,
-                    error = %e,
-                    "mailbox watcher failed"
-                );
-            }
+            crate::supervision::supervise(
+                "mailbox watcher",
+                &token,
+                crate::supervision::RestartPolicy::default(),
+                || watcher.run(),
+            )
+            .await;
         });
     }
 }

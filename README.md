@@ -560,3 +560,9 @@ Exported metrics:
 ## License
 
 [MIT](LICENSE)
+
+Each mailbox watcher and account manager has an independent restart loop.
+Errors, panics, and unexpected clean exits trigger a five-second restart delay.
+Ten failures within five minutes trigger a 15-minute cooldown for that task.
+A failed watcher restarts without interrupting healthy peer mailboxes; shutdown
+cancels restart delays and cooldowns.
