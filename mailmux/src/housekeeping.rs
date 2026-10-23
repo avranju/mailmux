@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
@@ -33,6 +33,8 @@ pub async fn run_event_cleanup(
 }
 
 pub(crate) async fn cleanup_old_events(pool: &PgPool, retention_days: u64) -> Result<()> {
+    let retention_days = i32::try_from(retention_days)
+        .context("event retention days exceed PostgreSQL interval range")?;
     let mut tx = pool.begin().await?;
 
     // Lock eligible events so a concurrent job insert (which takes a key-share
@@ -41,7 +43,7 @@ pub(crate) async fn cleanup_old_events(pool: &PgPool, retention_days: u64) -> Re
         r#"
         SELECT e.id
         FROM events e
-        WHERE e.created_at < now() - ($1 || ' days')::interval
+        WHERE e.created_at < now() - make_interval(days => $1)
         AND e.dispatched_at IS NOT NULL
         AND NOT EXISTS (
             SELECT 1 FROM processor_jobs pj
@@ -51,7 +53,7 @@ pub(crate) async fn cleanup_old_events(pool: &PgPool, retention_days: u64) -> Re
         FOR UPDATE OF e
         "#,
     )
-    .bind(retention_days as i64)
+    .bind(retention_days)
     .fetch_all(&mut *tx)
     .await?;
 
@@ -137,6 +139,31 @@ mod tests {
         .bind(status)
         .execute(pool)
         .await?;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn retention_interval_is_typed_and_overflow_cannot_delete_events(
+        pool: PgPool,
+    ) -> Result<()> {
+        let recent = create_event(&pool, 29).await?;
+        let old = create_event(&pool, 31).await?;
+        assert!(cleanup_old_events(&pool, u64::MAX).await.is_err());
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM events ORDER BY id")
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(ids, vec![recent, old]);
+        cleanup_old_events(&pool, 30).await?;
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM events ORDER BY id")
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(ids, vec![recent]);
+        cleanup_old_events(&pool, 0).await?;
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM events")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(count, 0);
         Ok(())
     }
 
