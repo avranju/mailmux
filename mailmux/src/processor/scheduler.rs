@@ -1485,4 +1485,70 @@ exit 1
             Some("post_transaction")
         );
     }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn retry_schedule_honors_future_deadline_clamps_backoff_and_abandons(
+        pool: PgPool,
+    ) -> Result<()> {
+        let id = create_scheduler_test_event(&pool).await?;
+        let registry = Arc::new(ProcessorRegistry::for_tests(vec![Box::new(
+            TestProcessor {
+                name: "retry-probe".into(),
+                events: vec!["email_arrived".into()],
+                output: ProcessorOutput {
+                    success: false,
+                    message: Some("retryable".into()),
+                    metadata: None,
+                    metrics: vec![],
+                },
+            },
+        )]));
+        let scheduler = JobScheduler::new(
+            pool.clone(),
+            registry,
+            tokio::sync::mpsc::channel(1).1,
+            CancellationToken::new(),
+            vec![test_processor_config("retry-probe", 4, vec![2, 5])],
+        );
+        let event = crate::db::events::get_event_by_id(&pool, id)
+            .await?
+            .unwrap();
+        let mut before = chrono::Utc::now();
+        scheduler.process_events(vec![event]).await;
+        for (attempt, delay) in [(1, Some(2)), (2, Some(5)), (3, Some(5)), (4, None)] {
+            let job = jobs::get_job_by_event_and_processor(&pool, id, "retry-probe")
+                .await?
+                .unwrap();
+            assert_eq!(job.attempts, attempt);
+            if let Some(delay) = delay {
+                assert_eq!(job.status, "failed");
+                let next = job.next_retry_at.unwrap();
+                assert!(next >= before + chrono::Duration::seconds(delay));
+                assert!(next <= chrono::Utc::now() + chrono::Duration::seconds(delay));
+                scheduler.retry_sweep().await;
+                assert_eq!(
+                    jobs::get_job_by_id(&pool, job.id).await?.unwrap().attempts,
+                    attempt,
+                    "future job ran too early"
+                );
+                sqlx::query(
+                    "UPDATE processor_jobs SET next_retry_at=now()-interval '1 second' WHERE id=$1",
+                )
+                .bind(job.id)
+                .execute(&pool)
+                .await?;
+                before = chrono::Utc::now();
+                scheduler.retry_sweep().await;
+            } else {
+                assert_eq!(job.status, "abandoned");
+                assert!(job.next_retry_at.is_none());
+                scheduler.retry_sweep().await;
+                assert_eq!(
+                    jobs::get_job_by_id(&pool, job.id).await?.unwrap().attempts,
+                    4
+                );
+            }
+        }
+        Ok(())
+    }
 }

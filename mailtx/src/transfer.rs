@@ -328,7 +328,7 @@ impl PendingStore {
             "SELECT id
              FROM pending_transfers
              WHERE rule_id = ?1 AND leg = ?2 AND amount_units = ?3 AND inserted_at >= ?4 AND currency_code IS ?5
-             ORDER BY inserted_at ASC
+             ORDER BY inserted_at ASC, id ASC
              LIMIT 1",
             params![rule_id, opposite_leg, amount_units, cutoff, currency_code],
             |row| Ok(PendingLeg { id: row.get(0)? }),
@@ -528,5 +528,79 @@ mod tests {
             store.drain_expired().unwrap()[0].currency_code.as_deref(),
             Some("USD")
         );
+    }
+    #[test]
+    fn pending_lifecycle_is_fifo_durable_and_expiry_is_non_destructive() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pending.sqlite");
+        let path = path.to_str().unwrap();
+        let store = PendingStore::open(path, 1).unwrap();
+        for external_id in ["old", "new", "expired"] {
+            store
+                .insert(InsertLeg {
+                    rule_id: "route",
+                    leg: &Leg::Withdrawal,
+                    amount_units: 1234,
+                    currency_code: Some("INR"),
+                    narration: external_id,
+                    category: Some("Transfer"),
+                    source_firefly_id: "1",
+                    destination_firefly_id: "2",
+                    occurred_at: &Utc::now().fixed_offset(),
+                    tags: &["source".into()],
+                    external_id: Some(external_id),
+                })
+                .unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE pending_transfers SET inserted_at=0 WHERE external_id='expired'",
+                [],
+            )
+            .unwrap();
+        let expired_id = store.drain_expired().unwrap()[0].id;
+        assert_eq!(
+            store.drain_expired().unwrap()[0].id,
+            expired_id,
+            "read must not delete before post"
+        );
+        let first = store
+            .find_match("route", "withdrawal", 1234, Some("INR"))
+            .unwrap()
+            .unwrap()
+            .id;
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT external_id FROM pending_transfers WHERE id=?1",
+                    [first],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "old"
+        );
+        store.delete(first).unwrap();
+        drop(store);
+        let reopened = PendingStore::open(path, 1).unwrap();
+        assert!(
+            reopened
+                .find_match("route", "deposit", 1234, Some("INR"))
+                .unwrap()
+                .is_none()
+        );
+        let next = reopened
+            .find_match("route", "withdrawal", 1234, Some("INR"))
+            .unwrap()
+            .unwrap();
+        assert_ne!(next.id, first);
+        assert_ne!(next.id, expired_id);
+        let expired = reopened.drain_expired().unwrap();
+        assert_eq!(expired[0].narration, "expired");
+        assert_eq!(expired[0].tags, ["source"]);
+        assert_eq!(expired[0].currency_code.as_deref(), Some("INR"));
+        reopened.delete(expired_id).unwrap();
+        assert!(reopened.drain_expired().unwrap().is_empty());
     }
 }

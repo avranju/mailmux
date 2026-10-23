@@ -508,4 +508,93 @@ exit 0
         assert_eq!(output.metrics.len(), 1);
         assert_eq!(output.metrics[0].name, "emails_processed_total");
     }
+    #[tokio::test]
+    #[ignore = "requires cargo build --workspace --bins (real mailtx protocol test)"]
+    async fn real_mailtx_stdout_roundtrips_on_success_and_failure() -> Result<()> {
+        let binary = std::env::var_os("MAILMUX_TEST_MAILTX_BIN")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::current_exe()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join(if cfg!(windows) {
+                        "mailtx.exe"
+                    } else {
+                        "mailtx"
+                    })
+            });
+        anyhow::ensure!(
+            binary.is_file(),
+            "build mailtx first: cargo build --workspace --bins"
+        );
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("mailtx.toml");
+        std::fs::write(
+            &path,
+            r#"
+allowed_senders=["allowed@example.test"]
+trusted_authserv_ids=["mx.receiver.test"]
+validation={enabled=false}
+[llm]
+backend="openai_compatible"
+model="test"
+base_url="https://example.test"
+[firefly]
+base_url="https://example.test/api"
+access_token="fixture-token"
+[[firefly.asset_accounts]]
+id="default"
+firefly_account_id="1"
+"#,
+        )?;
+        for (config_path, success, outcome) in [
+            (path.clone(), true, "skipped_sender"),
+            (directory.path().join("missing.toml"), false, "error"),
+        ] {
+            let mut config = build_command_config(binary.to_str().unwrap(), vec![]);
+            config.config.insert(
+                "env".into(),
+                toml::Value::Table(
+                    [(
+                        "MAILTX_CONFIG".into(),
+                        toml::Value::String(config_path.to_str().unwrap().into()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            );
+            let result = CommandProcessor::new(&config)
+                .process(
+                    &Event {
+                        id: 42,
+                        event_type: "email_arrived".into(),
+                        account_id: "test".into(),
+                        mailbox_name: "INBOX".into(),
+                        email_id: None,
+                        payload: serde_json::json!({}),
+                        created_at: chrono::Utc::now(),
+                    },
+                    None,
+                )
+                .await?;
+            assert_eq!(result.success, success);
+            assert_eq!(
+                result.metadata.unwrap()["outcome"],
+                outcome,
+                "stdout fell back to unstructured output"
+            );
+            if success {
+                assert_eq!(result.metrics[0].name, "emails_processed_total");
+                assert!(matches!(
+                    result.metrics[0].kind,
+                    crate::processor::MetricKind::Counter
+                ));
+                assert_eq!(result.metrics[0].labels["result"], "skipped_sender");
+            }
+        }
+        Ok(())
+    }
 }

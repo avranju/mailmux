@@ -1115,3 +1115,110 @@ fn missing_receiver_trust_configuration_fails_before_network_activity() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("trusted_authserv_ids"));
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn expired_legs_post_before_delete_and_failed_posts_remain_for_next_process() {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = root();
+    let state = root.join("pending.sqlite");
+    let db = rusqlite::Connection::open(&state).unwrap();
+    db.execute_batch("CREATE TABLE pending_transfers(id INTEGER PRIMARY KEY,rule_id TEXT,leg TEXT,amount_units INTEGER,narration TEXT,category TEXT,source_firefly_id TEXT,destination_firefly_id TEXT,occurred_at TEXT,inserted_at INTEGER,tags TEXT,external_id TEXT,currency_code TEXT); INSERT INTO pending_transfers VALUES (1,'route','withdrawal',1234,'expired payment','Transfer','acct1','acct2','2026-01-01T00:00:00+05:30',0,'[\"source-bank\"]','expired:event','INR');").unwrap();
+    let attempted = Arc::new(AtomicUsize::new(0));
+    let attempts = attempted.clone();
+    let posted = Mutex::new(HashSet::<String>::new());
+    let query_path = state.clone();
+    let ff = Fixture::start(9, move |request| {
+        if request.starts_with("GET /api/v1/categories") {
+            return (
+                200,
+                r#"{"data":[],"meta":{"pagination":{"current_page":1,"total_pages":1}}}"#.into(),
+            );
+        }
+        if request.starts_with("GET ") {
+            let path = request.split_whitespace().nth(1).unwrap();
+            let url = reqwest::Url::parse(&format!("http://localhost{path}")).unwrap();
+            let id = url
+                .query_pairs()
+                .find(|(key, _)| key == "external_identifier")
+                .unwrap()
+                .1
+                .into_owned();
+            return (
+                200,
+                json!({"count":usize::from(posted.lock().unwrap().contains(&id))}).to_string(),
+            );
+        }
+        let payload: Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let tx = &payload["transactions"][0];
+        let id = tx["external_id"].as_str().unwrap();
+        if id == "expired:event" {
+            let db = rusqlite::Connection::open(&query_path).unwrap();
+            assert_eq!(
+                db.query_row(
+                    "SELECT count(*) FROM pending_transfers WHERE id=1",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1,
+                "pending row deleted before successful POST"
+            );
+            assert_eq!(tx["currency_code"], "INR");
+            assert_eq!(tx["amount"], "12.34");
+            assert!(
+                tx["tags"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("unmatched-transfer"))
+            );
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return (500, "temporary failure".into());
+            }
+        }
+        posted.lock().unwrap().insert(id.into());
+        (200, r#"{"data":{"id":"posted"}}"#.into())
+    });
+    let llm = Fixture::start(2, |_| {
+        response(
+            r#"{"status":"found","amount":100,"transaction_type":"withdrawal","narration":"current payment","transaction_date":"2026-01-05","category":"Food"}"#,
+        )
+    });
+    let (config, eml) = setup_config(&root, &llm.url, &ff.url, "");
+    let text = fs::read_to_string(&config)
+        .unwrap()
+        .replace(
+            "tag = \"mailtx-test-tag\"",
+            &format!("tag = \"mailtx-test-tag\"\nstate_db='{}'", state.display()),
+        )
+        .replace("[firefly]", "[firefly]\ncurrency_code='INR'");
+    fs::write(&config, text).unwrap();
+    for (run_number, remaining) in [(0, 1), (1, 0)] {
+        let output = run(&config, &eml, 113, &[]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM pending_transfers", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            remaining
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["metadata"]["outcome"], "posted");
+        if run_number == 0 {
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("failed to flush expired transfer leg")
+            );
+        }
+    }
+    assert_eq!(attempted.load(Ordering::SeqCst), 2);
+    assert_eq!(llm.finish().len(), 2);
+    assert_eq!(ff.finish().len(), 9);
+    drop(db);
+    fs::remove_dir_all(root).unwrap();
+}

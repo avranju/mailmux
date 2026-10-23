@@ -1,0 +1,38 @@
+name: Test workspace
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust with formatting and lint tools
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo +stable fmt --all --check
+      - name: Build real command binaries for protocol integration
+        run: cargo +stable build --workspace --bins --locked
+      - name: Test including PostgreSQL and real Mailtx protocol
+        run: cargo +stable test --workspace --locked -- --include-ignored
+      - name: Lint
+        run: cargo +stable clippy --workspace --all-targets --locked -- -D warnings

@@ -714,6 +714,11 @@ Missing `${VAR}` substitutions also emit warnings naming only the unresolved
 variable; the reference remains unchanged so existing optional/disabled
 configuration can still load.
 
+## Verification
+
+See the [testing guide](mailmux/docs/testing.md) for the complete PostgreSQL,
+IMAP, command-protocol, and Mailtx pipeline suite and CI checks.
+
 ## License
 
 [MIT](LICENSE)

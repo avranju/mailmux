@@ -152,3 +152,7 @@ connections and monitored at credential_reload_interval_secs (default 30).
 Valid rotation reconnects only the mailbox session; missing/invalid transient
 updates retain an existing session. Never log credential contents or TOML parse
 errors with source snippets. Legacy environment credentials require restart.
+
+Run cargo build --workspace --bins before cargo test --workspace -- --include-ignored
+with DATABASE_URL to include the real Mailtx stdout contract test. See
+docs/testing.md for the coverage map and disposable PostgreSQL setup.
