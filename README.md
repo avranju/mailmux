@@ -646,3 +646,13 @@ files, events, and processor jobs remain available under their original IDs.
 The migration assigns existing emails their mailbox state's UIDVALIDITY and
 keeps their existing raw file paths. Emails without a mailbox state retain
 generation 0 (unknown) and may be imported again on the next sync.
+
+### Processor crash recovery
+
+Scheduler and replay claims carry an execution lease lasting the processor
+timeout plus 30 seconds for persisting the result. The 10-second retry sweep
+requeues expired claims and legacy in-progress jobs without leases; pending
+jobs are also recovered. A monotonically increasing claim version prevents
+a late result from overwriting a newer attempt. Recovery can repeat external
+side effects after a crash, so processors still need downstream idempotency.
+Stop old daemon versions before upgrading: they do not participate in leases.
