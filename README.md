@@ -702,3 +702,8 @@ IMAP retry decisions and sync-failure metrics use typed errors for authenticatio
 deadlines, transport, protocol, and unsupported IDLE. Error context and server
 message wording do not determine retry behavior or metric categories. Only an
 explicit IDLE rejection selects polling; other failures reconnect.
+
+Plaintext IMAP (`tls = false`) to a non-loopback host emits a startup warning.
+Missing `${VAR}` substitutions also emit warnings naming only the unresolved
+variable; the reference remains unchanged so existing optional/disabled
+configuration can still load.

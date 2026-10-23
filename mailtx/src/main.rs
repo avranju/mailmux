@@ -1,6 +1,6 @@
 use std::io::Read;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use crate::matcher::AccountMatcher;
@@ -85,11 +85,19 @@ async fn main() {
     }
 }
 
+fn endpoint_http_client(timeout: std::time::Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(timeout)
+        .build()
+        .context("building bounded endpoint HTTP client")
+}
+
 async fn run(m: &mut Metrics) -> Result<()> {
     let config = config::Config::load()?;
     let llm_config = config.resolve_llm()?;
     let endpoint = endpoint::build_endpoint(&config);
-    let http_client = reqwest::Client::new();
+    let http_client = endpoint_http_client(std::time::Duration::from_secs(30))?;
 
     let account_matcher = matcher::DeterministicAccountMatcher::new(
         &config.firefly.asset_accounts,
@@ -556,4 +564,35 @@ async fn run(m: &mut Metrics) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod http_timeout_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn endpoint_http_deadline_stops_a_stalled_response() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (received, request) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 1024];
+            assert!(peer.read(&mut buffer).await.unwrap() > 0);
+            let _ = received.send(());
+            std::future::pending::<()>().await;
+        });
+        let client = endpoint_http_client(std::time::Duration::from_millis(100))?;
+        let error = client
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .unwrap_err();
+        request.await?;
+        server.abort();
+        assert!(error.is_timeout());
+        Ok(())
+    }
 }

@@ -767,3 +767,8 @@ DNS/DKIM verification. Historical messages without trusted results are skipped.
 Use a receiver that supplies and sanitizes these results. Treat model output
 as untrusted even for authenticated mail; retain downstream idempotency and
 transaction validation.
+
+Email text sent to the LLM is capped at 32 KiB, with a truncation marker and a
+warning for oversized messages. Firefly requests have a 10-second connection
+deadline and a 30-second total deadline, including response reads. Keep the
+outer mailmux processor timeout longer than LLM work plus these requests.
