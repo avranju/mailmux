@@ -9,7 +9,8 @@ Type=notify
 ExecStart=/usr/local/bin/mailmux --config /etc/mailmux/config.toml
 Restart=on-failure
 RestartSec=10
-WatchdogSec=60
+# WatchdogSec is omitted: mailmux sends READY/STOPPING notifications,
+# but does not implement systemd watchdog heartbeats.
 
 # Security hardening
 NoNewPrivileges=true
