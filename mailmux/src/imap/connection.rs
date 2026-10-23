@@ -49,6 +49,17 @@ impl ResponseBudget {
     }
 }
 
+/// Redacted authentication error: server replies may echo account credentials.
+#[derive(Debug)]
+pub struct AuthenticationFailure;
+
+impl std::fmt::Display for AuthenticationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IMAP authentication failed")
+    }
+}
+impl std::error::Error for AuthenticationFailure {}
+
 /// Outcome of an IDLE wait.
 #[derive(Debug, PartialEq, Eq)]
 pub enum IdleOutcome {
@@ -924,6 +935,14 @@ fn flag_to_string(flag: &Flag<'_>) -> String {
 }
 
 fn check_status(status: &Status, operation: &str) -> Result<()> {
+    let rejected = match status {
+        Status::Tagged(response) => response.body.kind != StatusKind::Ok,
+        Status::Untagged(body) => body.kind != StatusKind::Ok,
+        Status::Bye(_) => false,
+    };
+    if operation == "LOGIN" && rejected {
+        return Err(AuthenticationFailure.into());
+    }
     match status {
         Status::Tagged(tagged) => match tagged.body.kind {
             StatusKind::Ok => Ok(()),

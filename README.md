@@ -579,3 +579,8 @@ partial results; the watcher reconnects through its normal error handling.
 Split very large mailboxes if their UID scan exceeds the entry limit.
 
 IMAP timeout settings are per account and must be positive values no greater than 86,400,000 in their documented units. Defaults preserve the existing timing.
+
+IMAP authentication failures use a typed, redacted error. Failure logs omit
+account IDs, mailbox names, usernames, and server-provided rejection text, since
+servers can echo credentials. Watchers stop after rejection; operators should
+check their configured credentials.
