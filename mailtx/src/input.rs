@@ -44,7 +44,6 @@ pub struct EventPayload {
 #[derive(Debug, Deserialize)]
 pub struct EmailRecord {
     pub id: Option<i64>,
-    pub subject: Option<String>,
     pub sender: Option<String>,
     pub date: Option<DateTime<Utc>>,
     pub raw_message_path: String,

@@ -665,3 +665,8 @@ or the scheduler's retry timer. The scheduler allows at most 16 batch workers
 in memory; additional dispatches apply channel backpressure, while pending jobs
 remain durable in PostgreSQL. Shutdown drains active work within the daemon's
 configured grace period.
+
+The mailtx bank processor requires a configured list of receiving
+`trusted_authserv_ids` and a trusted aligned DMARC pass before processing mail.
+See [sender authentication](mailtx/README.md#sender-authentication) for the
+receiving-provider requirements and migration guidance.

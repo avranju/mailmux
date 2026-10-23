@@ -6,6 +6,7 @@ use tracing::{info, warn};
 use crate::matcher::AccountMatcher;
 use crate::metrics::Metrics;
 
+mod auth;
 mod balance;
 mod category_cache;
 mod config;
@@ -90,13 +91,6 @@ async fn run(m: &mut Metrics) -> Result<()> {
     let endpoint = endpoint::build_endpoint(&config);
     let http_client = reqwest::Client::new();
 
-    // Open the pending transfer store (only when transfer_rules are configured).
-    let pending_store = config
-        .state_db
-        .as_deref()
-        .map(|path| transfer::PendingStore::open(path, config.transfer_match_window_hours))
-        .transpose()?;
-
     let account_matcher = matcher::DeterministicAccountMatcher::new(
         &config.firefly.asset_accounts,
         config.firefly.default_asset_account_id.clone(),
@@ -130,6 +124,27 @@ async fn run(m: &mut Metrics) -> Result<()> {
         return Ok(());
     }
 
+    let Some(authenticated) = email::extract_authenticated(
+        &email.raw_message_path,
+        sender,
+        &config.trusted_authserv_ids,
+    )?
+    else {
+        warn!("email lacks a trusted aligned DMARC pass; skipping");
+        m.result = Some("skipped_authentication");
+        return Ok(());
+    };
+    let subject = authenticated.subject.as_str();
+    let body = authenticated.body;
+    info!(sender, "processing authenticated bank transaction email");
+
+    // Open the pending transfer store (only when transfer_rules are configured).
+    let pending_store = config
+        .state_db
+        .as_deref()
+        .map(|path| transfer::PendingStore::open(path, config.transfer_match_window_hours))
+        .transpose()?;
+
     if config.validation.enabled {
         let pending =
             validation::pending_review(config.state_db.as_deref().unwrap(), &external_id)?;
@@ -139,11 +154,6 @@ async fn run(m: &mut Metrics) -> Result<()> {
             return Ok(());
         }
     }
-
-    let subject = email.subject.as_deref().unwrap_or("");
-    info!(sender, subject, "processing bank transaction email");
-
-    let body = email::extract_body(&email.raw_message_path)?;
 
     let llm_client = llm::LlmClient::from_config(&llm_config)?;
 
