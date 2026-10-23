@@ -2,12 +2,16 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use axum::Router;
+use axum::extract::Request;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::{Router, middleware};
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use metrics_exporter_prometheus::PrometheusHandle;
+use nonzero_ext::nonzero;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -18,6 +22,7 @@ pub struct HealthState {
     pool: PgPool,
     ready: Arc<AtomicBool>,
     metrics_handle: Option<PrometheusHandle>,
+    rate_limit: Arc<DefaultDirectRateLimiter>,
 }
 
 impl HealthState {
@@ -26,6 +31,9 @@ impl HealthState {
             pool,
             ready: Arc::new(AtomicBool::new(false)),
             metrics_handle,
+            rate_limit: Arc::new(RateLimiter::direct(
+                Quota::per_second(nonzero!(10u32)).allow_burst(nonzero!(20u32)),
+            )),
         }
     }
 
@@ -35,7 +43,7 @@ impl HealthState {
 }
 
 /// Start the health check HTTP server.
-pub async fn serve(port: u16, state: HealthState, token: CancellationToken) {
+fn router(state: HealthState) -> Router {
     let mut app = Router::new()
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler));
@@ -44,8 +52,31 @@ pub async fn serve(port: u16, state: HealthState, token: CancellationToken) {
         app = app.route("/metrics", get(metrics_handler));
     }
 
-    let app = app.with_state(state);
+    app.layer(middleware::from_fn_with_state(
+        state.clone(),
+        enforce_rate_limit,
+    ))
+    .with_state(state)
+}
 
+async fn enforce_rate_limit(
+    State(state): State<HealthState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if state.rate_limit.check().is_err() {
+        metrics::counter!("mailmux_health_rate_limited_total").increment(1);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("Retry-After", "1")],
+            "rate limit exceeded",
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+pub async fn serve(port: u16, state: HealthState, token: CancellationToken) {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!(port, "health check server starting");
 
@@ -57,7 +88,15 @@ pub async fn serve(port: u16, state: HealthState, token: CancellationToken) {
         }
     };
 
-    axum::serve(listener, app)
+    serve_listener(listener, state, token).await;
+}
+
+async fn serve_listener(
+    listener: tokio::net::TcpListener,
+    state: HealthState,
+    token: CancellationToken,
+) {
+    axum::serve(listener, router(state))
         .with_graceful_shutdown(async move {
             token.cancelled().await;
         })
@@ -90,5 +129,53 @@ async fn metrics_handler(State(state): State<HealthState>) -> impl IntoResponse 
             StatusCode::SERVICE_UNAVAILABLE,
             "metrics not available".to_string(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn request(addr: SocketAddr, path: &str) -> String {
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        socket
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        socket.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn every_endpoint_shares_budget_and_excess_health_requests_do_not_touch_database() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@localhost/unused")
+            .unwrap();
+        let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle();
+        let mut state = HealthState::new(pool, Some(handle));
+        // A long refill interval makes the HTTP boundary test deterministic.
+        state.rate_limit = Arc::new(RateLimiter::direct(Quota::per_hour(nonzero!(1u32))));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = CancellationToken::new();
+        let server = tokio::spawn(serve_listener(listener, state, token.clone()));
+        assert!(request(addr, "/ready").await.starts_with("HTTP/1.1 503"));
+        for path in ["/health", "/ready", "/metrics"] {
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(1), request(addr, path))
+                    .await
+                    .unwrap();
+            assert!(response.starts_with("HTTP/1.1 429"), "{path}: {response}");
+            assert!(response.to_ascii_lowercase().contains("retry-after: 1"));
+        }
+        token.cancel();
+        server.await.unwrap();
     }
 }
