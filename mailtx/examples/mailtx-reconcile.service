@@ -1,0 +1,15 @@
+[Unit]
+Description=Reconcile Firefly balances against bank reference snapshots
+Wants=network-online.target
+After=network-online.target
+# Add OnFailure=your-alert-unit.service to route failures to your alerting system.
+
+[Service]
+Type=oneshot
+User=mailtx
+Environment=MAILTX_CONFIG=/etc/mailtx/mailtx.toml
+ExecStart=/usr/local/bin/mailtx reconcile
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true

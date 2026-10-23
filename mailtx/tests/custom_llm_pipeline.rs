@@ -942,3 +942,65 @@ fn validation_holds_balance_drift_before_any_firefly_post() {
     drop(db);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn reconciliation_command_reports_match_drift_and_incomplete_without_llm_or_writes() {
+    for (closing, limit, status, exit) in [
+        ("850.00", 1000, "matched", 0),
+        ("900.00", 1000, "drift", 2),
+        ("850.00", 1, "incomplete", 2),
+    ] {
+        let root = root();
+        let ff = Fixture::start(if limit == 1 { 1 } else { 2 }, move |request| {
+            assert!(request.starts_with("GET /api/v1/accounts/acct1/transactions?"));
+            assert!(request.contains("start=2026-01-01") && request.contains("end=2026-01-31"));
+            let second = request.contains("page=2");
+            let splits = if second {
+                json!([{"transaction_journal_id":"3","date":"2026-01-03T12:00:00+05:30","amount":"100.00","currency_code":"INR","source_id":"acct1","destination_id":"other"}])
+            } else {
+                json!([
+                    {"transaction_journal_id":"1","date":"2026-01-01T12:00:00+05:30","amount":"-100.00","currency_code":"INR","source_id":"acct1","destination_id":"shop"},
+                    {"transaction_journal_id":"2","date":"2026-01-02T12:00:00+05:30","amount":"50.00","currency_code":"INR","source_id":"employer","destination_id":"acct1"}
+                ])
+            };
+            (200,json!({"data":[{"id":if second{"2"}else{"1"},"attributes":{"transactions":splits}}],"meta":{"pagination":{"current_page":if second{2}else{1},"total_pages":2}}}).to_string())
+        });
+        let (config, _) = setup_config(&root, "http://127.0.0.1:1", &ff.url, "");
+        let reference = root.join("reference.json");
+        fs::write(&reference,json!({"accounts":[{"firefly_account_id":"acct1","currency_code":"INR","start":"2026-01-01","end":"2026-01-31","opening_balance":"1000.00","closing_balance":closing}]}).to_string()).unwrap();
+        let text = fs::read_to_string(&config)
+            .unwrap()
+            .replace(
+                "[llm]",
+                &format!(
+                    "[reconciliation]\nreference_file='{}'\nmax_transactions={limit}\n[llm]",
+                    reference.display()
+                ),
+            )
+            .replace("[firefly]", "[firefly]\ncurrency_code='INR'");
+        fs::write(&config, text).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_mailtx"))
+            .arg("reconcile")
+            .env("MAILTX_CONFIG", &config)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(exit),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["accounts"][0]["status"], status);
+        if status == "matched" {
+            assert_eq!(report["accounts"][0]["computed_closing"], "850.00");
+            assert_eq!(report["accounts"][0]["transactions_checked"], 3);
+        }
+        if status == "drift" {
+            assert_eq!(report["accounts"][0]["difference"], "-50.00");
+        }
+        let requests = ff.finish();
+        assert!(requests.iter().all(|r| r.starts_with("GET ")));
+        fs::remove_dir_all(root).unwrap();
+    }
+}

@@ -663,3 +663,56 @@ There is no automatic approval or deletion of held items.
 Setting `[validation] enabled = false` explicitly restores the previous posting
 behavior; use this only when validation/review is handled separately. An outer
 mailmux command timeout must allow two LLM deadlines plus Firefly work.
+
+### Periodic reference reconciliation
+
+`MAILTX_CONFIG=/etc/mailtx/mailtx.toml mailtx reconcile` is a read-only command
+for a timer, cron job, or an external scheduler such as blipbot. It reads a bank
+statement/reference snapshot and fetches Firefly's transactions for each account
+and inclusive date interval. It adds deposits, subtracts withdrawals, handles
+both sides of transfers, and checks `opening balance + net movements = closing
+balance` in that account's native currency. It never calls the LLM or writes to
+Firefly. Provide a reference JSON file, for example:
+
+```json
+{"accounts":[{"firefly_account_id":"12","currency_code":"INR",
+  "start":"2026-03-01","end":"2026-03-31",
+  "opening_balance":"100000.00","closing_balance":"95000.00"}]}
+```
+
+Opening balance must precede all movements on the start date; closing balance
+must include every movement through the end date. Replace the file atomically
+when refreshing snapshots. Configure the same asset account and currency in the
+normal mailtx config, then add:
+
+```toml
+[reconciliation]
+reference_file = "/var/lib/mailtx/bank-reference.json"
+max_transactions = 1000
+tolerance_minor_units = 1
+```
+
+The command pages through up to `max_transactions` Firefly transaction groups per
+account, counting every relevant split. A limit that truncates the interval yields
+`incomplete`, never a false match. Explicit foreign amounts can supply the native
+currency; missing amounts/rates are errors, never estimated. Duplicate rows,
+inconsistent pagination, invalid reference inputs, oversized responses, and API
+failures also fail the run. Transactions in unrelated accounts are excluded.
+
+Stdout contains a JSON report with per-account status, expected/computed closing
+balances, signed difference (`computed - expected`), and split count. Exit 0 means
+all accounts matched; exit 2 means drift or incomplete data; exit 1 means an input
+or API error. Warnings go to stderr. Route the nonzero exit/report to your existing
+alerting system; no external notifications are sent automatically.
+
+The example [service](examples/mailtx-reconcile.service) and
+[timer](examples/mailtx-reconcile.timer) run daily. Adjust the binary/config paths,
+service user and reference-file permissions, and configure `OnFailure=` for your
+alert handler before installing them. They are templates; no timer is installed
+by mailtx. The config still follows the normal validation/state and secret rules.
+For cron, run `MAILTX_CONFIG=/etc/mailtx/mailtx.toml /usr/local/bin/mailtx reconcile`
+and preserve its exit status and report. This interface can consume reference
+files exported by an existing reconciliation script without coupling to it.
+
+The API behavior follows Firefly's official
+[OpenAPI specification](https://github.com/firefly-iii/api-docs/blob/main/dist/firefly-iii-v6.7.8-v1.yaml).

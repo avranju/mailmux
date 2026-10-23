@@ -78,6 +78,8 @@ pub struct Config {
     pub balance_monitor: crate::balance::BalanceConfig,
     #[serde(default)]
     pub validation: crate::validation::ValidationConfig,
+    #[serde(default)]
+    pub reconciliation: crate::reconciliation::ReconciliationConfig,
     pub firefly: FireflyConfig,
     #[serde(default)]
     pub payee_rules: Vec<PayeeRule>,
@@ -762,6 +764,7 @@ error_if_duplicate_hash = false"#,
             tagging: Default::default(),
             balance_monitor: Default::default(),
             validation: Default::default(),
+            reconciliation: Default::default(),
             firefly: FireflyConfig {
                 base_url: "https://firefly.example/api".to_string(),
                 access_token: "token".to_string(),

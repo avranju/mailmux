@@ -17,6 +17,7 @@ mod matcher;
 mod metrics;
 mod money;
 mod payee;
+mod reconciliation;
 mod tagging;
 mod transfer;
 mod validation;
@@ -31,6 +32,32 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        if args == ["reconcile"] {
+            let result = async {
+                let config = config::Config::load()?;
+                reconciliation::run(&config).await
+            }
+            .await;
+            match result {
+                Ok(report) => {
+                    println!("{}", serde_json::to_string(&report).unwrap());
+                    if !report.success {
+                        std::process::exit(2);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("reconciliation failed: {error:#}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        eprintln!("usage: mailtx [reconcile]");
+        std::process::exit(1);
+    }
 
     let mut m = Metrics::default();
     let success = match run(&mut m).await {
