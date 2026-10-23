@@ -466,6 +466,14 @@ impl Config {
         const KNOWN_EVENT_TYPES: &[&str] = &["email_arrived"];
         let mut seen_names = std::collections::HashSet::new();
         for processor in &self.processors {
+            if processor.concurrency == 0
+                || processor.concurrency as usize > tokio::sync::Semaphore::MAX_PERMITS
+            {
+                bail!(
+                    "processor '{}': concurrency must be positive and within the supported semaphore range",
+                    processor.name
+                );
+            }
             if processor.name.is_empty() {
                 bail!("processor name must not be empty");
             }
@@ -712,6 +720,19 @@ concurrency = 1
         temp_env::with_vars([("MAILMUX_TEST_METRICS_TOKEN_41", None::<&str>)], || {
             assert!(config.general.metrics_token().is_err());
         });
+    }
+
+    #[test]
+    fn processor_concurrency_must_be_positive() {
+        let text = sample_toml().replace("concurrency = 1", "concurrency = 0");
+        let config: Config = toml::from_str(&text).unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("concurrency")
+        );
     }
 
     fn write_temp_config(content: &str) -> NamedTempFile {

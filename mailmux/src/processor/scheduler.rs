@@ -3,8 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use futures::StreamExt;
 use sqlx::PgPool;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -13,6 +15,8 @@ use crate::db::emails::get_email_by_id;
 use crate::db::events::{Event, get_event_by_id};
 use crate::db::jobs;
 use crate::processor::registry::ProcessorRegistry;
+
+const MAX_INFLIGHT_BATCHES: usize = 16;
 
 const RETRY_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -24,6 +28,7 @@ pub struct JobScheduler {
     event_rx: mpsc::Receiver<Vec<Event>>,
     token: CancellationToken,
     processor_configs: HashMap<String, ProcessorConfig>,
+    processor_limits: HashMap<String, Arc<Semaphore>>,
     #[cfg(test)]
     before_claim: Option<(
         tokio::sync::mpsc::UnboundedSender<()>,
@@ -39,6 +44,15 @@ impl JobScheduler {
         token: CancellationToken,
         processor_configs: Vec<ProcessorConfig>,
     ) -> Self {
+        let limits = processor_configs
+            .iter()
+            .map(|config| {
+                (
+                    config.name.clone(),
+                    Arc::new(Semaphore::new(config.concurrency.max(1) as usize)),
+                )
+            })
+            .collect();
         let configs = processor_configs
             .into_iter()
             .map(|c| (c.name.clone(), c))
@@ -49,6 +63,7 @@ impl JobScheduler {
             event_rx,
             token,
             processor_configs: configs,
+            processor_limits: limits,
             #[cfg(test)]
             before_claim: None,
         }
@@ -56,28 +71,42 @@ impl JobScheduler {
 
     pub async fn run(mut self) -> Result<()> {
         info!("job scheduler starting");
-
+        let mut event_rx = std::mem::replace(&mut self.event_rx, mpsc::channel(1).1);
+        let scheduler = Arc::new(self);
+        let mut running = JoinSet::new();
+        let sweep_limit = Arc::new(Semaphore::new(1));
         let mut retry_interval = tokio::time::interval(RETRY_SWEEP_INTERVAL);
-
         loop {
             tokio::select! {
-                _ = self.token.cancelled() => {
-                    info!("job scheduler shutting down");
+                _ = scheduler.token.cancelled() => {
+                    info!("job scheduler draining active work");
+                    while let Some(result) = running.join_next().await {
+                        if let Err(error) = result { error!(%error, "scheduler worker failed during shutdown"); }
+                    }
                     return Ok(());
                 }
-
-                Some(events) = self.event_rx.recv() => {
-                    self.process_events(events).await;
+                Some(events) = event_rx.recv(), if running.len() < MAX_INFLIGHT_BATCHES => {
+                    let scheduler = scheduler.clone();
+                    running.spawn(async move { scheduler.process_events(events).await });
                 }
-
-                _ = retry_interval.tick() => {
-                    self.retry_sweep().await;
+                _ = retry_interval.tick(), if running.len() < MAX_INFLIGHT_BATCHES => {
+                    if let Ok(permit) = sweep_limit.clone().try_acquire_owned() {
+                        let scheduler = scheduler.clone();
+                        running.spawn(async move {
+                            let _permit = permit;
+                            scheduler.retry_sweep().await;
+                        });
+                    }
+                }
+                Some(result) = running.join_next(), if !running.is_empty() => {
+                    if let Err(error) = result { error!(%error, "scheduler worker failed"); }
                 }
             }
         }
     }
 
     async fn process_events(&self, events: Vec<Event>) {
+        let mut executions = Vec::new();
         for event in events {
             let processors = self.registry.processors_for_event(&event);
             if processors.is_empty() {
@@ -140,16 +169,24 @@ impl JobScheduler {
                     .map(|c| c.timeout_secs)
                     .unwrap_or(30);
 
-                self.execute_job(
+                executions.push((
                     job_id,
-                    &processor_name,
-                    &event,
-                    email.as_ref(),
+                    processor_name,
+                    event.clone(),
+                    email.clone(),
                     timeout_secs,
-                )
-                .await;
+                ));
             }
         }
+        futures::stream::iter(executions)
+            .for_each_concurrent(
+                None,
+                |(job_id, name, event, email, timeout_secs)| async move {
+                    self.execute_job(job_id, &name, &event, email.as_ref(), timeout_secs)
+                        .await;
+                },
+            )
+            .await;
     }
 
     async fn execute_job(
@@ -179,6 +216,19 @@ impl JobScheduler {
             let _ = arrived.send(());
             barrier.wait().await;
         }
+        let Some(limit) = self.processor_limits.get(processor_name) else {
+            error!(
+                processor = processor_name,
+                "missing processor concurrency configuration"
+            );
+            return;
+        };
+        // Hold the same permit across dispatch and retry execution. Claim only
+        // after acquiring capacity so queued jobs remain recoverable in the DB.
+        let _permit = tokio::select! {
+            permit = limit.acquire() => match permit { Ok(permit) => permit, Err(_) => return },
+            _ = self.token.cancelled() => return,
+        };
         let claim = match jobs::claim_job_with_lease(&self.pool, job_id, timeout_secs, false).await
         {
             Ok(Some(claim)) => claim,
@@ -371,6 +421,7 @@ impl JobScheduler {
 
         debug!(count = retryable.len(), "found retryable jobs");
 
+        let mut executions = Vec::new();
         for job in retryable {
             let event = match get_event_by_id(&self.pool, job.event_id).await {
                 Ok(Some(e)) => e,
@@ -400,15 +451,17 @@ impl JobScheduler {
                 .map(|c| c.timeout_secs)
                 .unwrap_or(30);
 
-            self.execute_job(
-                job.id,
-                &job.processor_name,
-                &event,
-                email.as_ref(),
-                timeout_secs,
+            executions.push((job.id, job.processor_name, event, email, timeout_secs));
+        }
+        futures::stream::iter(executions)
+            .for_each_concurrent(
+                None,
+                |(job_id, name, event, email, timeout_secs)| async move {
+                    self.execute_job(job_id, &name, &event, email.as_ref(), timeout_secs)
+                        .await;
+                },
             )
             .await;
-        }
     }
 }
 
@@ -482,6 +535,7 @@ mod tests {
         pool: PgPool,
         events: Vec<String>,
         terminal_status: &'static str,
+        second_release: Arc<Semaphore>,
     }
 
     #[async_trait]
@@ -514,7 +568,11 @@ mod tests {
             let next_job = jobs::get_job_by_event_and_processor(&self.pool, event.id, "second")
                 .await?
                 .expect("the next job must already be registered");
-            assert_eq!(next_job.status, "pending");
+            assert!(matches!(
+                next_job.status.as_str(),
+                "pending" | "in_progress"
+            ));
+            self.second_release.add_permits(1);
 
             Ok(ProcessorOutput {
                 success: self.terminal_status == "completed",
@@ -542,6 +600,131 @@ mod tests {
             concurrency: 1,
             config: HashMap::new(),
         }
+    }
+
+    struct GatedProcessor {
+        name: String,
+        events: Vec<String>,
+        release: Option<Arc<Semaphore>>,
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        entered: tokio::sync::mpsc::UnboundedSender<String>,
+    }
+
+    #[async_trait]
+    impl Processor for GatedProcessor {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn subscribed_events(&self) -> &[String] {
+            &self.events
+        }
+        async fn process(&self, _: &Event, _: Option<&EmailRecord>) -> Result<ProcessorOutput> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            let _ = self.entered.send(self.name.clone());
+            if let Some(release) = &self.release {
+                release.acquire().await?.forget();
+            }
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(ProcessorOutput {
+                success: true,
+                message: None,
+                metadata: None,
+                metrics: vec![],
+            })
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn run_honors_shared_limits_and_fast_work_bypasses_slow_dispatch_and_retries(
+        pool: PgPool,
+    ) -> Result<()> {
+        let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut configs = Vec::new();
+        let mut processors: Vec<(Box<dyn Processor>, ProcessorConfig)> = Vec::new();
+        for name in ["slow", "fast"] {
+            let config = ProcessorConfig {
+                concurrency: if name == "slow" { 2 } else { 1 },
+                sources: Some(vec![crate::config::ProcessorSource {
+                    account: name.into(),
+                    mailboxes: None,
+                }]),
+                ..test_processor_config(name, 3, vec![0])
+            };
+            processors.push((
+                Box::new(GatedProcessor {
+                    name: name.into(),
+                    events: vec!["email_arrived".into()],
+                    release: if name == "slow" {
+                        Some(release.clone())
+                    } else {
+                        None
+                    },
+                    active: if name == "slow" {
+                        active.clone()
+                    } else {
+                        Arc::new(AtomicUsize::new(0))
+                    },
+                    peak: if name == "slow" {
+                        peak.clone()
+                    } else {
+                        Arc::new(AtomicUsize::new(0))
+                    },
+                    entered: entered.clone(),
+                }),
+                config.clone(),
+            ));
+            configs.push(config);
+        }
+        let mut slow_events = Vec::new();
+        for index in 0..3 {
+            let id: i64 = sqlx::query_scalar("INSERT INTO events(event_type,account_id,mailbox_name) VALUES ('email_arrived','slow','INBOX') RETURNING id").fetch_one(&pool).await?;
+            if index == 0 {
+                let job = jobs::create_job(&pool, id, "slow").await?.unwrap();
+                sqlx::query("UPDATE processor_jobs SET status='failed',attempts=1,next_retry_at=now() WHERE id=$1").bind(job).execute(&pool).await?;
+            } else {
+                slow_events.push(get_event_by_id(&pool, id).await?.unwrap());
+            }
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let token = CancellationToken::new();
+        let scheduler = JobScheduler::new(
+            pool.clone(),
+            Arc::new(ProcessorRegistry::for_tests_with_configs(processors)),
+            rx,
+            token.clone(),
+            configs,
+        );
+        tx.send(slow_events).await?;
+        let worker = tokio::spawn(scheduler.run());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            assert_eq!(entries.recv().await.unwrap(), "slow");
+            assert_eq!(entries.recv().await.unwrap(), "slow");
+            assert_eq!(peak.load(Ordering::SeqCst), 2);
+            // Both slow permits are held. A new batch for a different
+            // processor must still reach execution without releasing them.
+            let fast_id: i64 = sqlx::query_scalar("INSERT INTO events(event_type,account_id,mailbox_name) VALUES ('email_arrived','fast','INBOX') RETURNING id").fetch_one(&pool).await?;
+            tx.send(vec![get_event_by_id(&pool, fast_id).await?.unwrap()]).await?;
+            assert_eq!(entries.recv().await.unwrap(), "fast");
+            release.add_permits(2);
+            assert_eq!(entries.recv().await.unwrap(), "slow");
+            release.add_permits(1);
+            loop {
+                let count: i64 = sqlx::query_scalar("SELECT count(*) FROM processor_jobs WHERE status='completed'").fetch_one(&pool).await?;
+                if count == 4 { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok::<_, anyhow::Error>(())
+        }).await??;
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        token.cancel();
+        worker.await??;
+        Ok(())
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -840,21 +1023,21 @@ mod tests {
             .fetch_one(&pool)
             .await?;
             let event = get_event_by_id(&pool, event_id).await?.unwrap();
+            let second_release = Arc::new(Semaphore::new(0));
             let registry = Arc::new(ProcessorRegistry::for_tests(vec![
                 Box::new(CleanupBetweenProcessors {
                     pool: pool.clone(),
                     events: vec!["email_arrived".into()],
                     terminal_status,
+                    second_release: second_release.clone(),
                 }),
-                Box::new(TestProcessor {
+                Box::new(GatedProcessor {
                     name: "second".into(),
                     events: vec!["email_arrived".into()],
-                    output: ProcessorOutput {
-                        success: true,
-                        message: None,
-                        metadata: None,
-                        metrics: vec![],
-                    },
+                    release: Some(second_release),
+                    active: Arc::new(AtomicUsize::new(0)),
+                    peak: Arc::new(AtomicUsize::new(0)),
+                    entered: tokio::sync::mpsc::unbounded_channel().0,
                 }),
             ]));
             let scheduler = JobScheduler::new(
