@@ -424,11 +424,10 @@ impl MailboxWatcher {
                 }
 
                 let uid = msg.uid;
-                if uid > max_uid {
-                    max_uid = uid;
-                }
-
                 batch_ingested += self.ingest_message(msg, uid_validity, &parser).await? as u64;
+                // Never cover a failed insert with a later checkpoint. Errors
+                // abort the batch before its state write; retries are idempotent.
+                max_uid = max_uid.max(uid);
             }
 
             crate::db::emails::upsert_mailbox_state(
@@ -454,9 +453,9 @@ impl MailboxWatcher {
         Ok(total_ingested)
     }
 
-    /// Parse and persist a single fetched message. Returns 1 on success, 0 on
-    /// failure (failure is logged as a warning rather than propagated so that
-    /// one bad message does not abort the entire batch).
+    /// Parse and persist a single fetched message. Returns 1 for a new email,
+    /// 0 for an existing email, and an error if persistence failed. The caller
+    /// must not checkpoint a batch containing a failed persistence operation.
     async fn ingest_message(
         &self,
         msg: &FetchedMessage,
@@ -570,7 +569,8 @@ impl MailboxWatcher {
                     error = %e,
                     "failed to persist message, will retry next cycle"
                 );
-                Ok(0)
+                Err(e)
+                    .with_context(|| format!("persisting message uid={uid}; checkpoint unchanged"))
             }
         }
     }
@@ -1050,6 +1050,118 @@ mod tests {
             .fetch_one(&pool)
             .await?;
         assert_eq!((emails, events, paths), (6, 6, 6));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_persistence_tests {
+    use super::*;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    async fn mock_mailbox() -> (AccountConfig, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let account: AccountConfig = toml::from_str(&format!(
+            r#"
+            id = "test"
+            imap_host = "127.0.0.1"
+            imap_port = {}
+            tls = false
+            username = "test"
+            password = "test"
+            mailboxes = ["INBOX"]
+        "#,
+            listener.local_addr().unwrap().port()
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut peer = BufReader::new(stream);
+            peer.write_all(b"* OK mock ready\r\n").await.unwrap();
+            for phase in 1..=3 {
+                let mut line = String::new();
+                peer.read_line(&mut line).await.unwrap();
+                let tag = line.split_whitespace().next().unwrap();
+                if phase == 1 {
+                    assert!(line.contains(" LOGIN "));
+                } else if phase == 2 {
+                    assert!(line.contains(" UID FETCH 1:* "));
+                    peer.write_all(
+                        b"* 1 FETCH (UID 1)\r\n* 2 FETCH (UID 2)\r\n* 3 FETCH (UID 3)\r\n",
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    assert!(line.contains(" UID FETCH 1:3 "));
+                    // Deliberately out of order: a higher UID persists before
+                    // the injected failure at UID 2. It must not be checkpointed.
+                    for uid in [3, 2, 1] {
+                        let raw =
+                            format!("From: test@example.com\r\nSubject: Message {uid}\r\n\r\nBody");
+                        let response = format!(
+                            "* {uid} FETCH (UID {uid} FLAGS () BODY[] {{{}}}\r\n{raw})\r\n",
+                            raw.len()
+                        );
+                        peer.write_all(response.as_bytes()).await.unwrap();
+                    }
+                }
+                peer.write_all(format!("{tag} OK done\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        (account, server)
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn failed_insert_cannot_be_checkpointed_and_is_retried(pool: PgPool) -> Result<()> {
+        crate::db::emails::upsert_mailbox_state(&pool, "test", "INBOX", 123, 0).await?;
+        sqlx::query("ALTER TABLE emails ADD CONSTRAINT injected_failure CHECK (uid <> 2)")
+            .execute(&pool)
+            .await?;
+        let dir = TempDir::new()?;
+        let store = Arc::new(MessageStore::new(dir.path().to_str().unwrap()));
+        let limiter = Arc::new(RateLimiter::direct(Quota::per_second(nonzero!(1000u32))));
+        for attempt in 0..2 {
+            let (account, server) = mock_mailbox().await;
+            let mut conn = ImapConnection::connect(&account).await?;
+            let watcher = MailboxWatcher::new(
+                Arc::new(account),
+                "INBOX".into(),
+                pool.clone(),
+                store.clone(),
+                CancellationToken::new(),
+            );
+            let result = watcher.do_incremental_sync(&mut conn, 123, &limiter).await;
+            server.await?;
+            let state = crate::db::emails::get_mailbox_state(&pool, "test", "INBOX")
+                .await?
+                .unwrap();
+            if attempt == 0 {
+                assert!(result.is_err());
+                assert_eq!(state.last_seen_uid, 0);
+                let uids: Vec<i64> = sqlx::query_scalar("SELECT uid FROM emails ORDER BY uid")
+                    .fetch_all(&pool)
+                    .await?;
+                assert_eq!(uids, vec![1]);
+                sqlx::query("ALTER TABLE emails DROP CONSTRAINT injected_failure")
+                    .execute(&pool)
+                    .await?;
+            } else {
+                assert_eq!(result?, 2); // UID 1 was already durable; UID results are sorted.
+                assert_eq!(state.last_seen_uid, 3);
+                let emails: i64 = sqlx::query_scalar("SELECT count(*) FROM emails")
+                    .fetch_one(&pool)
+                    .await?;
+                let events: i64 = sqlx::query_scalar("SELECT count(*) FROM events")
+                    .fetch_one(&pool)
+                    .await?;
+                assert_eq!((emails, events), (3, 3));
+            }
+        }
         Ok(())
     }
 }
