@@ -19,6 +19,7 @@ mod money;
 mod payee;
 mod tagging;
 mod transfer;
+mod validation;
 
 #[tokio::main]
 async fn main() {
@@ -69,63 +70,6 @@ async fn run(m: &mut Metrics) -> Result<()> {
         .map(|path| transfer::PendingStore::open(path, config.transfer_match_window_hours))
         .transpose()?;
 
-    // Flush any transfer legs that exceeded the match window before processing
-    // the current email. They are posted as regular transactions with the
-    // "unmatched-transfer" tag so nothing is silently lost.
-    if let Some(store) = &pending_store {
-        for expired in store.drain_expired()? {
-            let (kind, asset_account_id) = match expired.leg {
-                transfer::Leg::Withdrawal => (
-                    endpoint::TransactionKind::Withdrawal,
-                    expired.source_firefly_id.clone(),
-                ),
-                transfer::Leg::Deposit => (
-                    endpoint::TransactionKind::Deposit,
-                    expired.destination_firefly_id.clone(),
-                ),
-            };
-            let mut tags = expired.tags.clone();
-            tags.push("unmatched-transfer".to_string());
-            let currency_code = expired
-                .currency_code
-                .clone()
-                .or_else(|| config.currency_for_account(&asset_account_id));
-            let fallback = endpoint::CanonicalTransaction {
-                currency_code,
-                amount: expired.amount,
-                kind,
-                narration: expired.narration.clone(),
-                occurred_at: expired.occurred_at,
-                asset_account_id,
-                transfer_destination_account_id: None,
-                tags,
-                category_name: expired.category.clone(),
-                external_id: expired.external_id.clone(),
-            };
-            match endpoint.post_transaction(&http_client, &fallback).await {
-                Ok(receipt) => {
-                    warn!(
-                        id = receipt.id.as_deref(),
-                        amount = %expired.amount,
-                        narration = expired.narration.as_str(),
-                        "expired transfer leg flushed as unmatched transaction"
-                    );
-                    store.delete_after_post(expired.id);
-                    m.firefly_requests.push(("post_transaction", "success"));
-                    m.transfers_expired += 1;
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        id = expired.id,
-                        "failed to flush expired transfer leg; will retry next run"
-                    );
-                    m.firefly_requests.push(("post_transaction", "error"));
-                }
-            }
-        }
-    }
-
     let account_matcher = matcher::DeterministicAccountMatcher::new(
         &config.firefly.asset_accounts,
         config.firefly.default_asset_account_id.clone(),
@@ -159,6 +103,16 @@ async fn run(m: &mut Metrics) -> Result<()> {
         return Ok(());
     }
 
+    if config.validation.enabled {
+        let pending =
+            validation::pending_review(config.state_db.as_deref().unwrap(), &external_id)?;
+        if let Some(reasons) = pending {
+            m.review_reasons = reasons;
+            m.result = Some("held_for_review");
+            return Ok(());
+        }
+    }
+
     let subject = email.subject.as_deref().unwrap_or("");
     info!(sender, subject, "processing bank transaction email");
 
@@ -185,6 +139,7 @@ async fn run(m: &mut Metrics) -> Result<()> {
         }
     };
 
+    m.llm_calls += 1;
     let tx = match llm_client
         .extract_transaction(subject, &body, &categories)
         .await
@@ -226,6 +181,45 @@ async fn run(m: &mut Metrics) -> Result<()> {
         }
     };
 
+    if config.validation.enabled {
+        let currency = resolved
+            .currency_code
+            .as_deref()
+            .or(config.firefly.currency_code.as_deref());
+        let mut reasons = validation::reasons(
+            &tx,
+            email.date,
+            currency,
+            resolved
+                .timezone
+                .unwrap_or(config.firefly.transaction_timezone),
+            &body,
+            &config.validation,
+        )?;
+        if config.validation.double_extraction {
+            m.llm_calls += 1;
+            let second = llm_client
+                .verify_transaction(subject, &body, &categories)
+                .await?;
+            if validation::independent_disagrees(&tx, &second) {
+                reasons.push("independent_extraction_disagrees");
+            }
+        }
+        if !reasons.is_empty() {
+            validation::hold(
+                config.state_db.as_deref().unwrap(),
+                &external_id,
+                &reasons,
+                None,
+                &email.raw_message_path,
+            )?;
+            m.review_reasons = reasons.iter().map(|reason| reason.to_string()).collect();
+            m.result = Some("held_for_review");
+            warn!(reasons=?m.review_reasons,"transaction held for manual review");
+            return Ok(());
+        }
+    }
+
     // Build the canonical transaction. For transfers this is reused as a base
     // (struct update) to keep all the shared fields (narration, occurred_at, etc.).
     let mut canonical_tx = endpoint::canonical_from_llm(
@@ -265,7 +259,7 @@ async fn run(m: &mut Metrics) -> Result<()> {
         .unwrap_or(&resolved.account_id);
     tagging::apply(&mut canonical_tx, source_id, &config.tagging);
 
-    if config.balance_monitor.enabled {
+    if config.balance_monitor.enabled || config.validation.enabled {
         if let Some(currency) = canonical_tx.currency_code.as_deref() {
             match balance::closing_balance(&body, currency) {
                 Ok(Some(closing)) => {
@@ -328,8 +322,83 @@ async fn run(m: &mut Metrics) -> Result<()> {
         }
     }
 
+    if config.validation.enabled
+        && matches!(
+            m.balance_status,
+            Some("drift" | "out_of_order" | "invalid_balance")
+        )
+    {
+        validation::hold(
+            config.state_db.as_deref().unwrap(),
+            &external_id,
+            &["balance_requires_review"],
+            Some(&canonical_tx),
+            &email.raw_message_path,
+        )?;
+        m.review_reasons = vec!["balance_requires_review".into()];
+        m.result = Some("held_for_review");
+        return Ok(());
+    }
+
     let original_narration = canonical_tx.narration.clone();
     canonical_tx.narration = payee::normalize(&original_narration, &config.payee_rules);
+
+    // Flush any transfer legs that exceeded the match window before processing
+    // the current email. They are posted as regular transactions with the
+    // "unmatched-transfer" tag so nothing is silently lost.
+    if let Some(store) = &pending_store {
+        for expired in store.drain_expired()? {
+            let (kind, asset_account_id) = match expired.leg {
+                transfer::Leg::Withdrawal => (
+                    endpoint::TransactionKind::Withdrawal,
+                    expired.source_firefly_id.clone(),
+                ),
+                transfer::Leg::Deposit => (
+                    endpoint::TransactionKind::Deposit,
+                    expired.destination_firefly_id.clone(),
+                ),
+            };
+            let mut tags = expired.tags.clone();
+            tags.push("unmatched-transfer".to_string());
+            let currency_code = expired
+                .currency_code
+                .clone()
+                .or_else(|| config.currency_for_account(&asset_account_id));
+            let fallback = endpoint::CanonicalTransaction {
+                currency_code,
+                amount: expired.amount,
+                kind,
+                narration: expired.narration.clone(),
+                occurred_at: expired.occurred_at,
+                asset_account_id,
+                transfer_destination_account_id: None,
+                tags,
+                category_name: expired.category.clone(),
+                external_id: expired.external_id.clone(),
+            };
+            match endpoint.post_transaction(&http_client, &fallback).await {
+                Ok(receipt) => {
+                    warn!(
+                        id = receipt.id.as_deref(),
+                        amount = %expired.amount,
+                        narration = expired.narration.as_str(),
+                        "expired transfer leg flushed as unmatched transaction"
+                    );
+                    store.delete_after_post(expired.id);
+                    m.firefly_requests.push(("post_transaction", "success"));
+                    m.transfers_expired += 1;
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        id = expired.id,
+                        "failed to flush expired transfer leg; will retry next run"
+                    );
+                    m.firefly_requests.push(("post_transaction", "error"));
+                }
+            }
+        }
+    }
 
     // --- Transfer detection -------------------------------------------------
     // Check whether this transaction is a leg of a configured transfer route.

@@ -136,6 +136,14 @@ fn run(
         r#"{{"event":{{"id":{id}}},"email":{{"subject":"Bank notice","sender":"allowed@example.test","raw_message_path":"{}"}}}}"#,
         eml.display()
     );
+    invoke(config, &input, extra_env)
+}
+
+fn invoke(
+    config: &std::path::Path,
+    input: &str,
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mailtx"));
     command
         .env("MAILTX_CONFIG", config)
@@ -169,6 +177,7 @@ fn setup_config(
             r#"
 allowed_senders = ["allowed@example.test"]
 tag = "mailtx-test-tag"
+validation = {{ enabled = false }}
 [llm]
 backend = "openai_compatible"
 model = "opaque/model::id"
@@ -752,6 +761,184 @@ fn balance_monitor_persists_across_processes_and_alerts_on_a_missing_transaction
         .unwrap(),
         60000
     );
+    drop(db);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pre_post_validation_holds_suspicious_mail_and_replays_without_calls() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for (amount, second_amount, date, narration, body, reason) in [
+        (
+            600000,
+            600000,
+            "2026-01-05",
+            Some("Shop"),
+            "Paid INR 600000",
+            "amount_above_limit",
+        ),
+        (
+            100,
+            100,
+            "2025-01-05",
+            Some("Shop"),
+            "Paid INR 100",
+            "date_outside_email_window",
+        ),
+        (
+            100,
+            100,
+            "2026-01-05",
+            Some("Shop"),
+            "Paid USD 100",
+            "unexpected_email_currency",
+        ),
+        (
+            100,
+            100,
+            "2026-01-05",
+            None,
+            "Paid INR 100",
+            "missing_narration",
+        ),
+        (
+            100,
+            100,
+            "2026-01-05",
+            Some("Shop"),
+            "Paid INR 200",
+            "email_amount_disagrees",
+        ),
+        (
+            100,
+            101,
+            "2026-01-05",
+            Some("Shop"),
+            "Paid INR 100",
+            "independent_extraction_disagrees",
+        ),
+        (100, 100, "2026-01-05", Some("Shop"), "Paid INR 100", ""),
+    ] {
+        let root = root();
+        let invocation = AtomicUsize::new(0);
+        let llm = Fixture::start(2, move |_| {
+            let amount = if invocation.fetch_add(1, Ordering::SeqCst) == 0 {
+                amount
+            } else {
+                second_amount
+            };
+            response(&json!({"status":"found","amount":amount,"transaction_type":"withdrawal","narration":narration,"transaction_date":date,"category":"Food"}).to_string())
+        });
+        let ff = firefly(if reason.is_empty() { 3 } else { 1 });
+        let (config, eml) = setup_config(&root, &llm.url, &ff.url, "");
+        let state = root.join("review.sqlite");
+        let text = fs::read_to_string(&config)
+            .unwrap()
+            .replace(
+                "validation = { enabled = false }",
+                &format!(
+                    "state_db='{}'\nvalidation = {{ enabled = true }}",
+                    state.display()
+                ),
+            )
+            .replace("[firefly]", "[firefly]\ncurrency_code='INR'");
+        fs::write(&config, text).unwrap();
+        fs::write(
+            &eml,
+            format!("From: allowed@example.test\nContent-Type: text/plain\n\n{body}\n"),
+        )
+        .unwrap();
+        let input=json!({"event":{"id":111},"email":{"subject":"Bank notice","sender":"allowed@example.test","date":"2026-01-05T12:00:00Z","raw_message_path":eml}}).to_string();
+        let output = invoke(&config, &input, &[]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let metadata: Value = serde_json::from_slice(&output.stdout).unwrap();
+        if reason.is_empty() {
+            assert_eq!(metadata["metadata"]["outcome"], "posted");
+        } else {
+            assert_eq!(metadata["metadata"]["outcome"], "held_for_review");
+            assert!(
+                metadata["metadata"]["review_reasons"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(reason))
+            );
+            let repeated = invoke(&config, &input, &[]);
+            assert!(repeated.status.success());
+            let repeat: Value = serde_json::from_slice(&repeated.stdout).unwrap();
+            assert_eq!(repeat["metadata"]["outcome"], "held_for_review");
+            let db = rusqlite::Connection::open(&state).unwrap();
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM review_queue", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+        let prompts = llm.finish();
+        assert!(!prompts[0].contains("Independently audit"));
+        assert!(prompts[1].contains("Independently audit"));
+        let requests = ff.finish();
+        assert_eq!(
+            requests.iter().filter(|r| r.starts_with("POST ")).count(),
+            usize::from(reason.is_empty())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn validation_holds_balance_drift_before_any_firefly_post() {
+    let root = root();
+    let llm = Fixture::start(2, |_| {
+        response(
+            r#"{"status":"found","amount":100,"transaction_type":"withdrawal","narration":"Shop","transaction_date":"2026-01-05","category":"Food"}"#,
+        )
+    });
+    let ff = firefly(1);
+    let (config, eml) = setup_config(&root, &llm.url, &ff.url, "");
+    let state = root.join("review.sqlite");
+    let text = fs::read_to_string(&config)
+        .unwrap()
+        .replace(
+            "validation = { enabled = false }",
+            &format!(
+                "state_db='{}'\nvalidation={{enabled=true}}",
+                state.display()
+            ),
+        )
+        .replace("[firefly]", "[firefly]\ncurrency_code='INR'");
+    fs::write(&config, text).unwrap();
+    let db = rusqlite::Connection::open(&state).unwrap();
+    db.execute_batch("CREATE TABLE balance_checkpoints(account TEXT NOT NULL,currency TEXT NOT NULL,timestamp INTEGER NOT NULL,balance_units INTEGER NOT NULL,PRIMARY KEY(account,currency));INSERT INTO balance_checkpoints VALUES ('acct1','INR',1,100000);").unwrap();
+    fs::write(&eml,"From: allowed@example.test\nContent-Type: text/plain\n\nPaid INR 100. Closing balance INR 700\n").unwrap();
+    let input=json!({"event":{"id":112},"email":{"subject":"Bank notice","sender":"allowed@example.test","date":"2026-01-05T12:00:00Z","raw_message_path":eml}}).to_string();
+    let out = invoke(&config, &input, &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["metadata"]["outcome"], "held_for_review");
+    assert_eq!(value["metadata"]["balance_status"], "drift");
+    let held: String = db
+        .query_row("SELECT transaction_json FROM review_queue", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let held: Value = serde_json::from_str(&held).unwrap();
+    assert!(
+        held["tags"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("needs-review"))
+    );
+    llm.finish();
+    assert_eq!(ff.finish().len(), 1);
     drop(db);
     fs::remove_dir_all(root).unwrap();
 }

@@ -9,7 +9,9 @@ use serde::Serialize;
 /// its Prometheus endpoint.
 #[derive(Debug, Default)]
 pub struct Metrics {
+    pub llm_calls: u32,
     pub balance_status: Option<&'static str>,
+    pub review_reasons: Vec<String>,
     /// Terminal outcome for this invocation.
     pub result: Option<&'static str>,
     /// Result of the LLM call, set whenever a call was attempted.
@@ -34,6 +36,8 @@ pub struct Metrics {
 /// and any associated Firefly transaction ID.
 #[derive(Debug, Serialize)]
 pub struct ProcessorMetadata {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub review_reasons: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance_status: Option<&'static str>,
     /// Terminal outcome string, e.g. `"posted"`, `"no_transaction"`, `"error"`.
@@ -80,7 +84,11 @@ impl Metrics {
         }
 
         if let Some(result) = self.llm_result {
-            metrics.push(counter("llm_calls_total", 1.0, &[("result", result)]));
+            metrics.push(counter(
+                "llm_calls_total",
+                self.llm_calls.max(1) as f64,
+                &[("result", result)],
+            ));
         }
 
         for (operation, result) in &self.firefly_requests {
@@ -123,6 +131,7 @@ impl Metrics {
         let outcome = self.result.unwrap_or("error");
         let metadata = ProcessorMetadata {
             balance_status: self.balance_status,
+            review_reasons: self.review_reasons,
             outcome,
             firefly_transaction_id: self.firefly_transaction_id,
         };

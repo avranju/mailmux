@@ -86,6 +86,7 @@ Configuration is split between a TOML file (most settings) and a few env vars
 ```toml
 # Senders matched as exact normalized mailbox addresses.
 allowed_senders = ["alerts@mybank.com", "noreply@anotherbank.com"]
+state_db = "/var/lib/mailtx/state.sqlite" # durable validation review queue
 
 # Model name passed to genai. Provider is inferred from the name.
 # Default: "claude-haiku-4-5-20251001"
@@ -95,6 +96,7 @@ llm_model = "claude-haiku-4-5-20251001"
 [firefly]
 base_url     = "https://firefly.example.com/api"
 access_token = "eyJ..."
+currency_code = "INR" # set the native currency; per-account overrides supported
 
 # Optional Firefly settings (shown with their defaults):
 # default_asset_account_id = "12"

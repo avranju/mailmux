@@ -214,6 +214,7 @@ In `auto` mode, genai infers provider keys from the environment. In custom mode,
 ```toml
 # Senders matched as exact normalized mailbox addresses.
 allowed_senders = ["alerts@mybank.com", "noreply@anotherbank.com"]
+state_db = "/var/lib/mailtx/state.sqlite" # durable validation review queue
 
 # Model name passed to genai. Provider (and required API key) is inferred from
 # the name. Default: "claude-haiku-4-5-20251001"
@@ -225,6 +226,7 @@ llm_model = "claude-haiku-4-5-20251001"
 [firefly]
 base_url     = "https://firefly.example.com/api"
 access_token = "eyJ..."
+currency_code = "INR" # set the native currency; per-account overrides supported
 
 # Optional — shown with defaults:
 # default_asset_account_id = "12"
@@ -618,3 +620,46 @@ reported as `no_balance`; contradictory figures or currency mismatches require
 review. Labels must describe the post-transaction available/closing balance.
 Credit-limit/available-credit figures are not supported as account balances.
 This is evidence from notifications, not an independent bank statement audit.
+
+### Validation and manual review
+
+Validation is enabled by default and requires top-level `state_db` for a durable
+review queue. Set each account's native currency (or the global fallback). A
+found transaction must have a nonzero exact amount, a narration, and a valid date
+within seven calendar days of `email.date` in the booking timezone. Missing email
+dates are held. INR amounts over 500,000 are held by default. Currency limits are
+independent; add appropriate limits for other currencies:
+
+```toml
+[validation]
+enabled = true
+double_extraction = true # two calls with different instructions, compared exactly
+date_window_days = 7
+regex_tolerance_percent = 5
+[validation.max_amounts]
+INR = "500000"
+USD = "10000"
+```
+
+Explicit currency figures in the email must agree with the account currency. The
+first prominent currency-labelled amount is cross-checked against the extraction;
+labelled closing balances are excluded. This is a conservative heuristic:
+notifications with multiple unrelated amounts can require manual review. Zero,
+sub-cent, or malformed model amounts fail extraction without posting. The second
+extraction must agree on absolute amount and direction; agreement is a consistency
+check, not proof of model accuracy. When explicit closing-balance evidence is
+present, validation also runs persistent balance monitoring; drift, out-of-order
+observations, and ambiguous balances are held before posting or transfer storage.
+
+Held items return success with `metadata.outcome = "held_for_review"` and
+`review_reasons`. No transaction is posted. SQLite `review_queue` keeps one row per
+stable event identity, its reasons, original email path, and available transaction
+fields/tags. Replays remain held and make no LLM or Firefly calls. Inspect the row
+and original email, correct the extraction/configuration or import manually, then
+explicitly remove the reviewed queue row before an intentional replay. Retain
+original email files until review is complete; use private durable state storage.
+There is no automatic approval or deletion of held items.
+
+Setting `[validation] enabled = false` explicitly restores the previous posting
+behavior; use this only when validation/review is handled separately. An outer
+mailmux command timeout must allow two LLM deadlines plus Firefly work.

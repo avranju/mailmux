@@ -152,6 +152,23 @@ impl LlmClient {
         body: &str,
         categories: &[String],
     ) -> anyhow::Result<TransactionData> {
+        self.extract(subject, body, categories, false).await
+    }
+    pub async fn verify_transaction(
+        &self,
+        subject: &str,
+        body: &str,
+        categories: &[String],
+    ) -> anyhow::Result<TransactionData> {
+        self.extract(subject, body, categories, true).await
+    }
+    async fn extract(
+        &self,
+        subject: &str,
+        body: &str,
+        categories: &[String],
+        verify: bool,
+    ) -> anyhow::Result<TransactionData> {
         let started = std::time::Instant::now();
         let backend = match self {
             Self::Auto { .. } => "auto",
@@ -161,7 +178,14 @@ impl LlmClient {
             Self::Auto { config, .. } => config.model.as_str(),
             Self::OpenAiCompatible(client) => client.model(),
         };
-        let prompt = build_prompt(subject, body, categories);
+        let mut prompt = build_prompt(subject, body, categories);
+        if verify {
+            prompt.system.push_str(" Independently audit the transaction amount and direction. Identify the explicit debit/credit amount, exclude balances, limits and unrelated figures, then return the required JSON. Do not estimate missing values.");
+            prompt.user = format!(
+                "Independent verification task. Extract only what the bank notification explicitly states.\n{}",
+                prompt.user
+            );
+        }
         let attempt: anyhow::Result<TransactionData> = async {
             let text = match self {
                 Self::OpenAiCompatible(client) => {
