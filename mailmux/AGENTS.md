@@ -139,7 +139,7 @@ enabled and subscribed to `email_arrived`) over durable `emails` rows:
 - The project uses `imap-next` (not `async-imap`) for the IMAP client.
 - `sqlx` is used with compile-time query checking; the database must be available (or `DATABASE_URL` set) when running `sqlx` macros during a fresh build.
 - Systemd integration uses `sd-notify` (`Type=notify` in the service unit). See `contrib/mailmux.service`.
-- Task 4.4 (flag change + deletion detection) is the only deferred feature; all other planned phases are complete.
+- Flag change and deletion detection remain deferred; see docs/design.md for implemented lifecycle and recovery semantics.
 
 AccountManager owns the shared synchronization RateLimiter for all its mailbox
 watchers. There is no account max_connections setting; the PostgreSQL pool's

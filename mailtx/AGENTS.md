@@ -44,14 +44,19 @@ Single async pipeline in `main.rs`:
 
 ```
 stdin JSON
-  → parse Input { event, email }
-  → check email.sender against ALLOWED_SENDERS        (skip → exit 0)
-  → read raw_message_path from disk
-  → extract plain-text body (text/plain preferred, HTML stripped if needed)
-  → LlmClient builds shared prompt/schema and calls auto(genai) or custom Chat Completions
-  → if status = "not_found" → skip → exit 0
-  → HTTP POST { amount, transaction_type, narration } to ENDPOINT_URL
-  → exit 0 on success, exit 1 on any error
+  → parse Input and stable external identity
+  → exact normalized sender allow-list
+  → authenticate raw email using trusted receiver DMARC results
+  → consult durable review queue (held replays make no API calls)
+  → fetch/cache categories; run extraction
+  → resolve account, native currency, and booking timezone
+  → validate required fields, date, amount/currency evidence; independent extraction
+  → build canonical transaction with configurable and automatic tags
+  → observe/check closing balance; hold suspicious candidates in SQLite
+  → normalize display narration; transfer rules use original narration
+  → flush expired accepted legs; match/store transfer or POST normal transaction
+  → emit ProcessorOutput JSON on stdout, logs on stderr
+
 ```
 
 ## Key Modules (`src/`)
@@ -61,7 +66,7 @@ stdin JSON
 | `main.rs`   | Orchestrates the pipeline; owns stdin reading and exit code                                                       |
 | `config.rs` | Loads config from a TOML file (`MAILTX_CONFIG`); `sender_allowed()` does exact normalized mailbox matching                         |
 | `input.rs`  | Minimal serde types mirroring mailmux's stdin schema; only used fields are declared                               |
-| `email.rs`  | Reads `.eml` file with `mail-parser`; prefers text/plain, strips HTML via regex if only text/html is available    |
+| `email.rs`  | Reads `.eml` file with `mail-parser`; prefers text/plain, converts HTML with html2text if only text/html is available    |
 | `llm.rs`    | LlmClient dispatch, shared prompt/schema, and strict transaction validation |
 | `llm/openai_compatible.rs` | Dedicated custom Chat Completions transport with explicit auth and bounded responses |
 | `endpoint/` | Firefly and endpoint HTTP operations                                                           |
@@ -102,7 +107,7 @@ currency_code = "INR" # set the native currency; per-account overrides supported
 
 access_token = "${FIREFLY_ACCESS_TOKEN}"
 
-# Optional Firefly settings (shown with their defaults):
+# Optional examples (account ID/currency have no default):
 # default_asset_account_id = "12"
 # currency_code            = "USD"
 # apply_rules              = false
@@ -136,16 +141,20 @@ mailmux config block:
 
 ```toml
 [[processors]]
-name = "mailtx
+name = "mailtx"
 enabled = true
 events = ["email_arrived"]
 max_retries = 3
 retry_backoff_secs = [30, 120, 600]
-timeout_secs = 90
+timeout_secs = 360 # allow two default 60s LLM calls plus Firefly requests
 concurrency = 1
 
 [processors.config]
 command = "/usr/local/bin/mailtx"
+[processors.config.env]
+MAILTX_CONFIG = "/etc/mailtx/config.toml"
+FIREFLY_ACCESS_TOKEN = "${FIREFLY_ACCESS_TOKEN}"
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}"
 ```
 
 Command processors receive a cleared environment plus PATH/LANG and their
@@ -157,23 +166,23 @@ For mailtx, pass MAILTX_CONFIG and its chosen provider/custom backend key.
 
 - **stdout is reserved for mailmux.** All logging must go to stderr. The
   `tracing_subscriber` is initialised with `.with_writer(std::io::stderr)`.
-- **Exit code is the success signal.** Exit 0 covers both success and
-  deliberate skips (sender not in list, LLM found no transaction). Exit non-0
-  triggers mailmux retry.
+- **Exit code is the success signal.** Exit 0 covers posts, skips, and durable
+  held_for_review outcomes. Check stdout metadata to distinguish them. Nonzero
+  retries the pipeline. The separate reconcile command exits 2 for drift or an
+  incomplete scan and emits a reconciliation report rather than ProcessorOutput.
 - **Retries replay the full pipeline.** The LLM call is repeated on retry, so
   the downstream endpoint must be idempotent.
-- **State is mostly stateless.** Normal transaction processing uses only stdin
-  and env vars. When `transfer_rules` are configured, a local SQLite database
-  (`state_db` in TOML) is used to persist pending transfer legs between
-  invocations via `rusqlite` (bundled — no system library required). Do not add
-  `sqlx` or any server-backed database dependency.
+- **State uses local SQLite.** Default validation requires state_db for held
+  reviews and bank observations. Pending transfers share that database. A private
+  TTL-bounded category cache can use a separate SQLite path. Use rusqlite; do not
+  add sqlx or a server-backed database dependency.
 - **HTML-to-text conversion uses `html2text`** (`src/email.rs`), which is built
   on `html5ever` (the Servo HTML parser). It handles malformed HTML gracefully
   and is spec-compliant. The `width` parameter (120) controls line wrapping and
   has no effect on LLM input quality.
 - **LLM outputs are untrusted.** Shared parsing accepts bare JSON or one enclosing Markdown fence and validates status and business fields without exposing model output in errors.
 - **Configuration is resolved before pipeline side effects.** `Config::resolve_llm` validates backend and endpoint settings; custom credentials are read only from an explicitly named `api_key_env`.
-- **Timeouts are coordinated.** LLM calls have bounded connection and total deadlines; configure mailmux's outer timeout longer than the LLM deadline plus Firefly work.
+- **Timeouts are coordinated.** LLM calls have bounded connection and total deadlines; configure mailmux's outer timeout longer than two LLM deadlines plus Firefly work when double extraction is enabled.
 
 ## Adding or Changing Behaviour
 
@@ -227,3 +236,11 @@ topmost result to report aligned DMARC pass for a single raw From address.
 Unauthenticated mail exits successfully as skipped_authentication before any
 LLM, Firefly, or transfer-store activity. Use raw subject/body from that same
 message. Tests must include realistic trusted authentication results.
+
+Default validation performs two differently prompted extractions, requires a
+valid email.date and transaction_date within seven bank-local calendar days,
+checks explicit currency/amount evidence and INR >500000, and holds suspect
+transactions before any POST or transfer insert. Review replays remain held.
+Balance observations are account/currency scoped and replay safe; only an actual
+balance match earns reconciled. mailtx reconcile reads reference-file intervals,
+pages Firefly using GET only, and reports drift/incomplete data without LLM work.

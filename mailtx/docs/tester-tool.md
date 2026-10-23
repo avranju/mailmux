@@ -14,6 +14,17 @@ mailtx/tools/tester/
 └── tester.py
 ```
 
+## Compatibility with current validation
+
+The harness supplies subject/from/path but omits `email.date`; default validation
+therefore holds found transactions for manual review. To exercise posting with
+this legacy harness, explicitly set `[validation] enabled = false` in a disposable
+local mock config, or use the dated stdin examples in the
+[manual guide](manual-testing.md) to test validation too. Configure
+`trusted_authserv_ids` and use original messages with trusted authentication
+results; unverified messages are skipped. The harness does not forge authentication
+headers, approve held items, or support the reconciliation command.
+
 ## Usage
 
 ```bash

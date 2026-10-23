@@ -41,10 +41,6 @@ fn describe_all() {
         "Total number of processor executions"
     );
     describe_gauge!(
-        "mailmux_active_connections",
-        "Number of active IMAP connections"
-    );
-    describe_gauge!(
         "mailmux_mailboxes_monitored",
         "Number of mailboxes being monitored"
     );

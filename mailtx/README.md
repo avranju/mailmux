@@ -231,7 +231,7 @@ base_url     = "https://firefly.example.com/api"
 access_token = "eyJ..."
 currency_code = "INR" # set the native currency; per-account overrides supported
 
-# Optional — shown with defaults:
+# Optional examples (account ID/currency have no default):
 # default_asset_account_id = "12"
 # currency_code            = "USD"
 # apply_rules              = false
@@ -313,7 +313,7 @@ model management, fallback, or internal retry. HTTP to a custom LLM host require
 encrypted tunnels. This permission is separate from Firefly's loopback-only HTTP
 exception. Invalid model output is an error; only valid `not_found` is skipped.
 The 60-second deadline is new; cold models may need `timeout_secs = 180`,
-mailmux timeout around 240 seconds, and `concurrency = 1`.
+mailmux timeout around 600 seconds with default double extraction, and `concurrency = 1`.
 
 ### Sender matching
 
@@ -346,14 +346,14 @@ enabled = true
 events = ["email_arrived"]
 max_retries = 3
 retry_backoff_secs = [30, 120, 600]
-timeout_secs = 90
+timeout_secs = 360
 concurrency = 1
 
 [processors.config]
 command = "/usr/local/bin/mailtx"
 ```
 
-**`timeout_secs`** must be generous enough to cover an LLM API round-trip
+**`timeout_secs`** must cover both LLM extractions plus category, duplicate-lookup, and POST requests
 (typically 2–10 s) plus the downstream HTTP POST. 90 s is a safe default.
 
 **`concurrency = 1`** is appropriate for low-volume bank notification emails.
@@ -440,7 +440,8 @@ mailmux replay --event-id <id> --processor mailtx
 ## Retry behaviour
 
 mailmux retries the entire invocation on non-zero exit. This means a retry
-re-runs the LLM call even if it succeeded the first time. Firefly writes carry a
+normally re-runs extraction even if it succeeded the first time. Held review
+items remain held without calling the LLM or Firefly again. Firefly writes carry a
 stable mailmux event ID as Firefly's `external_id`. On a retry, mailtx checks
 that ID before posting and treats an existing transaction as success.
 `error_if_duplicate_hash` also defaults to `true` as a backstop.
@@ -455,8 +456,8 @@ normal event does not deduplicate against that event's transaction.
 ## Logging
 
 Logs are written to stderr in the default tracing compact format. To enable
-debug logging when running under mailmux, set `RUST_LOG=mailtx_processor=debug`
-in the mailmux environment.
+debug logging when running under mailmux, set `RUST_LOG = "mailtx=debug"`
+in that processor's `[processors.config.env]` map.
 
 To inspect logs when running standalone:
 

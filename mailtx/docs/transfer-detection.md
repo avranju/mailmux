@@ -1,4 +1,4 @@
-# Transfer Detection Design
+# Transfer detection and pending state
 
 Bank transfers between two asset accounts that are both configured in mailtx
 produce two separate emails — one debit alert from the source bank and one
@@ -7,9 +7,9 @@ apart. Without special handling, each email becomes an independent
 withdrawal/deposit transaction in Firefly III. This document describes the
 design for coalescing them into a single Firefly `transfer` transaction.
 
-## Problem
+## Original problem
 
-The pipeline is stateless: each invocation processes exactly one email and
+Before pending state was introduced, the pipeline was stateless: each invocation processes exactly one email and
 immediately POSTs to Firefly. A Firefly `transfer` requires both `source_id`
 and `destination_id`, which are only available once both emails have been
 processed. The two emails arrive at different times and are processed in
@@ -104,15 +104,17 @@ Once a leg is identified as belonging to a transfer rule:
 
 1. Look up the pending store for a counterpart entry with:
    - Same `rule_id`
-   - Same `amount` (exact)
+   - Same absolute amount in checked integer minor units
+   - Same native currency
    - Opposite `leg` type (withdrawal ↔ deposit)
    - `inserted_at` within `transfer_match_window_hours`
 
 2. **Match found** — create a Firefly `transfer` transaction using the
-   `source_id` and `destination_id` from the rule. Delete the pending entry.
+   `source_id` and `destination_id` from the rule. Delete the pending entry after a successful POST; cleanup failure warns and retains success.
 
 3. **No match** — insert this leg into the pending store with its rule, leg
-   type, amount, date, narration, category, and current timestamp. Exit 0
+   type, amount, currency, bank-local date/offset, narration, category, tags,
+   stable external ID, and current timestamp. Exit 0
    without creating any Firefly transaction.
 
 If two transfers of the same amount between the same accounts arrive within the
@@ -120,12 +122,17 @@ window, match FIFO (oldest pending leg first).
 
 ## Expiry and Fallback
 
-On startup, mailtx scans the pending store for entries older than
+After authenticating and validating a found transaction, mailtx scans pending
+state for entries older than
 `transfer_match_window_hours`. Each expired entry is:
 
 1. Submitted to Firefly as a regular withdrawal or deposit (based on its leg
    type), with the tag `unmatched-transfer` appended alongside the normal tag.
-2. Deleted from the pending store.
+2. Deleted only after successful posting. Failed POSTs leave the row for retry;
+   cleanup failures warn and stable external IDs protect replays.
+
+Expiry flushing needs a subsequent accepted transaction invocation. There is no
+independent background flush daemon.
 
 This ensures no transaction is silently dropped if the counterpart email never
 arrives (e.g. the second email was filtered, already processed, or the sender
@@ -155,12 +162,20 @@ leg that completes the match), on the assumption that the credit email tends to
 carry more descriptive narration. This is a simple heuristic and could be made
 configurable.
 
-## What Does Not Change
+## Validation and currencies
 
-- The LLM schema and prompt are unchanged — no new fields are extracted.
-- The account matcher is unchanged — it resolves the account for the current
-  email only.
-- Regular (non-transfer) transactions follow the existing pipeline without
-  touching the pending store.
-- The `error_if_duplicate_hash` Firefly setting continues to act as a backstop
-  against duplicate posts.
+Sender authentication and pre-post validation run before matching/storing legs.
+Held candidates never enter transfer matching. Rules must reference known local
+accounts with compatible currencies; cross-currency coalescing is rejected
+because amounts in both currencies would be required. Replayed first legs are
+idempotent by external ID. Legacy expired rows receive stable persisted fallback
+identities, and currency-less legacy rows expire independently of known-currency
+legs. Firefly duplicate hashes remain a secondary protection.
+
+The completed transfer uses the second leg's date, narration, category and tags;
+source/destination asset IDs come from the configured rule. Keyword matching uses
+the original extracted narration, before payee display cleanup. This heuristic
+does not establish that two same-amount transfers belong together; limit rules
+and windows appropriately. Concurrent mailtx processes should be serialized
+(`concurrency = 1`) for FIFO matching; downstream IDs protect replays of the same
+event but cannot infer a shared identity for two independently claimed legs.

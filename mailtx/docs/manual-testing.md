@@ -2,6 +2,12 @@
 
 `mailtx` reads JSON from stdin, loads a `.eml` file from disk, calls an LLM to extract transaction details, runs the deterministic account matcher, and POSTs to a Firefly III HTTP endpoint. To test it manually you need to provide: a config file, a sample email, and a mock HTTP server.
 
+Synthetic Authentication-Results below are for local fixtures only. Production
+mail must retain verdicts from a trusted receiving provider. Default validation
+runs two extractions and can hold suspicious outputs; inspect review_reasons if
+no POST appears. Use matching transaction/email dates and a fresh state DB for
+each independent scenario.
+
 ## Cloud/auto and local OpenAI-compatible acceptance
 
 The existing cloud example below exercises legacy `llm_model` routing. For local
@@ -32,6 +38,7 @@ Exercise the debit fixture below, then create and run these additional fixtures:
 
 ```bash
 cat > /tmp/mailtx-test/credit.eml <<'EOF'
+Authentication-Results: mx.receiver.test; dmarc=pass header.from=mybank.com
 From: alerts@mybank.com
 Subject: Salary credited INR 50000
 Content-Type: text/plain
@@ -39,6 +46,7 @@ Content-Type: text/plain
 Your account XX9772 was credited with INR 50,000.00 on 09-Mar-2026. Narration: ACME Salary.
 EOF
 cat > /tmp/mailtx-test/html-only.eml <<'EOF'
+Authentication-Results: mx.receiver.test; dmarc=pass header.from=mybank.com
 From: alerts@mybank.com
 Subject: Card purchase
 MIME-Version: 1.0
@@ -47,6 +55,7 @@ Content-Type: text/html; charset=utf-8
 <html><body><p>INR 250.00 debited from account XX9772 on 10-Mar-2026. Narration: Cafe.</p></body></html>
 EOF
 cat > /tmp/mailtx-test/non-transaction.eml <<'EOF'
+Authentication-Results: mx.receiver.test; dmarc=pass header.from=mybank.com
 From: alerts@mybank.com
 Subject: Monthly statement available
 Content-Type: text/plain
@@ -57,7 +66,7 @@ EOF
 
 Replace `llm_model` in the sample TOML with the `[llm]` table above (do not
 append it: explicit `llm_model` plus `[llm]` is a configuration error). Run each
-fixture using its path in stdin JSON. Run each supported `json_schema`,
+fixture using its path and a matching email.date timestamp in stdin JSON. Run each supported `json_schema`,
 `json_object`, and `prompt` mode; repeat cold and warm, with and without
 configured API-key authentication. For the deadline check set both
 `timeout_secs = 1` and `connect_timeout_secs = 1` (the connection deadline may
@@ -77,6 +86,7 @@ mkdir -p /tmp/mailtx-test
 Create `/tmp/mailtx-test/sample.eml`:
 
 ```
+Authentication-Results: mx.receiver.test; dmarc=pass header.from=mybank.com
 From: alerts@mybank.com
 To: me@example.com
 Subject: HDFC Bank: Debit of INR 1,234.56 from A/c XX9772
@@ -98,11 +108,16 @@ Create `/tmp/mailtx-test/config.toml`:
 
 ```toml
 allowed_senders = ["alerts@mybank.com"]
+trusted_authserv_ids = ["mx.receiver.test"] # synthetic receiver, fixtures only
+state_db = "/tmp/mailtx-test/state.sqlite"
 llm_model = "claude-haiku-4-5-20251001"
 
 [firefly]
 base_url = "http://localhost:8080"
 access_token = "test-token"
+currency_code = "INR"
+transaction_timezone = "Asia/Kolkata"
+categories_cache_ttl_secs = 0 # make every mock request visible
 default_asset_account_id = "1"
 apply_rules = false
 fire_webhooks = false
@@ -157,6 +172,7 @@ echo '{
   "email": {
     "subject": "HDFC Bank: Debit of INR 1,234.56 from A/c XX9772",
     "sender": "HDFC Bank Alerts <alerts@mybank.com>",
+    "date": "2026-03-09T05:00:00Z",
     "raw_message_path": "/tmp/mailtx-test/sample.eml"
   }
 }' | MAILTX_CONFIG=/tmp/mailtx-test/config.toml \
@@ -167,7 +183,7 @@ echo '{
 Or if already built:
 
 ```bash
-echo '{"event":{"id":1},"email":{"subject":"HDFC Bank: Debit of INR 1,234.56 from A/c XX9772","sender":"alerts@mybank.com","raw_message_path":"/tmp/mailtx-test/sample.eml"}}' \
+echo '{"event":{"id":1},"email":{"subject":"HDFC Bank: Debit of INR 1,234.56 from A/c XX9772","sender":"alerts@mybank.com","date":"2026-03-09T05:00:00Z","raw_message_path":"/tmp/mailtx-test/sample.eml"}}' \
   | MAILTX_CONFIG=/tmp/mailtx-test/config.toml \
     ANTHROPIC_API_KEY=your-key-here \
     ./target/debug/mailtx

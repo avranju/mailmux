@@ -1,291 +1,155 @@
-# High-Level Design: Mailmux
+# Mailmux implementation design
 
-## 1. System Overview
+This document describes the implemented daemon. The [workspace README](../../README.md)
+and [configuration example](../config.example.toml) contain runnable setup and
+configuration examples. The SQL files in [migrations](../migrations/) are the
+schema source of truth.
 
-Mailmux is a background daemon designed to reliably synchronize emails from IMAP servers into a local PostgreSQL database and trigger event-driven processing pipelines. It emphasizes data integrity, recoverability, and idempotency.
+## Ingestion and storage
 
-The system is composed of two active stages:
+One account manager supervises a watcher per configured mailbox. Each watcher
+owns one authenticated IMAP connection; there is no per-account connection pool.
+All watchers for an account share its synchronization request rate limit.
+`database.max_connections` controls the separate PostgreSQL pool.
 
-1.  **Ingestion + Event Creation (IMAP -> DB)**: Fetches emails and stores them alongside their corresponding events in a single atomic transaction. This guarantees that no events are lost and no data changes go unnoticed.
-2.  **Processing (Event -> Processor)**: Consumes events from the database and executes registered processors (business logic).
+A watcher selects its mailbox, requires UIDVALIDITY, synchronizes UIDs, then
+waits in IDLE. An explicit IDLE rejection switches to polling on the same selected
+connection. Transport/protocol failures reconnect. Heartbeats run an incremental
+sync even without a notification. When leaving active IDLE, the client sends DONE and drains the matching tagged
+completion before reusing the connection; no DONE is needed if the server already
+completed IDLE. Drain failure forces reconnect.
+Command, drain, inactivity, and fetch-drain deadlines are configurable per account.
+Aggregate result/body limits bound each IMAP command's retained data.
 
-There is no separate "event generation" stage — event creation is embedded in the ingestion transaction, not a separate polling loop that scans the DB for changes.
+Emails are identified by account, mailbox, UIDVALIDITY, and UID. A generation
+change resets synchronization for the new generation while preserving earlier
+emails, events, jobs, and raw files. New raw messages use
+`{data_dir}/{account}/{mailbox}/uv_{uidvalidity}/{uid}.eml`; existing paths remain
+valid after migration. Filesystem writes precede the metadata transaction, so a
+failed SQL insert can leave an unreferenced raw file. The filesystem and database
+are not one atomic transaction.
 
-## 2. Architecture Modules
+UID responses are sorted and deduplicated. Metadata and the `email_arrived` event
+are inserted in one PostgreSQL transaction, with NOTIFY delivered after commit.
+A failed write aborts the batch before checkpoint advancement. Successfully
+stored messages are deduplicated on retry. Checkpoints use checked UID arithmetic;
+a maximum UID waits for a new generation. Initial-scan filters still checkpoint
+an excluded mailbox so later cycles can ingest new arrivals without repeating the
+initial scan. Flag-change and deletion detection remain deferred.
 
-### 2.1 Core
-*   **Main**: Application entry point. Parses CLI arguments (via `clap`), initializes runtime, logger, database pool, and spawns manager tasks.
-*   **Config**: Handles loading `config.toml`, merging environment variables, and validating settings. Uses `serde` + `toml`.
+Subjects and sender metadata are bounded; raw `.eml` files retain full content.
+SELECT's message count is diagnostic evidence, not a completeness guarantee for
+a mailbox that can change during synchronization.
 
-### 2.2 Storage Layer (PostgreSQL)
-*   **Database**: PostgreSQL is the single source of truth for metadata and events.
-*   **Message Store**: Raw RFC 5322 messages and attachments are stored on the filesystem, with only metadata and parsed headers in PostgreSQL. This prevents DB bloat.
-*   **Models**:
-    *   `MailboxState`: Tracks `uid_validity` and `last_seen_uid`.
-    *   `Email`: Stores parsed headers, metadata, flags, and a filesystem path to the raw message.
-    *   `Event`: Append-only log of interesting occurrences (NewEmail, FlagChange).
-    *   `ProcessorJob`: Tracks the state of an event being processed by a specific processor (Pending, Success, Failed).
-*   **Library**: `sqlx` for async, type-safe queries.
+## Event dispatch and processors
 
-### 2.3 Ingestion (The "Source")
-*   **AccountManager**: Manages the lifecycle of IMAP connections. Supervises per-account tasks and restarts them on failure (see section 6).
-*   **MailboxWatcher**: A task per mailbox.
-    *   **Sync**: Performs initial fetch (bounded by configurable limits) and incremental updates (UID fetch). Rate-limited per account.
-    *   **Idle** (Phase 4): Uses IMAP IDLE to listen for real-time updates. Sends DONE on shutdown, reconnects on timeout.
-*   **Library**: `imap-next` (built on `imap-codec`, actively maintained, designed for async from the ground up). `mail-parser` for RFC 5322 parsing.
-*   **Note on `async-imap`**: This crate has had periods of low maintenance. `imap-next` is preferred. This decision should be revisited if `imap-next` proves insufficient during Phase 2 implementation.
+LISTEN/NOTIFY lowers latency; periodic polling recovers missed notifications.
+Events remain undispatched until the scheduler atomically registers jobs for all
+currently eligible processors and sets `events.dispatched_at`. Zero-match events
+are marked dispatched too. Unique `(event_id, processor_name)` jobs and atomic
+claims deduplicate notification/poll overlap.
 
-### 2.4 Event Bus
-*   **EventLog**: Part of the storage transaction. When an email is inserted or updated, an `Event` is created in the **same transaction**.
-*   **EventLoop**: Notified of new events via **PostgreSQL `LISTEN/NOTIFY`**. Falls back to periodic polling as a safety net (e.g., every 5 seconds). This ensures low-latency event dispatch without excessive DB load.
+The registry supports `logger` and `command`. An arbitrary processor name also
+selects the command implementation when its `config` contains `command`.
+Unknown names without that key are logged and skipped. There is no built-in
+HTTP/webhook processor: use an executable that reads the stdin event JSON and
+performs the HTTP operation.
 
-### 2.5 Processor System (The "Sink")
-*   **ProcessorRegistry**: Loads compiled-in trait-based processors at startup. Each processor is a Rust type implementing the `Processor` trait. Out-of-process processors (CLI/HTTP) are a Phase 4 addition.
-*   **JobScheduler**: Distributes events to processors.
-    *   Ensures a processor processes events in order (if required) or concurrently.
-    *   Handles retries and backoff logic.
-*   **State Tracking**: Updates `processor_jobs` table to ensure at-least-once delivery.
-
-## 3. Data Flow
-
-1.  **Startup**: Parse CLI args, load config, connect to DB, run migrations.
-2.  **Connect**: `AccountManager` connects to IMAP servers.
-3.  **Sync/Idle**:
-    *   IMAP Server reports new message (UID 123).
-    *   `MailboxWatcher` fetches message 123 (respecting rate limits).
-4.  **Persist** (atomic):
-    *   Start DB Transaction.
-    *   Write raw message to filesystem.
-    *   Insert `email` metadata record (with path to raw message).
-    *   Insert `event` record (`type: email_arrived`, `ref: email_id`).
-    *   Commit Transaction.
-    *   Send `NOTIFY` on the events channel.
-5.  **Dispatch**:
-    *   `EventLoop` receives notification.
-    *   `JobScheduler` sees new `event`.
-    *   Finds matching processors (e.g., "WebhookProcessor").
-    *   Creates/Updates `processor_job` entry to `IN_PROGRESS`.
-6.  **Execute**:
-    *   `WebhookProcessor` runs (sends HTTP POST).
-    *   If success: Update `processor_job` to `COMPLETED`.
-    *   If fail: Update `processor_job` to `FAILED` (schedule retry).
-
-## 4. Key Technology Stack
-
-*   **Language**: Rust (Edition 2024)
-*   **Runtime**: `tokio` (Async I/O)
-*   **CLI**: `clap` (argument parsing and subcommands)
-*   **Database**: PostgreSQL
-*   **ORM/Query**: `sqlx`
-*   **IMAP**: `imap-next` + `mail-parser`
-*   **Serialization**: `serde` + `toml`
-*   **Logging**: `tracing` + `tracing-subscriber`
-
-## 5. Database Schema
-
-### 5.1 Tables
-
-```sql
--- Tracks sync state per mailbox
-CREATE TABLE mailbox_states (
-    id              BIGSERIAL PRIMARY KEY,
-    account_id      TEXT NOT NULL,
-    mailbox_name    TEXT NOT NULL,
-    uid_validity    BIGINT NOT NULL,
-    last_seen_uid   BIGINT NOT NULL DEFAULT 0,
-    last_sync_at    TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (account_id, mailbox_name)
-);
-
--- Email metadata (raw message stored on filesystem)
-CREATE TABLE emails (
-    id              BIGSERIAL PRIMARY KEY,
-    account_id      TEXT NOT NULL,
-    mailbox_name    TEXT NOT NULL,
-    uid             BIGINT NOT NULL,
-    message_id      TEXT,           -- RFC 5322 Message-ID header
-    subject         TEXT,
-    sender          TEXT,
-    recipients      JSONB,
-    date            TIMESTAMPTZ,
-    flags           TEXT[] NOT NULL DEFAULT '{}',
-    raw_message_path TEXT NOT NULL,  -- filesystem path to raw RFC 5322 message
-    size_bytes      BIGINT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (account_id, mailbox_name, uid)
-);
-
-CREATE INDEX idx_emails_message_id ON emails (message_id) WHERE message_id IS NOT NULL;
-CREATE INDEX idx_emails_account_mailbox ON emails (account_id, mailbox_name);
-CREATE INDEX idx_emails_date ON emails (date);
-
--- Append-only event log
-CREATE TABLE events (
-    id              BIGSERIAL PRIMARY KEY,
-    event_type      TEXT NOT NULL,   -- 'email_arrived', 'flags_changed', 'email_deleted', 'sync_completed'
-    account_id      TEXT NOT NULL,
-    mailbox_name    TEXT NOT NULL,
-    email_id        BIGINT REFERENCES emails(id),
-    payload         JSONB NOT NULL DEFAULT '{}',
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_events_unprocessed ON events (id) WHERE id > (
-    SELECT COALESCE(MAX(last_processed_event_id), 0) FROM processor_cursors
-);
-CREATE INDEX idx_events_type ON events (event_type);
-CREATE INDEX idx_events_created_at ON events (created_at);
-
--- Tracks per-processor progress and job state
-CREATE TABLE processor_jobs (
-    id              BIGSERIAL PRIMARY KEY,
-    event_id        BIGINT NOT NULL REFERENCES events(id),
-    processor_name  TEXT NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'pending',  -- pending, in_progress, completed, failed, abandoned
-    attempts        INT NOT NULL DEFAULT 0,
-    last_error      TEXT,
-    next_retry_at   TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (event_id, processor_name)
-);
-
-CREATE INDEX idx_processor_jobs_pending ON processor_jobs (processor_name, status)
-    WHERE status IN ('pending', 'failed');
-CREATE INDEX idx_processor_jobs_retry ON processor_jobs (next_retry_at)
-    WHERE status = 'failed' AND next_retry_at IS NOT NULL;
-```
-
-### 5.2 Schema Management
-
-*   Migrations managed via `sqlx migrate`.
-*   **Event table retention**: Old processed events should be cleaned up periodically (configurable retention period, e.g., 30 days). A background task truncates events older than the retention window where all processor_jobs are completed.
-
-## 6. Error Handling & Supervision Strategy
-
-### 6.1 Supervision Tree
-
-The system uses a hierarchical supervision model built on `tokio::JoinSet`:
-
-```
-Main
-├── AccountManager (one per account)
-│   ├── MailboxWatcher (one per mailbox)
-│   │   ├── Sync loop
-│   │   └── IDLE listener (Phase 4)
-│   └── Connection management
-├── EventLoop
-│   └── JobScheduler
-│       └── Processor tasks
-└── Housekeeping (event cleanup, health checks)
-```
-
-### 6.2 Failure Handling
-
-| Failure | Response |
-|---------|----------|
-| IMAP connection refused / timeout | Exponential backoff with jitter, max interval (e.g., 5 min). Log warning. |
-| IMAP auth failure | Log error, stop retrying for this account. Requires config fix + restart. |
-| PostgreSQL unavailable | All tasks pause. Retry connection with backoff. Resume from last known state. |
-| PostgreSQL transaction failure | Retry the transaction (up to 3 times). If persistent, log error and skip the message (resume on next sync). |
-| MailboxWatcher task panic | `AccountManager` detects via `JoinSet`, logs error, restarts the watcher after a delay. |
-| AccountManager task panic | Main loop detects via `JoinSet`, logs error, restarts the account manager after a delay. |
-| Processor execution failure | Handled by retry logic (see features.md 7.2). Does not affect other processors or ingestion. |
-| Filesystem write failure (raw message) | Log error, skip message, retry on next sync cycle. |
-
-### 6.3 Circuit Breaker
-
-If a task fails repeatedly (e.g., 10 consecutive failures within 5 minutes), it enters a "cooldown" state with a longer backoff (e.g., 15 minutes) before resuming. This prevents tight failure loops from consuming resources.
-
-## 7. Graceful Shutdown Semantics
-
-On receiving SIGTERM/SIGINT:
-
-1.  **Signal all tasks to stop.** Use a `tokio::sync::watch` channel or `CancellationToken` to broadcast shutdown.
-2.  **IDLE connections**: Send IMAP `DONE` command, then `LOGOUT`. Do not wait for new messages.
-3.  **In-flight sync batches**: Abandon partially fetched batches. The UID-based sync strategy ensures no data loss — unfetched messages will be picked up on the next startup.
-4.  **In-flight processor jobs**: Allow currently executing processors a grace period (configurable, default 10 seconds) to complete. After the grace period, mark remaining in-progress jobs as `pending` so they are retried on next startup.
-5.  **Database connections**: Flush pending writes, close the connection pool.
-6.  **Exit.** Return appropriate exit code (0 for clean shutdown).
-
-The system's idempotency guarantees (UID-based sync, at-least-once event processing) ensure correctness across unclean shutdowns as well.
-
-## 8. Example Configuration
+For example, the following is a command processor (install its executable first):
 
 ```toml
-[general]
-data_dir = "/var/lib/mailmux"       # where raw messages are stored
-log_level = "info"                   # trace, debug, info, warn, error
-log_format = "json"                  # json or pretty
-shutdown_grace_period_secs = 10
-
-[database]
-url = "postgres://mailmux:password@localhost:5432/mailmux"
-max_connections = 10
-
-# Each [[accounts]] entry defines one IMAP account to monitor.
-[[accounts]]
-id = "personal"
-imap_host = "imap.gmail.com"
-imap_port = 993
-tls = true
-username = "user@gmail.com"
-# Password can be provided via env var: MAILMUX_ACCOUNT_PERSONAL_PASSWORD
-password = "${MAILMUX_ACCOUNT_PERSONAL_PASSWORD}"
-poll_interval_secs = 60
-rate_limit_per_second = 5
-max_connections = 2
-
-# Mailboxes to monitor for this account.
-mailboxes = ["INBOX", "Sent"]
-
-# Initial sync bounds (optional). Omit to sync all messages.
-initial_sync_max_messages = 1000
-# initial_sync_max_age_days = 90
-
-[[accounts]]
-id = "work"
-imap_host = "outlook.office365.com"
-imap_port = 993
-tls = true
-username = "user@company.com"
-password = "${MAILMUX_ACCOUNT_WORK_PASSWORD}"
-poll_interval_secs = 120
-rate_limit_per_second = 3
-max_connections = 2
-mailboxes = ["INBOX"]
-
-# Processor definitions.
 [[processors]]
-name = "webhook"
+name = "mail-webhook"
 enabled = true
 events = ["email_arrived"]
 max_retries = 3
-retry_backoff_secs = [5, 30, 300]   # exponential backoff schedule
+retry_backoff_secs = [5, 30, 300]
 timeout_secs = 30
 concurrency = 2
-
 [processors.config]
-url = "https://example.com/hooks/new-email"
-method = "POST"
-headers = { "Authorization" = "Bearer ${WEBHOOK_TOKEN}" }
-
-[[processors]]
-name = "logger"
-enabled = true
-events = ["email_arrived", "flags_changed", "email_deleted"]
-max_retries = 0
-timeout_secs = 5
-concurrency = 1
+command = "/usr/local/bin/mail-webhook"
+[processors.config.env]
+WEBHOOK_URL = "https://example.com/hooks/new-email"
+WEBHOOK_TOKEN = "${WEBHOOK_TOKEN}"
 ```
 
-## 9. Implementation Phases
+Source filters and event subscriptions apply to dispatch, retries, replay, and
+backfill. The scheduler shares a positive semaphore limit per processor across
+new work and retries. It bounds batch workers at 16; channels provide backpressure
+and pending work remains durable in PostgreSQL. Slow work does not block unrelated
+processors. Backfill/replay are separate invocations, so the daemon's semaphore is
+not a global limit across those processes.
 
-1.  **Phase 1 — Foundation**: Basic CLI (clap), config loading + validation, DB connection + migrations, structured logging (tracing), graceful shutdown skeleton (CancellationToken).
-2.  **Phase 2 — Ingestion**: Connect to IMAP (imap-next), fetch emails, store raw messages on filesystem, store metadata in DB, UID-based sync, rate limiting, initial sync bounds.
-3.  **Phase 3 — Events & Processing**: Atomic event creation in ingestion transaction, LISTEN/NOTIFY event dispatch, processor trait + registry, job scheduler, basic processor execution.
-4.  **Phase 4 — Refinement**: IMAP IDLE support, retry logic + backoff, out-of-process processors (CLI/HTTP), supervision/restart on failure, systemd integration.
-5.  **Phase 5 — Observability & Operational Hardening**: Prometheus metrics export, dry-run / replay debugging tools, health check HTTP endpoint, event retention/cleanup automation.
+Command processors receive only default PATH/LANG and explicitly configured
+environment entries (plus SystemRoot on Windows). They read event/email JSON on
+stdin. Successful stdout can contain ProcessorOutput JSON, including namespaced
+metrics and metadata; stderr is for logs. Nonzero exit means retryable failure.
+Cancellation/timeouts terminate the child process group, including descendants.
+Downstream actions must be idempotent because execution is at least once.
+
+## Persistent state and retention
+
+The schema is built by applying all migrations, rather than copying a standalone
+DDL fragment from this document:
+
+| Table | Purpose |
+| --- | --- |
+| `mailbox_states` | Per-mailbox UIDVALIDITY, checkpoint, and sync timestamps |
+| `emails` | Headers, flags, booking/email date and raw-message path; generation-aware UID identity |
+| `events` | Event payload, source identifiers and `dispatched_at` |
+| `processor_jobs` | Unique event/processor job, status, attempts, output, retry time, claim version and execution lease |
+
+The undispatched-event index filters `dispatched_at IS NULL`; there is no
+processor-cursor table. Job states are `pending`, `in_progress`, `completed`,
+`failed`, and `abandoned`. A claim increments a version and carries a lease lasting
+the processor timeout plus 30 seconds. Result writes require the same claim
+version, fencing late attempts. Every ten seconds, the scheduler recovers expired
+claims and old in-progress jobs without leases, and executes pending/due jobs.
+
+Replay uses the same atomic leased claim. It may re-run a terminal job, but an
+active claim is skipped, so replay cannot race the retry sweep into executing the
+same current claim. External side effects can still repeat if a crash occurs
+after the downstream write and before recording success. Stop older daemon
+versions before upgrading because they do not participate in leases.
+
+Hourly retention selects old dispatched events with only terminal jobs, locks
+them, removes terminal child jobs before their parent events, and rechecks for
+remaining children. Undispatched events and nonterminal work are preserved.
+Retention does not delete email metadata or raw files.
+
+## Supervision and failures
+
+Account managers and mailbox watchers each have independent restart supervisors.
+Errors, panics, and unexpected clean exits trigger a five-second delay. Ten
+failures in a sliding five-minute window trigger a fifteen-minute cooldown;
+shutdown cancels both delay and cooldown. A failed mailbox does not restart its
+healthy peers. This failure window counts task exits; connection errors handled
+inside the watcher's retry loop use its own exponential backoff with jitter.
+
+Authentication failures are typed and redacted. With a credential file, rejected
+sessions wait for a valid update; valid rotation reconnects only that mailbox.
+Temporary missing/invalid updates preserve a healthy session. With legacy
+credentials, the watcher exits and its supervisor retries after the normal delay;
+changing environment-based configuration requires a daemon restart. Logs do not
+include server-provided LOGIN rejection text or private account/mailbox labels
+on authentication-failure paths.
+
+Database and filesystem failures propagate before the affected sync checkpoint is
+advanced. The next cycle retries. Processor failures follow their configured
+backoff and eventually become abandoned. The daemon does not promise that every
+task pauses synchronously while PostgreSQL is unavailable.
+
+## Shutdown and observability
+
+SIGINT/SIGTERM cancels the root token. Watcher shutdown tries to drain IDLE and
+LOGOUT, while task supervisors cancel their outstanding work. The scheduler
+drains active batches within `shutdown_grace_period_secs` (default ten seconds).
+At the grace deadline, remaining tasks are aborted. In-progress jobs are not
+blindly reset during shutdown: expired leases recover them in a subsequent
+scheduler sweep. A partial batch repeats from its last durable checkpoint.
+
+The health listener binds to loopback by default, can require a bearer token on
+metrics, and shares a request budget across its endpoints. Metrics describe
+recorded counters/gauges only; the previously advertised active-connection gauge
+was never recorded and has been removed. See the README's current metric table.
+The systemd unit uses notification readiness; watchdog signaling is not enabled.

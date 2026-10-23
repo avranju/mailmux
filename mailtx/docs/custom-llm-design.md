@@ -2,7 +2,7 @@
 
 **Status:** Implemented. See [mailtx configuration](../README.md#configuration) and the [manual testing guide](manual-testing.md) for current usage.
 
-## Recommendation
+## Implemented transport choice
 
 Add an explicit `openai_compatible` LLM backend accepting a model name, base
 URL, and endpoint path. This supports llama.cpp and llama-swap without
@@ -27,11 +27,11 @@ as explicit backends if needed.
 
 The following assessment describes the source before this design was implemented.
 
-## Current implementation and gaps
+## Historical implementation and gaps
 
 The assessment is based on the source and the workspace's `genai` **0.6.5**
-lockfile entry. `mailtx/Cargo.lock` still contains 0.5.3; workspace builds use
-`Cargo.lock` at the repository root.
+lockfile entry at the time of that assessment. Workspace builds now use only
+`Cargo.lock` at the repository root; the stale member lockfiles were removed.
 
 | Location | Current behavior | Required change |
 | --- | --- | --- |
@@ -148,7 +148,7 @@ JSON guarantees ultimately depend on the upstream inference server.
 
 ### Settings and defaults
 
-| Setting | Proposed behavior |
+| Setting | Implemented behavior |
 | --- | --- |
 | `backend` | `auto` by default; alternatively `openai_compatible` |
 | `model` | Required and nonblank for custom servers; existing Claude default for `auto` |
@@ -469,3 +469,7 @@ changing transaction processing.
 
 Upstream server documentation tracks moving branches. The relevant API
 contracts should be tested against the actual server versions deployed.
+
+Current sender authentication, durable validation review, native currencies and
+balance reconciliation are described in the [README](../README.md). Default
+double extraction requires two LLM deadlines in the outer command timeout.

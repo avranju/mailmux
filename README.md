@@ -226,7 +226,7 @@ env = { NOTIFY_TOKEN = "${NOTIFY_TOKEN}" }
 | `fetch_drain_timeout_millis` | `200` | Grace period for FETCH data sent after tagged completion (e.g. Proton Bridge). |
 | `imap_command_timeout_secs` | `60`       | Timeout for individual IMAP command exchanges                                                                             |
 | `tls_ca_file`               | —          | Path to a PEM file with extra CA cert(s) to trust (e.g. for local bridges with self-signed certs). Requires `tls = true`. |
-| `tls_accept_invalid_certs`  | `false`    | Disable TLS certificate verification entirely. Only for local bridges on loopback. Requires `tls = true`.                 |
+| `tls_accept_invalid_certs`  | `false`    | Disable TLS certificate verification entirely. Only for local bridges at exactly `localhost`, `127.0.0.1`, `::1`, or `[::1]`. Requires `tls = true`.                 |
 | `idle_heartbeat_interval_secs` | (none) | When IDLE is active, force a sync after this many seconds even if no server notification has arrived. Acts as a safety net for missed IDLE notifications. Should be larger than `poll_interval_secs`. Omit or set to null to disable. |
 
 > **TLS mode note:** mailmux supports **implicit TLS** only (`tls = true` wraps
@@ -247,7 +247,7 @@ env = { NOTIFY_TOKEN = "${NOTIFY_TOKEN}" }
 | `max_retries`        | `0`        | Max retry attempts on failure                                                      |
 | `retry_backoff_secs` | `[]`       | Backoff schedule (seconds per attempt)                                             |
 | `timeout_secs`       | `30`       | Execution timeout                                                                  |
-| `concurrency`        | `1`        | Max concurrent executions                                                          |
+| `concurrency`        | `1`        | Max active executions per processor across daemon dispatch and retries; replay/backfill have separate limits |
 | `config`             | `{}`       | Processor-specific key/value config                                                |
 
 Source selectors preserve account/mailbox pairing, for example:
@@ -308,7 +308,7 @@ environment variable. Provider API keys are inferred from the environment only
 in `auto` mode. Custom OpenAI-compatible endpoints use an explicit `api_key_env`
 or no authentication; see [mailtx custom endpoint configuration](mailtx/README.md#configuration).
 For cold local models, allow enough time beyond the LLM deadline (for example,
-180 seconds for LLM plus a 240-second mailmux processor timeout, concurrency 1).
+180 seconds for LLM plus a 600-second mailmux processor timeout, concurrency 1).
 
 Typical integration in `mailmux` config:
 
@@ -319,7 +319,7 @@ enabled = true
 events = ["email_arrived"]
 max_retries = 3
 retry_backoff_secs = [30, 120, 600]
-timeout_secs = 90
+timeout_secs = 360
 concurrency = 1
 
 [processors.config]
@@ -354,6 +354,12 @@ configurable grace period before tasks are aborted.
 mailmux replay --event-id 42
 mailmux replay --event-id 42 --processor notify
 ```
+
+Replay and the daemon retry sweep use the same atomic execution lease. An active
+claim is skipped; a terminal job can be deliberately replayed. A crash after an
+external write can still repeat side effects, so processors need idempotency.
+Backfill/replay run in separate processes and do not share the daemon's per-processor semaphore.
+
 
 **Dry-run** — execute a processor against an event without persisting results:
 
@@ -556,13 +562,13 @@ Exported metrics:
 | `mailmux_messages_ingested_total` | counter | account, mailbox  |
 | `mailmux_events_created_total`    | counter | event_type        |
 | `mailmux_processor_runs_total`    | counter | processor, status |
-| `mailmux_active_connections`      | gauge   | account           |
 | `mailmux_mailboxes_monitored`     | gauge   | account           |
 | `mailmux_idle_heartbeat_catches_total` | counter | account, mailbox |
+| `mailmux_sync_failures_total` | counter | account, mailbox, error_type |
+| `mailmux_oversized_headers_total` | counter | header |
+| `mailmux_health_rate_limited_total` | counter | none |
 
-## License
-
-[MIT](LICENSE)
+## Operational behavior
 
 Per-account `max_connections` was removed: every configured mailbox owns one
 connection, and all mailboxes of an account share its synchronization request
@@ -585,8 +591,8 @@ IMAP timeout settings are per account and must be positive values no greater tha
 
 IMAP authentication failures use a typed, redacted error. Failure logs omit
 account IDs, mailbox names, usernames, and server-provided rejection text, since
-servers can echo credentials. Watchers stop after rejection; operators should
-check their configured credentials.
+servers can echo credentials. Legacy-credential watchers exit after rejection and their supervisors retry;
+credential-file accounts wait for a valid update. Check configured credentials.
 
 ### Rotating IMAP credentials without restarting
 
@@ -707,3 +713,7 @@ Plaintext IMAP (`tls = false`) to a non-loopback host emits a startup warning.
 Missing `${VAR}` substitutions also emit warnings naming only the unresolved
 variable; the reference remains unchanged so existing optional/disabled
 configuration can still load.
+
+## License
+
+[MIT](LICENSE)
