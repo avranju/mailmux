@@ -53,6 +53,13 @@ initial_sync_max_messages = 1000
 # select, fetch inactivity, etc.). Default: 60
 # imap_command_timeout_secs = 60
 
+# Wait for IDLE DONE completion (increase on slow networks).
+# idle_drain_timeout_secs = 5
+# Force a periodic sync after this much IDLE inactivity.
+# idle_inactivity_timeout_secs = 1800
+# Grace period for servers sending FETCH data after tagged completion.
+# fetch_drain_timeout_millis = 200
+
 # Path to a PEM file containing additional CA certificate(s) to trust.
 # Use this for local mail bridges that present a self-signed certificate,
 # e.g. Proton Mail Bridge exports a cert.pem from its settings screen.

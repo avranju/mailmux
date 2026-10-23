@@ -84,6 +84,12 @@ pub struct AccountConfig {
     pub initial_sync_start_date: Option<NaiveDate>,
     #[serde(default = "default_imap_command_timeout")]
     pub imap_command_timeout_secs: u64,
+    #[serde(default = "default_idle_drain_timeout")]
+    pub idle_drain_timeout_secs: u64,
+    #[serde(default = "default_idle_inactivity_timeout")]
+    pub idle_inactivity_timeout_secs: u64,
+    #[serde(default = "default_fetch_drain_timeout")]
+    pub fetch_drain_timeout_millis: u64,
     pub tls_ca_file: Option<String>,
     #[serde(default)]
     pub tls_accept_invalid_certs: bool,
@@ -92,6 +98,16 @@ pub struct AccountConfig {
     /// net to catch messages that IDLE silently missed.  Should be larger
     /// than `poll_interval_secs`.  Omit or set to null to disable.
     pub idle_heartbeat_interval_secs: Option<u64>,
+}
+
+fn default_idle_drain_timeout() -> u64 {
+    5
+}
+fn default_idle_inactivity_timeout() -> u64 {
+    30 * 60
+}
+fn default_fetch_drain_timeout() -> u64 {
+    200
 }
 
 fn default_imap_port() -> u16 {
@@ -348,6 +364,28 @@ impl Config {
                     account.id
                 );
             }
+            for (name, value) in [
+                (
+                    "imap_command_timeout_secs",
+                    account.imap_command_timeout_secs,
+                ),
+                ("idle_drain_timeout_secs", account.idle_drain_timeout_secs),
+                (
+                    "idle_inactivity_timeout_secs",
+                    account.idle_inactivity_timeout_secs,
+                ),
+                (
+                    "fetch_drain_timeout_millis",
+                    account.fetch_drain_timeout_millis,
+                ),
+            ] {
+                if value == 0 || value > 86_400_000 {
+                    bail!(
+                        "account '{}': {name} must be between 1 and 86400000",
+                        account.id
+                    );
+                }
+            }
             if let Some(heartbeat) = account.idle_heartbeat_interval_secs
                 && heartbeat <= account.poll_interval_secs
             {
@@ -514,6 +552,41 @@ events = ["email_arrived"]
 timeout_secs = 5
 concurrency = 1
 "#
+    }
+
+    #[test]
+    fn imap_timeout_defaults_and_overrides() {
+        let config: Config = toml::from_str(sample_toml()).unwrap();
+        let account = &config.accounts[0];
+        assert_eq!(account.imap_command_timeout_secs, 60);
+        assert_eq!(account.idle_drain_timeout_secs, 5);
+        assert_eq!(account.idle_inactivity_timeout_secs, 1800);
+        assert_eq!(account.fetch_drain_timeout_millis, 200);
+        for field in [
+            "imap_command_timeout_secs",
+            "idle_drain_timeout_secs",
+            "idle_inactivity_timeout_secs",
+            "fetch_drain_timeout_millis",
+        ] {
+            let text = sample_toml().replace(
+                "poll_interval_secs = 60",
+                &format!("poll_interval_secs = 60\n{field} = 42"),
+            );
+            let config: Config = toml::from_str(&text).unwrap();
+            config.validate().unwrap();
+            let account = &config.accounts[0];
+            let actual = match field {
+                "imap_command_timeout_secs" => account.imap_command_timeout_secs,
+                "idle_drain_timeout_secs" => account.idle_drain_timeout_secs,
+                "idle_inactivity_timeout_secs" => account.idle_inactivity_timeout_secs,
+                "fetch_drain_timeout_millis" => account.fetch_drain_timeout_millis,
+                _ => unreachable!(),
+            };
+            assert_eq!(actual, 42);
+            let text = text.replace(&format!("{field} = 42"), &format!("{field} = 0"));
+            let config: Config = toml::from_str(&text).unwrap();
+            assert!(config.validate().unwrap_err().to_string().contains(field));
+        }
     }
 
     fn write_temp_config(content: &str) -> NamedTempFile {

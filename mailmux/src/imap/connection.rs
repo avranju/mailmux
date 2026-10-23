@@ -49,15 +49,6 @@ impl ResponseBudget {
     }
 }
 
-const IDLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Maximum time to sit in IDLE without any server activity before forcing a
-/// reconnect.  Acts as a safety net when no heartbeat is configured: if the
-/// TCP connection silently dies (NAT timeout, network outage, etc.) and the
-/// OS never surfaces a read error, `stream.next()` blocks forever.  This
-/// ceiling ensures we always break out and re-establish a fresh connection.
-const IDLE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-
 /// Outcome of an IDLE wait.
 #[derive(Debug, PartialEq, Eq)]
 pub enum IdleOutcome {
@@ -68,11 +59,6 @@ pub enum IdleOutcome {
     /// A shutdown was requested via the cancellation token.
     Shutdown,
 }
-
-/// How long to wait for trailing FETCH responses after a tagged OK.
-/// Proton Mail Bridge sends the tagged completion before the message data;
-/// this grace period lets those responses arrive before we return.
-const FETCH_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// A TLS certificate verifier that accepts any certificate without validation.
 /// Only use for local bridges (e.g. Proton Mail Bridge) on loopback interfaces.
@@ -131,6 +117,9 @@ pub struct ImapConnection {
     client: Client,
     tag_counter: u32,
     command_timeout: Duration,
+    idle_drain_timeout: Duration,
+    idle_inactivity_timeout: Duration,
+    fetch_drain_timeout: Duration,
 }
 
 impl ImapConnection {
@@ -243,6 +232,9 @@ impl ImapConnection {
             client,
             tag_counter: 0,
             command_timeout,
+            idle_drain_timeout: Duration::from_secs(config.idle_drain_timeout_secs),
+            idle_inactivity_timeout: Duration::from_secs(config.idle_inactivity_timeout_secs),
+            fetch_drain_timeout: Duration::from_millis(config.fetch_drain_timeout_millis),
         };
 
         // Wait for server greeting
@@ -452,7 +444,7 @@ impl ImapConnection {
                             while let Ok(Ok(Event::DataReceived {
                                 data: Data::Fetch { items, .. },
                             })) = tokio::time::timeout(
-                                FETCH_DRAIN_TIMEOUT,
+                                self.fetch_drain_timeout,
                                 self.stream.next(&mut self.client),
                             )
                             .await
@@ -537,7 +529,7 @@ impl ImapConnection {
                             while let Ok(Ok(Event::DataReceived {
                                 data: Data::Fetch { items, .. },
                             })) = tokio::time::timeout(
-                                FETCH_DRAIN_TIMEOUT,
+                                self.fetch_drain_timeout,
                                 self.stream.next(&mut self.client),
                             )
                             .await
@@ -695,7 +687,7 @@ impl ImapConnection {
         // immediately so the caller can run an incremental sync.
         if got_update_during_setup {
             self.client.set_idle_done();
-            let _ = tokio::time::timeout(IDLE_DRAIN_TIMEOUT, async {
+            let _ = tokio::time::timeout(self.idle_drain_timeout, async {
                 loop {
                     match self.stream.next(&mut self.client).await {
                         Ok(Event::StatusReceived { .. }) => break,
@@ -716,16 +708,16 @@ impl ImapConnection {
         // returns early with an empty result, causing every post-IDLE sync
         // to report "no new messages" even when new mail is present.
         let effective_heartbeat = match heartbeat_interval {
-            Some(d) if d > IDLE_INACTIVITY_TIMEOUT => {
+            Some(d) if d > self.idle_inactivity_timeout => {
                 tracing::warn!(
                     requested_secs = d.as_secs(),
-                    max_secs = IDLE_INACTIVITY_TIMEOUT.as_secs(),
+                    max_secs = self.idle_inactivity_timeout.as_secs(),
                     "heartbeat interval exceeds maximum IDLE inactivity timeout, clamping"
                 );
-                IDLE_INACTIVITY_TIMEOUT
+                self.idle_inactivity_timeout
             }
             Some(d) => d,
-            None => IDLE_INACTIVITY_TIMEOUT,
+            None => self.idle_inactivity_timeout,
         };
         let mut heartbeat: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
             Box::pin(tokio::time::sleep(effective_heartbeat));
@@ -771,7 +763,7 @@ impl ImapConnection {
                     if !saw_update {
                         self.client.set_idle_done();
                     }
-                    let _ = tokio::time::timeout(IDLE_DRAIN_TIMEOUT, async {
+                    let _ = tokio::time::timeout(self.idle_drain_timeout, async {
                         loop {
                             match self.stream.next(&mut self.client).await {
                                 Ok(Event::StatusReceived { .. }) => break,
@@ -791,7 +783,7 @@ impl ImapConnection {
                     }
                     // Drain until we get the tagged response, with a short timeout
                     // to avoid blocking shutdown indefinitely.
-                    let _ = tokio::time::timeout(IDLE_DRAIN_TIMEOUT, async {
+                    let _ = tokio::time::timeout(self.idle_drain_timeout, async {
                         loop {
                             match self.stream.next(&mut self.client).await {
                                 Ok(Event::StatusReceived { .. }) => break,
