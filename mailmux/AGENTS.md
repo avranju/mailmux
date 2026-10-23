@@ -145,3 +145,10 @@ AccountManager owns the shared synchronization RateLimiter for all its mailbox
 watchers. There is no account max_connections setting; the PostgreSQL pool's
 max_connections remains supported. UID lists and fetched messages are sorted,
 SELECT must supply UIDVALIDITY, and the maximum UID checkpoint must not wrap.
+
+IMAP accounts can use `credentials_file` instead of username/password. The
+16 KiB-bounded TOML file contains username and password and is re-read before
+connections and monitored at credential_reload_interval_secs (default 30).
+Valid rotation reconnects only the mailbox session; missing/invalid transient
+updates retain an existing session. Never log credential contents or TOML parse
+errors with source snippets. Legacy environment credentials require restart.

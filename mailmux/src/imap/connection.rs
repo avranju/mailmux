@@ -136,6 +136,7 @@ pub struct ImapConnection {
 impl ImapConnection {
     /// Connect to an IMAP server, wait for greeting, and login.
     pub async fn connect(config: &AccountConfig) -> Result<Self> {
+        let credentials = config.credentials()?;
         let addr = format!("{}:{}", config.imap_host, config.imap_port);
         let connect_timeout = Duration::from_secs(config.imap_command_timeout_secs);
         debug!(host = %config.imap_host, port = config.imap_port, tls = config.tls, "connecting to IMAP server");
@@ -252,9 +253,8 @@ impl ImapConnection {
         conn.wait_for_greeting().await?;
 
         // Login (clone strings to satisfy 'static lifetime requirements)
-        let username = config.username.clone();
-        let password = config.password.clone();
-        conn.login(&username, &password).await?;
+        conn.login(&credentials.username, &credentials.password)
+            .await?;
 
         Ok(conn)
     }
