@@ -565,3 +565,12 @@ responses are sorted defensively; missing UIDVALIDITY aborts sync, and a
 checkpoint at the maximum UID waits for a new UIDVALIDITY generation. SELECT
 message counts are included in diagnostics, without treating a changing
 EXISTS count as a completeness guarantee.
+
+### IMAP response limits
+
+Each IMAP command accepts at most 1,000,000 result entries. Message FETCH
+results also have a combined 128 MiB body/flag budget, checked before copying
+message data. Individual wire responses are limited to 100 MiB by the IMAP
+parser. Exceeding a limit logs a warning and fails the sync without returning
+partial results; the watcher reconnects through its normal error handling.
+Split very large mailboxes if their UID scan exceeds the entry limit.
