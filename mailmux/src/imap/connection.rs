@@ -60,6 +60,16 @@ impl std::fmt::Display for AuthenticationFailure {
 }
 impl std::error::Error for AuthenticationFailure {}
 
+#[derive(Debug)]
+pub struct IdleUnsupported;
+
+impl std::fmt::Display for IdleUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("server does not support IMAP IDLE")
+    }
+}
+impl std::error::Error for IdleUnsupported {}
+
 /// Outcome of an IDLE wait.
 #[derive(Debug, PartialEq, Eq)]
 pub enum IdleOutcome {
@@ -674,7 +684,7 @@ impl ImapConnection {
                         return Ok::<bool, anyhow::Error>(saw_update);
                     }
                     Event::IdleRejected { .. } => {
-                        bail!("IDLE rejected by server");
+                        return Err(IdleUnsupported.into());
                     }
                     Event::DataReceived { data } => match data {
                         Data::Exists(_) | Data::Expunge(_) | Data::Recent(_) => {

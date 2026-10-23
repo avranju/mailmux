@@ -11,7 +11,9 @@ use tracing::{debug, error, info, warn};
 use crate::config::AccountConfig;
 use crate::db::emails::NewEmail;
 use crate::db::events::NewEvent;
-use crate::imap::connection::{AuthenticationFailure, FetchedMessage, IdleOutcome, ImapConnection};
+use crate::imap::connection::{
+    AuthenticationFailure, FetchedMessage, IdleOutcome, IdleUnsupported, ImapConnection,
+};
 use crate::store::MessageStore;
 
 const FETCH_BATCH_SIZE: usize = 500;
@@ -255,20 +257,17 @@ impl MailboxWatcher {
                     let _ = conn.logout().await;
                     return Ok(());
                 }
-                Err(e) if e.to_string().contains("timed out") => {
-                    return Err(e);
-                }
-                Err(e) => {
+                Err(e) if e.is::<IdleUnsupported>() => {
                     debug!(
                         account = self.account.id,
                         mailbox = self.mailbox,
-                        error = %e,
-                        "IDLE not supported or failed, falling back to polling"
+                        "IDLE unsupported, continuing on the selected connection with polling"
                     );
-                    // Fall back to polling for the rest of this connection
-                    let _ = conn.logout().await;
-                    return self.poll_cycle(rate_limiter, poll_interval).await;
+                    return self
+                        .poll_cycle(&mut conn, uid_validity, rate_limiter, poll_interval)
+                        .await;
                 }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -276,27 +275,24 @@ impl MailboxWatcher {
     /// Polling fallback when IDLE is not available.
     async fn poll_cycle(
         &self,
+        conn: &mut ImapConnection,
+        uid_validity: u32,
         rate_limiter: &Arc<DefaultDirectRateLimiter>,
         poll_interval: Duration,
     ) -> Result<()> {
-        let mut conn = ImapConnection::connect(&self.account).await?;
-        let (uid_validity, exists) = conn.select(&self.mailbox).await?;
-        debug!(
-            exists,
-            uid_validity, "selected mailbox; scanning UIDs to cover concurrent arrivals"
-        );
-
-        self.do_incremental_sync(&mut conn, uid_validity, rate_limiter)
-            .await?;
-        let _ = conn.logout().await;
-
-        // Wait for next poll
-        tokio::select! {
-            _ = tokio::time::sleep(poll_interval) => {}
-            _ = self.token.cancelled() => {}
+        loop {
+            // The initial sync already ran before IDLE was attempted. Wait
+            // before each subsequent sync, keeping this authenticated session.
+            tokio::select! {
+                _ = tokio::time::sleep(poll_interval) => {},
+                _ = self.token.cancelled() => {
+                    let _ = conn.logout().await;
+                    return Ok(());
+                },
+            }
+            self.do_incremental_sync(conn, uid_validity, rate_limiter)
+                .await?;
         }
-
-        Ok(())
     }
 
     /// Fetch new messages since last_seen_uid and persist them.
@@ -1162,6 +1158,106 @@ mod checkpoint_persistence_tests {
                 assert_eq!((emails, events), (3, 3));
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod polling_tests {
+    use super::*;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn non_idle_server_uses_one_connection_and_one_sync_per_poll(pool: PgPool) -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let account: AccountConfig = toml::from_str(&format!(
+            r#"
+            id = "test"
+            imap_host = "127.0.0.1"
+            imap_port = {}
+            tls = false
+            username = "test"
+            password = "test"
+            mailboxes = ["INBOX"]
+        "#,
+            listener.local_addr()?.port()
+        ))?;
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut peer = BufReader::new(stream);
+            peer.write_all(b"* OK ready\r\n").await.unwrap();
+            let mut syncs = 0;
+            let mut idles = 0;
+            let mut logins = 0;
+            let mut selects = 0;
+            loop {
+                let mut line = String::new();
+                assert!(peer.read_line(&mut line).await.unwrap() > 0);
+                let tag = line.split_whitespace().next().unwrap();
+                if line.contains(" LOGIN ") {
+                    logins += 1;
+                } else if line.contains(" SELECT ") {
+                    selects += 1;
+                    peer.write_all(b"* OK [UIDVALIDITY 123] valid\r\n* 0 EXISTS\r\n")
+                        .await
+                        .unwrap();
+                } else if line.contains(" UID FETCH ") {
+                    syncs += 1;
+                    assert!(line.contains("UID FETCH 1:*"));
+                    if syncs == 4 {
+                        server_token.cancel();
+                    }
+                } else if line.contains(" IDLE") {
+                    idles += 1;
+                    assert_eq!(syncs, 1, "initial sync must run exactly once");
+                    peer.write_all(format!("{tag} BAD IDLE unsupported\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                    continue;
+                } else if line.contains(" LOGOUT") {
+                    peer.write_all(format!("* BYE closing\r\n{tag} OK done\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                    break;
+                } else {
+                    panic!("unexpected command {line}");
+                }
+                peer.write_all(format!("{tag} OK done\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            assert_eq!((logins, selects, idles, syncs), (1, 1, 1, 4));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err(),
+                "polling opened another connection"
+            );
+        });
+        let dir = TempDir::new()?;
+        let watcher = MailboxWatcher::new(
+            Arc::new(account),
+            "INBOX".into(),
+            pool.clone(),
+            Arc::new(MessageStore::new(dir.path().to_str().unwrap())),
+            token,
+        );
+        let limiter = Arc::new(RateLimiter::direct(Quota::per_second(nonzero!(1000u32))));
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            watcher.sync_and_idle_cycle(&limiter, Duration::from_millis(20)),
+        )
+        .await??;
+        server.await?;
+        let state = crate::db::emails::get_mailbox_state(&pool, "test", "INBOX")
+            .await?
+            .unwrap();
+        assert_eq!(state.uid_validity, 123);
         Ok(())
     }
 }
