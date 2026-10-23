@@ -615,3 +615,13 @@ and `Retry-After: 1` before database access or metrics rendering. The global
 budget uses constant memory and applies across clients; it does not trust
 forwarded IP headers. Monitor `mailmux_health_rate_limited_total` to detect
 excessive scrape/probe traffic.
+
+### Event header limits
+
+Ingested subjects are capped at 4096 UTF-8 bytes without splitting a character.
+Sender addresses over 1024 bytes are omitted from metadata and event payloads;
+partial sender addresses are never used for processor matching. The raw `.eml`
+file retains the complete message. With the UID field, the generated
+`email_arrived` payload stays below 31 KiB even with JSON escaping. Each
+truncation or omission emits a warning without header contents and increments
+`mailmux_oversized_headers_total{header="subject"|"sender"}`.

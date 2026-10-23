@@ -15,6 +15,42 @@ use crate::imap::connection::{AuthenticationFailure, FetchedMessage, IdleOutcome
 use crate::store::MessageStore;
 
 const FETCH_BATCH_SIZE: usize = 500;
+const MAX_SUBJECT_BYTES: usize = 4096;
+const MAX_SENDER_BYTES: usize = 1024;
+
+fn bounded_subject(subject: &str) -> String {
+    let mut end = subject.len().min(MAX_SUBJECT_BYTES);
+    if end < subject.len() {
+        while !subject.is_char_boundary(end) {
+            end -= 1;
+        }
+        crate::metrics::inc_oversized_header("subject");
+        warn!(
+            limit = MAX_SUBJECT_BYTES,
+            "oversized email subject truncated"
+        );
+    }
+    subject[..end].to_owned()
+}
+
+fn bounded_sender(sender: &str) -> Option<String> {
+    let sender = sender.trim();
+    if sender.is_empty() {
+        return None;
+    }
+    if sender.len() > MAX_SENDER_BYTES {
+        crate::metrics::inc_oversized_header("sender");
+        warn!(limit = MAX_SENDER_BYTES, "oversized email sender omitted");
+        return None;
+    }
+    let normalized = sender.to_lowercase();
+    if normalized.len() > MAX_SENDER_BYTES {
+        crate::metrics::inc_oversized_header("sender");
+        warn!(limit = MAX_SENDER_BYTES, "oversized email sender omitted");
+        return None;
+    }
+    Some(normalized)
+}
 
 /// Watches a single mailbox, performing initial + incremental sync.
 /// Supports IDLE when available, falls back to polling.
@@ -428,13 +464,12 @@ impl MailboxWatcher {
         let (message_id, subject, sender, recipients, date) = match parsed {
             Some(ref parsed) => {
                 let message_id = parsed.message_id().map(|s| s.to_string());
-                let subject = parsed.subject().map(|s| s.to_string());
+                let subject = parsed.subject().map(bounded_subject);
                 let sender = parsed.from().and_then(|addrs| {
                     addrs
                         .first()
                         .and_then(|a| a.address.as_deref())
-                        .map(|addr| addr.trim().to_lowercase())
-                        .filter(|addr| !addr.is_empty())
+                        .and_then(bounded_sender)
                 });
                 let recipients = parsed.to().map(|addrs| {
                     let list: Vec<String> = addrs
@@ -784,6 +819,99 @@ mod rotation_tests {
             tokio::time::timeout(Duration::from_secs(10), watcher.run()).await??;
             server.await?;
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod header_limit_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn header_bounds_preserve_utf8_and_never_turn_a_sender_prefix_into_an_address() {
+        assert_eq!(bounded_subject("ordinary subject"), "ordinary subject");
+        let oversized = format!("{}é", "x".repeat(MAX_SUBJECT_BYTES - 1));
+        assert_eq!(bounded_subject(&oversized).len(), MAX_SUBJECT_BYTES - 1);
+        assert_eq!(
+            bounded_subject(&"x".repeat(MAX_SUBJECT_BYTES)).len(),
+            MAX_SUBJECT_BYTES
+        );
+        assert_eq!(
+            bounded_sender("  TEST@example.com "),
+            Some("test@example.com".into())
+        );
+        assert_eq!(bounded_sender("  "), None);
+        assert!(bounded_sender(&format!("{}@example.com", "a".repeat(MAX_SENDER_BYTES))).is_none());
+    }
+
+    #[test]
+    fn generated_payload_has_a_bound_even_with_json_control_escaping() {
+        let payload = serde_json::json!({
+            "uid": u32::MAX,
+            "subject": bounded_subject(&"\u{1}".repeat(MAX_SUBJECT_BYTES)),
+            "sender": bounded_sender(&"\u{1}".repeat(MAX_SENDER_BYTES)),
+        });
+        assert!(serde_json::to_vec(&payload).unwrap().len() < 31 * 1024);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn oversized_headers_are_bounded_in_email_and_event_but_raw_is_preserved(
+        pool: PgPool,
+    ) -> Result<()> {
+        let account: AccountConfig = toml::from_str(
+            r#"
+            id = "test"
+            imap_host = "localhost"
+            username = "test"
+            password = "test"
+            mailboxes = ["INBOX"]
+        "#,
+        )?;
+        let dir = TempDir::new()?;
+        let store = Arc::new(MessageStore::new(dir.path().to_str().unwrap()));
+        let watcher = MailboxWatcher::new(
+            Arc::new(account),
+            "INBOX".into(),
+            pool.clone(),
+            store,
+            CancellationToken::new(),
+        );
+        let raw = format!(
+            "From: {}@example.com\r\nSubject: {}\r\n\r\nBody",
+            "a".repeat(MAX_SENDER_BYTES),
+            "s".repeat(MAX_SUBJECT_BYTES + 1)
+        )
+        .into_bytes();
+        let msg = FetchedMessage {
+            uid: 1,
+            flags: vec![],
+            raw_bytes: raw.clone(),
+            size: None,
+        };
+        assert_eq!(
+            watcher
+                .ingest_message(&msg, &MessageParser::default())
+                .await?,
+            1
+        );
+        let row: (String, Option<String>, String) =
+            sqlx::query_as("SELECT subject, sender, raw_message_path FROM emails")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(row.0.len(), MAX_SUBJECT_BYTES);
+        assert_eq!(row.1, None);
+        assert_eq!(tokio::fs::read(row.2).await?, raw);
+        let payload: serde_json::Value = sqlx::query_scalar("SELECT payload FROM events")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            payload["subject"].as_str().unwrap().len(),
+            MAX_SUBJECT_BYTES
+        );
+        assert!(payload["sender"].is_null());
+        assert!(serde_json::to_vec(&payload)?.len() < MAX_SUBJECT_BYTES + 128);
         Ok(())
     }
 }
