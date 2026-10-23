@@ -20,6 +20,7 @@ mod metrics;
 mod processor;
 mod shutdown;
 mod store;
+mod supervision;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -170,7 +171,6 @@ async fn cmd_run(config: config::Config) -> Result<()> {
             );
             continue;
         }
-        let account_id = account_config.id.clone();
         let manager = imap::AccountManager::new(
             account_config,
             pool.clone(),
@@ -179,9 +179,7 @@ async fn cmd_run(config: config::Config) -> Result<()> {
         );
 
         account_tasks.spawn(async move {
-            if let Err(e) = manager.run().await {
-                error!(account = account_id, error = %e, "account manager exited with error");
-            }
+            manager.run_supervised().await;
         });
     }
 

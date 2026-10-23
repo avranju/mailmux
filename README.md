@@ -688,3 +688,9 @@ ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}"
 
 When using `mailmux-submit`, explicitly pass `MAILINDEX_URL` and
 `MAILINDEX_API_TOKEN` in that processor's environment map.
+
+Each mailbox watcher and account manager has an independent restart loop.
+Errors, panics, and unexpected clean exits trigger a five-second restart delay.
+Ten failures within five minutes trigger a 15-minute cooldown for that task.
+A failed watcher restarts without interrupting healthy peer mailboxes; shutdown
+cancels restart delays and cooldowns.
