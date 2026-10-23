@@ -364,8 +364,17 @@ Increase it only if you observe a queue backlog.
 Write your config file (e.g. `/etc/mailtx/config.toml`) — see the
 [Configuration](#configuration) section for the full schema.
 
-The env vars must be present in the environment that runs mailmux, since the
-command processor inherits mailmux's environment.
+Set required variables in the environment that runs mailmux, then explicitly
+forward only those needed by mailtx in its processor configuration:
+
+```toml
+[processors.config.env]
+MAILTX_CONFIG = "/etc/mailtx/config.toml"
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}"
+```
+
+Command processors start with a cleared environment; add any custom backend
+key variable, proxy, or runtime setting explicitly to this map.
 
 #### systemd
 

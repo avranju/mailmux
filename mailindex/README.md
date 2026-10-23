@@ -89,3 +89,7 @@ The implementation uses local Turso 0.8.0-pre.6 (default features disabled), Tan
 0.26.1, rmcp 3.1.3 Streamable HTTP, mail-parser 0.11, and best-effort html2text and
 pdf-extract attachment extraction. MCP exposes only read-only `mail_search` and
 `mail_get` tools and shares HTTP search/retrieval behavior.
+
+When configuring `mailmux-submit` as a mailmux command processor, explicitly
+forward `MAILINDEX_URL` and `MAILINDEX_API_TOKEN` through
+`processors.config.env`. Commands do not inherit the daemon's environment.

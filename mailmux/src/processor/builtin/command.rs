@@ -111,12 +111,19 @@ impl Processor for CommandProcessor {
         let mut command = tokio::process::Command::new(&self.command);
         command
             .args(&self.args)
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("LANG", "C.UTF-8")
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
+        #[cfg(windows)]
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", system_root);
+        }
         #[cfg(unix)]
         command.process_group(0);
 
@@ -254,6 +261,45 @@ mod tests {
             concurrency: 1,
             config: config_map,
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn child_environment_is_explicit_and_daemon_secrets_are_absent() {
+        const FLAG: &str = "MAILMUX_ENV_ISOLATION_PROBE";
+        if std::env::var_os(FLAG).is_none() {
+            // Isolate parent-environment mutations in a subprocess so this
+            // test cannot race unrelated async tests that read environment.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "processor::builtin::command::tests::child_environment_is_explicit_and_daemon_secrets_are_absent", "--nocapture"])
+                .env(FLAG, "1")
+                .env("DB_PASSWORD", "private-test-value")
+                .env("GMAIL_APP_PASSWORD", "private-test-value")
+                .env("MAILMUX_TEST_PRIVATE", "private-test-value")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut config = build_command_config("sh", vec!["-c", r#"
+                cat >/dev/null
+                test -z "${DB_PASSWORD+x}${GMAIL_APP_PASSWORD+x}${MAILMUX_TEST_PRIVATE+x}${MAILMUX_ENV_ISOLATION_PROBE+x}" || exit 1
+                test "$EXPLICIT" = configured || exit 2
+                test "$LANG" = custom || exit 3
+                test "$PATH" = /usr/local/bin:/usr/bin:/bin || exit 4
+                printf '{"success":true}'
+            "#]);
+            config.config.insert("env".into(), toml::Value::Table([
+                ("EXPLICIT".into(), toml::Value::String("configured".into())),
+                ("LANG".into(), toml::Value::String("custom".into())),
+            ].into_iter().collect()));
+            let result = CommandProcessor::new(&config).process(&cancellation_event(), None).await.unwrap();
+            assert!(result.success);
+        });
     }
 
     #[cfg(unix)]

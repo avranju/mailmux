@@ -128,4 +128,5 @@ concurrency = 1
 # [processors.config]
 # command = "/usr/local/bin/notify-new-mail"
 # args = ["--json"]
+# Children receive only PATH, LANG, and this explicit environment map.
 # env = { NOTIFY_TOKEN = "${NOTIFY_TOKEN}", LOG_LEVEL = "info" }
