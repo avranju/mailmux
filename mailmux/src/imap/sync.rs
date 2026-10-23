@@ -428,7 +428,7 @@ impl MailboxWatcher {
                     max_uid = uid;
                 }
 
-                batch_ingested += self.ingest_message(msg, &parser).await? as u64;
+                batch_ingested += self.ingest_message(msg, uid_validity, &parser).await? as u64;
             }
 
             crate::db::emails::upsert_mailbox_state(
@@ -457,7 +457,12 @@ impl MailboxWatcher {
     /// Parse and persist a single fetched message. Returns 1 on success, 0 on
     /// failure (failure is logged as a warning rather than propagated so that
     /// one bad message does not abort the entire batch).
-    async fn ingest_message(&self, msg: &FetchedMessage, parser: &MessageParser) -> Result<u8> {
+    async fn ingest_message(
+        &self,
+        msg: &FetchedMessage,
+        uid_validity: u32,
+        parser: &MessageParser,
+    ) -> Result<u8> {
         let uid = msg.uid;
         let parsed = parser.parse(&msg.raw_bytes);
 
@@ -497,7 +502,13 @@ impl MailboxWatcher {
 
         let raw_path = self
             .store
-            .save(&self.account.id, &self.mailbox, uid, &msg.raw_bytes)
+            .save(
+                &self.account.id,
+                &self.mailbox,
+                uid_validity,
+                uid,
+                &msg.raw_bytes,
+            )
             .await
             .with_context(|| format!("saving raw message uid={uid}"))?;
 
@@ -505,6 +516,7 @@ impl MailboxWatcher {
             account_id: self.account.id.clone(),
             mailbox_name: self.mailbox.clone(),
             uid: uid as i64,
+            uid_validity: uid_validity as i64,
             message_id,
             subject: subject.clone(),
             sender: sender.clone(),
@@ -912,6 +924,132 @@ mod header_limit_tests {
         );
         assert!(payload["sender"].is_null());
         assert!(serde_json::to_vec(&payload)?.len() < MAX_SUBJECT_BYTES + 128);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    async fn mock_mailbox(generation: u32) -> (AccountConfig, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let account: AccountConfig = toml::from_str(&format!(
+            r#"
+            id = "test"
+            imap_host = "127.0.0.1"
+            imap_port = {}
+            tls = false
+            username = "test"
+            password = "test"
+            mailboxes = ["INBOX"]
+        "#,
+            listener.local_addr().unwrap().port()
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut peer = BufReader::new(stream);
+            peer.write_all(b"* OK mock ready\r\n").await.unwrap();
+            for phase in 1..=3 {
+                let mut line = String::new();
+                peer.read_line(&mut line).await.unwrap();
+                let tag = line.split_whitespace().next().unwrap();
+                if phase == 1 {
+                    assert!(line.contains(" LOGIN "));
+                } else if phase == 2 {
+                    assert!(line.contains(" UID FETCH 1:* "));
+                    peer.write_all(
+                        b"* 1 FETCH (UID 1)\r\n* 2 FETCH (UID 2)\r\n* 3 FETCH (UID 3)\r\n",
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    assert!(line.contains(" UID FETCH 1:3 "));
+                    // Deliberately out of order: a higher UID persists before
+                    // the injected failure at UID 2. It must not be checkpointed.
+                    for uid in [3, 2, 1] {
+                        let raw = format!(
+                            "From: test@example.com\r\nSubject: Generation {generation} Message {uid}\r\n\r\nBody"
+                        );
+                        let response = format!(
+                            "* {uid} FETCH (UID {uid} FLAGS () BODY[] {{{}}}\r\n{raw})\r\n",
+                            raw.len()
+                        );
+                        peer.write_all(response.as_bytes()).await.unwrap();
+                    }
+                }
+                peer.write_all(format!("{tag} OK done\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        (account, server)
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn uidvalidity_change_preserves_archives_and_creates_new_events(
+        pool: PgPool,
+    ) -> Result<()> {
+        let dir = TempDir::new()?;
+        let store = Arc::new(MessageStore::new(dir.path().to_str().unwrap()));
+        let limiter = Arc::new(RateLimiter::direct(Quota::per_second(nonzero!(1000u32))));
+        let mut original = Vec::new();
+        for (attempt, generation) in [123, 124, 124].into_iter().enumerate() {
+            if attempt == 2 {
+                // Simulate a crash after durable messages but before checkpoint.
+                crate::db::emails::upsert_mailbox_state(&pool, "test", "INBOX", 124, 0).await?;
+            }
+            let (account, server) = mock_mailbox(generation).await;
+            let mut conn = ImapConnection::connect(&account).await?;
+            let watcher = MailboxWatcher::new(
+                Arc::new(account),
+                "INBOX".into(),
+                pool.clone(),
+                store.clone(),
+                CancellationToken::new(),
+            );
+            let count = watcher
+                .do_incremental_sync(&mut conn, generation, &limiter)
+                .await?;
+            server.await?;
+            assert_eq!(count, if attempt == 2 { 0 } else { 3 });
+            let state = crate::db::emails::get_mailbox_state(&pool, "test", "INBOX")
+                .await?
+                .unwrap();
+            assert_eq!(
+                (state.uid_validity, state.last_seen_uid),
+                (generation as i64, 3)
+            );
+            if attempt == 0 {
+                let paths: Vec<String> =
+                    sqlx::query_scalar("SELECT raw_message_path FROM emails ORDER BY id")
+                        .fetch_all(&pool)
+                        .await?;
+                for path in paths {
+                    let bytes = tokio::fs::read(&path).await?;
+                    original.push((path, bytes));
+                }
+            }
+        }
+        for (path, bytes) in original {
+            assert!(path.contains("uv_123"));
+            assert_eq!(tokio::fs::read(&path).await?, bytes);
+        }
+        let emails: i64 = sqlx::query_scalar("SELECT count(*) FROM emails")
+            .fetch_one(&pool)
+            .await?;
+        let events: i64 = sqlx::query_scalar("SELECT count(*) FROM events")
+            .fetch_one(&pool)
+            .await?;
+        let paths: i64 = sqlx::query_scalar("SELECT count(DISTINCT raw_message_path) FROM emails")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!((emails, events, paths), (6, 6, 6));
         Ok(())
     }
 }
