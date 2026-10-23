@@ -697,3 +697,8 @@ Errors, panics, and unexpected clean exits trigger a five-second restart delay.
 Ten failures within five minutes trigger a 15-minute cooldown for that task.
 A failed watcher restarts without interrupting healthy peer mailboxes; shutdown
 cancels restart delays and cooldowns.
+
+IMAP retry decisions and sync-failure metrics use typed errors for authentication,
+deadlines, transport, protocol, and unsupported IDLE. Error context and server
+message wording do not determine retry behavior or metric categories. Only an
+explicit IDLE rejection selects polling; other failures reconnect.

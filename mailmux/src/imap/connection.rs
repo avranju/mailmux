@@ -20,6 +20,7 @@ use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
+use super::error::ImapFailure;
 use crate::config::AccountConfig;
 
 // Bound aggregate command results as well as each individual wire response.
@@ -48,27 +49,6 @@ impl ResponseBudget {
         Ok(())
     }
 }
-
-/// Redacted authentication error: server replies may echo account credentials.
-#[derive(Debug)]
-pub struct AuthenticationFailure;
-
-impl std::fmt::Display for AuthenticationFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("IMAP authentication failed")
-    }
-}
-impl std::error::Error for AuthenticationFailure {}
-
-#[derive(Debug)]
-pub struct IdleUnsupported;
-
-impl std::fmt::Display for IdleUnsupported {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("server does not support IMAP IDLE")
-    }
-}
-impl std::error::Error for IdleUnsupported {}
 
 /// Outcome of an IDLE wait.
 #[derive(Debug, PartialEq, Eq)]
@@ -154,6 +134,7 @@ impl ImapConnection {
         let stream = tokio::time::timeout(connect_timeout, async {
             let tcp = TcpStream::connect(&addr)
                 .await
+                .map_err(ImapFailure::transport)
                 .with_context(|| format!("connecting to {addr}"))?;
 
             if config.tls {
@@ -236,14 +217,14 @@ impl ImapConnection {
                 let tls_stream = connector
                     .connect(server_name.to_owned(), tcp)
                     .await
-                    .map_err(|e| anyhow::anyhow!(format!("TLS handshake failed: {e}")))?;
+                    .map_err(ImapFailure::transport).context("TLS handshake failed")?;
                 Ok::<_, anyhow::Error>(Stream::tls(tls_stream.into()))
             } else {
                 Ok(Stream::insecure(tcp))
             }
         })
         .await
-        .unwrap_or_else(|_| bail!("IMAP connection timed out after {}s", connect_timeout.as_secs()))?;
+        .map_err(|_| ImapFailure::Timeout("connection"))??;
 
         let mut options = Options::default();
         options.max_response_size = MAX_WIRE_RESPONSE_BYTES;
@@ -283,6 +264,7 @@ impl ImapConnection {
                     .stream
                     .next(&mut self.client)
                     .await
+                    .map_err(ImapFailure::from_stream)
                     .context("waiting for server greeting")?;
                 match event {
                     Event::GreetingReceived { greeting } => {
@@ -296,7 +278,7 @@ impl ImapConnection {
             }
         })
         .await
-        .unwrap_or_else(|_| bail!("IMAP greeting timed out after {}s", timeout.as_secs()))
+        .map_err(|_| ImapFailure::Timeout("greeting"))?
     }
 
     async fn login(&mut self, username: &str, password: &str) -> Result<()> {
@@ -316,6 +298,7 @@ impl ImapConnection {
                     .stream
                     .next(&mut self.client)
                     .await
+                    .map_err(ImapFailure::from_stream)
                     .context("during LOGIN")?;
                 match event {
                     Event::StatusReceived { status } => {
@@ -335,7 +318,7 @@ impl ImapConnection {
             }
         })
         .await
-        .unwrap_or_else(|_| bail!("IMAP LOGIN timed out after {}s", timeout.as_secs()))
+        .map_err(|_| ImapFailure::Timeout("LOGIN"))?
     }
 
     /// SELECT a mailbox. Returns (uid_validity, exists_count).
@@ -357,6 +340,7 @@ impl ImapConnection {
                     .stream
                     .next(&mut self.client)
                     .await
+                    .map_err(ImapFailure::from_stream)
                     .context("during SELECT")?;
                 match event {
                     Event::DataReceived { data } => {
@@ -388,7 +372,7 @@ impl ImapConnection {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .unwrap_or_else(|_| bail!("IMAP SELECT timed out after {}s", timeout.as_secs()))?;
+        .map_err(|_| ImapFailure::Timeout("SELECT"))??;
 
         let uid_validity =
             uid_validity.context("SELECT omitted required UIDVALIDITY; refusing to sync")?;
@@ -439,12 +423,10 @@ impl ImapConnection {
         loop {
             let event =
                 match tokio::time::timeout(timeout, self.stream.next(&mut self.client)).await {
-                    Ok(result) => result.context("during UID FETCH")?,
-                    Err(_) => bail!(
-                        "IMAP UID FETCH timed out after {}s (no data received for {}s)",
-                        timeout.as_secs(),
-                        timeout.as_secs()
-                    ),
+                    Ok(result) => result
+                        .map_err(ImapFailure::from_stream)
+                        .context("during UID FETCH")?,
+                    Err(_) => return Err(ImapFailure::Timeout("UID FETCH").into()),
                 };
             match event {
                 Event::DataReceived { data } => {
@@ -529,11 +511,10 @@ impl ImapConnection {
         loop {
             let event =
                 match tokio::time::timeout(timeout, self.stream.next(&mut self.client)).await {
-                    Ok(result) => result.context("during UID FETCH (uid list)")?,
-                    Err(_) => bail!(
-                        "IMAP UID FETCH (uid list) timed out after {}s",
-                        timeout.as_secs()
-                    ),
+                    Ok(result) => result
+                        .map_err(ImapFailure::from_stream)
+                        .context("during UID FETCH (uid list)")?,
+                    Err(_) => return Err(ImapFailure::Timeout("UID FETCH uid list").into()),
                 };
             match event {
                 Event::DataReceived { data } => {
@@ -606,6 +587,7 @@ impl ImapConnection {
                     .stream
                     .next(&mut self.client)
                     .await
+                    .map_err(ImapFailure::from_stream)
                     .context("during UID SEARCH SINCE")?;
                 match event {
                     Event::DataReceived { data } => {
@@ -631,12 +613,7 @@ impl ImapConnection {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .unwrap_or_else(|_| {
-            bail!(
-                "IMAP UID SEARCH SINCE timed out after {}s",
-                timeout.as_secs()
-            )
-        })?;
+        .map_err(|_| ImapFailure::Timeout("UID SEARCH SINCE"))??;
 
         uids.sort_unstable();
         uids.dedup();
@@ -674,6 +651,7 @@ impl ImapConnection {
                     .stream
                     .next(&mut self.client)
                     .await
+                    .map_err(ImapFailure::from_stream)
                     .context("during IDLE setup")?;
                 match event {
                     Event::IdleCommandSent { .. } => {
@@ -684,7 +662,7 @@ impl ImapConnection {
                         return Ok::<bool, anyhow::Error>(saw_update);
                     }
                     Event::IdleRejected { .. } => {
-                        return Err(IdleUnsupported.into());
+                        return Err(ImapFailure::IdleUnsupported.into());
                     }
                     Event::DataReceived { data } => match data {
                         Data::Exists(_) | Data::Expunge(_) | Data::Recent(_) => {
@@ -705,7 +683,7 @@ impl ImapConnection {
             }
         })
         .await
-        .unwrap_or_else(|_| bail!("IMAP IDLE setup timed out after {}s", timeout.as_secs()))?;
+        .map_err(|_| ImapFailure::Timeout("IDLE setup"))??;
 
         let effective_heartbeat = heartbeat_interval
             .unwrap_or(self.idle_inactivity_timeout)
@@ -719,7 +697,7 @@ impl ImapConnection {
             loop {
                 tokio::select! {
                     event = self.stream.next(&mut self.client) => {
-                        match event.context("during IDLE")? {
+                        match event.map_err(ImapFailure::from_stream).context("during IDLE")? {
                             Event::DataReceived { data: Data::Exists(_) | Data::Expunge(_) | Data::Recent(_) } => {
                                 break IdleOutcome::Update;
                             }
@@ -754,6 +732,7 @@ impl ImapConnection {
                     .stream
                     .next(&mut self.client)
                     .await
+                    .map_err(ImapFailure::from_stream)
                     .context("draining IDLE DONE")?
                 {
                     check_status(&status, "IDLE DONE")?;
@@ -764,7 +743,7 @@ impl ImapConnection {
             }
         })
         .await
-        .context("IMAP IDLE DONE timed out; connection must be discarded")?
+        .map_err(|_| ImapFailure::Timeout("IDLE DONE"))?
     }
 
     /// Send LOGOUT.
@@ -893,28 +872,20 @@ fn is_command_completion(status: &Status<'_>, tag: &Tag<'_>) -> bool {
     matches!(status, Status::Tagged(response) if response.tag == *tag)
 }
 
-fn check_status(status: &Status, operation: &str) -> Result<()> {
-    let rejected = match status {
-        Status::Tagged(response) => response.body.kind != StatusKind::Ok,
-        Status::Untagged(body) => body.kind != StatusKind::Ok,
-        Status::Bye(_) => false,
-    };
-    if operation == "LOGIN" && rejected {
-        return Err(AuthenticationFailure.into());
-    }
+fn check_status(status: &Status, operation: &'static str) -> Result<()> {
     match status {
-        Status::Tagged(tagged) => match tagged.body.kind {
+        Status::Tagged(response) => match response.body.kind {
             StatusKind::Ok => Ok(()),
-            StatusKind::No => bail!("{operation} rejected: {}", tagged.body.text),
-            StatusKind::Bad => bail!("{operation} error: {}", tagged.body.text),
+            _ if operation == "LOGIN" => Err(ImapFailure::Authentication.into()),
+            _ => Err(ImapFailure::Protocol(anyhow::anyhow!("{operation} rejected")).into()),
         },
         Status::Untagged(body) => match body.kind {
             StatusKind::Ok => Ok(()),
-            StatusKind::No => bail!("{operation} rejected (untagged): {}", body.text),
-            StatusKind::Bad => bail!("{operation} error (untagged): {}", body.text),
+            _ if operation == "LOGIN" => Err(ImapFailure::Authentication.into()),
+            _ => Err(ImapFailure::Protocol(anyhow::anyhow!("{operation} rejected")).into()),
         },
-        Status::Bye(bye) => {
-            bail!("{operation}: server sent BYE: {}", bye.text)
+        Status::Bye(_) => {
+            Err(ImapFailure::Transport(anyhow::anyhow!("server closed {operation}")).into())
         }
     }
 }
@@ -1169,6 +1140,88 @@ mod command_completion_tests {
         let token = CancellationToken::new();
         token.cancel();
         assert!(conn.idle(&token, None).await.is_err());
+        server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod typed_error_tests {
+    use super::*;
+    use crate::imap::error::{FailureKind, kind};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    async fn pair() -> (ImapConnection, BufReader<TcpStream>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let mut options = Options::default();
+        options.discard_greeting = true;
+        (
+            ImapConnection {
+                stream: Stream::insecure(client),
+                client: Client::new(options),
+                tag_counter: 0,
+                command_timeout: Duration::from_millis(50),
+            },
+            BufReader::new(server),
+        )
+    }
+
+    #[tokio::test]
+    async fn non_english_login_rejection_is_typed_authentication() {
+        let (mut connection, mut peer) = pair().await;
+        let server = tokio::spawn(async move {
+            let mut line = String::new();
+            peer.read_line(&mut line).await.unwrap();
+            peer.write_all(b"M1 NO keine Berechtigung private-user\r\n")
+                .await
+                .unwrap();
+        });
+        let error = connection
+            .login("test", "test")
+            .await
+            .unwrap_err()
+            .context("unrelated wrapper");
+        assert_eq!(kind(&error), FailureKind::Authentication);
+        assert_eq!(crate::metrics::classify_error(&error), "auth");
+        assert!(!format!("{error:#}").contains("private-user"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn real_command_deadline_and_closed_connection_have_typed_categories() {
+        let (mut connection, mut peer) = pair().await;
+        let server = tokio::spawn(async move {
+            let mut line = String::new();
+            peer.read_line(&mut line).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let error = connection.login("test", "test").await.unwrap_err();
+        assert_eq!(kind(&error), FailureKind::Timeout);
+        assert_eq!(crate::metrics::classify_error(&error), "connection_timeout");
+        server.abort();
+        let (mut connection, peer) = pair().await;
+        drop(peer);
+        let error = connection.login("test", "test").await.unwrap_err();
+        assert_eq!(kind(&error), FailureKind::Network);
+        assert_eq!(crate::metrics::classify_error(&error), "network");
+    }
+
+    #[tokio::test]
+    async fn explicit_idle_rejection_is_distinct_from_a_transport_failure() {
+        let (mut connection, mut peer) = pair().await;
+        let server = tokio::spawn(async move {
+            let mut line = String::new();
+            peer.read_line(&mut line).await.unwrap();
+            peer.write_all(b"M1 BAD unsupported\r\n").await.unwrap();
+        });
+        let error = connection
+            .idle(&CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(kind(&error), FailureKind::IdleUnsupported);
         server.await.unwrap();
     }
 }

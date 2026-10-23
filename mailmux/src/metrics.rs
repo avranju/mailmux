@@ -87,22 +87,15 @@ pub fn add_idle_heartbeat_catches(account: &str, mailbox: &str, count: u64) {
         .increment(count);
 }
 
-/// Categorize an error into a human-readable error type for metric labels.
-/// Authentication failures are handled separately (the watcher logs an error
-/// and exits immediately), so they are intentionally excluded here.
-pub fn classify_error(error: &str) -> &'static str {
-    let lower = error.to_ascii_lowercase();
-    if lower.contains("timed out") {
-        "connection_timeout"
-    } else if lower.contains("connection refused")
-        || lower.contains("connection reset")
-        || lower.contains("network unreachable")
-        || lower.contains("no such host")
-        || lower.contains("tls")
-    {
-        "network"
-    } else {
-        "other"
+/// Classify typed IMAP failures through context wrappers. Display text is not
+/// part of either control flow or metric-label selection.
+pub fn classify_error(error: &anyhow::Error) -> &'static str {
+    use crate::imap::error::{FailureKind, kind};
+    match kind(error) {
+        FailureKind::Authentication => "auth",
+        FailureKind::Timeout => "connection_timeout",
+        FailureKind::Network => "network",
+        _ => "other",
     }
 }
 

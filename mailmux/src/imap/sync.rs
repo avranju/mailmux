@@ -8,12 +8,11 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use super::error::{FailureKind, kind};
 use crate::config::AccountConfig;
 use crate::db::emails::NewEmail;
 use crate::db::events::NewEvent;
-use crate::imap::connection::{
-    AuthenticationFailure, FetchedMessage, IdleOutcome, IdleUnsupported, ImapConnection,
-};
+use crate::imap::connection::{FetchedMessage, IdleOutcome, ImapConnection};
 use crate::store::MessageStore;
 
 const FETCH_BATCH_SIZE: usize = 500;
@@ -136,8 +135,7 @@ impl MailboxWatcher {
                     retry_attempt = 0;
                 }
                 Err(e) => {
-                    let err_str = format!("{e:#}");
-                    if e.is::<AuthenticationFailure>() {
+                    if kind(&e) == FailureKind::Authentication {
                         if let (Some(path), Some(previous)) =
                             (&self.account.credentials_file, &snapshot)
                         {
@@ -162,7 +160,7 @@ impl MailboxWatcher {
                     }
 
                     retry_attempt += 1;
-                    let error_type = crate::metrics::classify_error(&err_str);
+                    let error_type = crate::metrics::classify_error(&e);
                     crate::metrics::inc_sync_failures(&self.account.id, &self.mailbox, error_type);
                     let delay = super::retry_delay(retry_attempt, 1000, 300_000);
                     warn!(
@@ -257,7 +255,7 @@ impl MailboxWatcher {
                     let _ = conn.logout().await;
                     return Ok(());
                 }
-                Err(e) if e.is::<IdleUnsupported>() => {
+                Err(e) if kind(&e) == FailureKind::IdleUnsupported => {
                     debug!(
                         account = self.account.id,
                         mailbox = self.mailbox,
