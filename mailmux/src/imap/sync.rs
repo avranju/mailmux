@@ -354,6 +354,11 @@ impl MailboxWatcher {
             return Ok(0);
         }
 
+        // Excluded messages were deliberately considered by this scan. If no
+        // messages remain after initial filtering, checkpoint the scan boundary
+        // so later cycles start with newly assigned UIDs rather than re-scanning.
+        let scanned_max_uid = all_uids.iter().copied().max().unwrap_or(last_seen_uid);
+
         // Step 2: Apply initial sync limits (only on first sync).
         let uids_to_fetch_owned: Vec<u32> = if last_seen_uid == 0 {
             let mut uids = all_uids;
@@ -388,6 +393,17 @@ impl MailboxWatcher {
         } else {
             all_uids
         };
+        if uids_to_fetch_owned.is_empty() {
+            crate::db::emails::upsert_mailbox_state(
+                &self.pool,
+                &self.account.id,
+                &self.mailbox,
+                uid_validity as i64,
+                scanned_max_uid as i64,
+            )
+            .await?;
+            return Ok(0);
+        }
         let uids_to_fetch = &uids_to_fetch_owned[..];
 
         debug!(
@@ -1258,6 +1274,114 @@ mod polling_tests {
             .await?
             .unwrap();
         assert_eq!(state.uid_validity, 123);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod initial_sync_tests {
+    use super::*;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn command(peer: &mut BufReader<TcpStream>, expected: &str, response: &str) {
+        let mut line = String::new();
+        peer.read_line(&mut line).await.unwrap();
+        assert!(line.contains(expected), "expected {expected}, got {line}");
+        let tag = line.split_whitespace().next().unwrap();
+        peer.write_all(format!("{response}{tag} OK done\r\n").as_bytes())
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn excluded_initial_scan_is_checkpointed_and_new_mail_is_ingested(
+        pool: PgPool,
+    ) -> Result<()> {
+        for date_filter in [true, false] {
+            sqlx::query("TRUNCATE emails, events, processor_jobs, mailbox_states")
+                .execute(&pool)
+                .await?;
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let filter = if date_filter {
+                "initial_sync_start_date = \"2099-01-01\""
+            } else {
+                "initial_sync_max_messages = 0"
+            };
+            let account: AccountConfig = toml::from_str(&format!(
+                r#"
+                id = "test"
+                imap_host = "127.0.0.1"
+                imap_port = {}
+                tls = false
+                username = "test"
+                password = "test"
+                mailboxes = ["INBOX"]
+                {}
+            "#,
+                listener.local_addr()?.port(),
+                filter
+            ))?;
+            let server = tokio::spawn(async move {
+                for cycle in 0..2 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut peer = BufReader::new(stream);
+                    peer.write_all(b"* OK ready\r\n").await.unwrap();
+                    command(&mut peer, " LOGIN ", "").await;
+                    if cycle == 0 {
+                        command(
+                            &mut peer,
+                            " UID FETCH 1:* ",
+                            "* 1 FETCH (UID 1)\r\n* 2 FETCH (UID 3)\r\n* 3 FETCH (UID 2)\r\n",
+                        )
+                        .await;
+                        if date_filter {
+                            command(&mut peer, " UID SEARCH ", "* SEARCH\r\n").await;
+                        }
+                    } else {
+                        command(&mut peer, " UID FETCH 4:* ", "* 4 FETCH (UID 4)\r\n").await;
+                        let raw = "From: test@example.com\r\nSubject: New mail\r\n\r\nBody";
+                        command(
+                            &mut peer,
+                            " UID FETCH 4 ",
+                            &format!(
+                                "* 4 FETCH (UID 4 FLAGS () BODY[] {{{}}}\r\n{raw})\r\n",
+                                raw.len()
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            });
+            let account = Arc::new(account);
+            let dir = TempDir::new()?;
+            let watcher = MailboxWatcher::new(
+                account.clone(),
+                "INBOX".into(),
+                pool.clone(),
+                Arc::new(MessageStore::new(dir.path().to_str().unwrap())),
+                CancellationToken::new(),
+            );
+            let limiter = Arc::new(RateLimiter::direct(Quota::per_second(nonzero!(1000u32))));
+            for (cycle, expected_uid) in [3, 4].into_iter().enumerate() {
+                let mut conn = ImapConnection::connect(&account).await?;
+                let count = watcher
+                    .do_incremental_sync(&mut conn, 123, &limiter)
+                    .await?;
+                assert_eq!(count, cycle as u64);
+                let state = crate::db::emails::get_mailbox_state(&pool, "test", "INBOX")
+                    .await?
+                    .unwrap();
+                assert_eq!(state.last_seen_uid, expected_uid);
+            }
+            server.await?;
+            let uids: Vec<i64> = sqlx::query_scalar("SELECT uid FROM emails")
+                .fetch_all(&pool)
+                .await?;
+            assert_eq!(uids, vec![4]);
+        }
         Ok(())
     }
 }
