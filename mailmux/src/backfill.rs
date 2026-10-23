@@ -536,6 +536,8 @@ mod tests {
                 log_format: "json".into(),
                 shutdown_grace_period_secs: 1,
                 health_port: None,
+                health_bind_addr: std::net::Ipv4Addr::LOCALHOST.into(),
+                health_metrics_token_env: None,
                 event_retention_days: 30,
             },
             database: DatabaseConfig {

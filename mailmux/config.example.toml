@@ -25,6 +25,10 @@ event_retention_days = 30
 
 # HTTP port for /health, /ready, and /metrics endpoints (omit to disable)
 health_port = 8080
+# Defaults to loopback. Docker/network scrapes require an explicit external bind.
+# health_bind_addr = "127.0.0.1"
+# Protect /metrics with a Bearer token read from this environment variable.
+# health_metrics_token_env = "MAILMUX_METRICS_TOKEN"
 
 [database]
 url = "postgres://mailmux:${DB_PASSWORD}@localhost:5432/mailmux"
