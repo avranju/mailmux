@@ -95,8 +95,9 @@ llm_model = "claude-haiku-4-5-20251001"
 
 [firefly]
 base_url     = "https://firefly.example.com/api"
-access_token = "eyJ..."
 currency_code = "INR" # set the native currency; per-account overrides supported
+
+access_token = "${FIREFLY_ACCESS_TOKEN}"
 
 # Optional Firefly settings (shown with their defaults):
 # default_asset_account_id = "12"
@@ -211,3 +212,7 @@ Asset accounts may set currency_code (alias currency), overriding firefly.curren
 card_last4 aliases debit_card_last4 and accepts credit-card notifications too.
 Canonical and pending transactions preserve the native currency. Do not coalesce
 cross-currency transfers without explicit amounts in both currencies.
+
+Config loading checks Unix permissions on the opened file and supports an
+exact `${FIREFLY_ACCESS_TOKEN}` reference for `firefly.access_token`; unresolved
+or empty references fail before side effects. Literal tokens remain supported.

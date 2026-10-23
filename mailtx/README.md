@@ -716,3 +716,20 @@ files exported by an existing reconciliation script without coupling to it.
 
 The API behavior follows Firefly's official
 [OpenAPI specification](https://github.com/firefly-iii/api-docs/blob/main/dist/firefly-iii-v6.7.8-v1.yaml).
+
+### Protecting the Firefly access token
+
+Use `chmod 600 /etc/mailtx/config.toml` (or `0640` for a trusted group). On Unix,
+mailtx checks the opened config file and warns if it is world-readable or
+group/world-writable. You can keep the token out of TOML entirely:
+
+```toml
+[firefly]
+base_url = "https://firefly.example.com/api"
+access_token = "${FIREFLY_ACCESS_TOKEN}"
+```
+
+Set `FIREFLY_ACCESS_TOKEN` in the process environment. A reference must occupy
+the whole value; unavailable or empty variables fail before any endpoint calls
+and errors never print the token value. When mailmux invokes mailtx, forward
+`FIREFLY_ACCESS_TOKEN` explicitly in `processors.config.env`.
