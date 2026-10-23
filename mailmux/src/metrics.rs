@@ -113,23 +113,47 @@ pub fn record_processor_metrics(
 
     for m in metrics {
         let full_name = format!("mailmux_proc_{}_{}", processor_name, m.name);
-        let labels: Vec<(&'static str, String)> = m
+        let labels: Vec<metrics::Label> = m
             .labels
             .iter()
-            .map(|(k, v)| {
-                // Leak the key string so we get a `&'static str` required by the metrics macros.
-                let key: &'static str = Box::leak(k.clone().into_boxed_str());
-                (key, v.clone())
-            })
+            .map(|(k, v)| metrics::Label::new(k.clone(), v.clone()))
             .collect();
 
         match m.kind {
             MetricKind::Counter => {
-                counter!(full_name, &labels).increment(m.value as u64);
+                counter!(full_name, labels).increment(m.value as u64);
             }
             MetricKind::Gauge => {
-                gauge!(full_name, &labels).set(m.value);
+                gauge!(full_name, labels).set(m.value);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::processor::{MetricKind, ProcessorMetric};
+
+    #[test]
+    fn processor_labels_survive_the_output_and_reuse_the_same_series() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            for _ in 0..2 {
+                let output = vec![ProcessorMetric {
+                    name: "posted".into(),
+                    kind: MetricKind::Counter,
+                    value: 1.0,
+                    labels: [(String::from("bank"), String::from("test"))].into(),
+                }];
+                record_processor_metrics("mailtx", &output);
+            }
+        });
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("mailmux_proc_mailtx_posted{bank=\"test\"} 2"),
+            "{rendered}"
+        );
     }
 }
