@@ -18,10 +18,11 @@ emphasis on data integrity, recoverability, and idempotency.
 ```text
 .
 ├── Cargo.toml                  # workspace manifest
+├── Cargo.lock                  # shared workspace dependencies
+├── Dockerfile                  # builds mailmux, mailtx, and mailindex
 ├── README.md                   # workspace overview (this file)
 ├── mailmux/                    # daemon crate
 │   ├── config.example.toml
-│   ├── Dockerfile
 │   ├── docker-compose.yml
 │   ├── migrations/
 │   └── src/
@@ -452,7 +453,7 @@ mailmux backfill --processor mail-indexer --email-id 1042 --email-id 1043 --conc
 Build the image:
 
 ```bash
-docker build -t mailmux -f mailmux/Dockerfile mailmux
+docker build -t mailmux .
 ```
 
 Run with an existing PostgreSQL instance:
@@ -470,7 +471,9 @@ docker run --rm \
 ### Docker Compose
 
 A `docker-compose.yml` is provided at `mailmux/docker-compose.yml` and starts
-both PostgreSQL and `mailmux`.
+both PostgreSQL and `mailmux`. Compose and release CI use the root Dockerfile
+and workspace lockfile, with `mailmux`, `mailtx`, `mailindex`, and the
+`mailmux-submit` adapter included in the same image.
 
 1. Create `mailmux/config.toml` (see [mailmux configuration](#mailmux-configuration)).
    Use the Compose-internal hostname `postgres` for the database:
