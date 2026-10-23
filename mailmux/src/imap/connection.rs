@@ -909,6 +909,9 @@ mod uid_tests {
                 client: Client::new(options),
                 tag_counter: 0,
                 command_timeout: Duration::from_secs(1),
+                idle_drain_timeout: Duration::from_secs(1),
+                idle_inactivity_timeout: Duration::from_secs(1800),
+                fetch_drain_timeout: Duration::from_millis(200),
             },
             BufReader::new(peer),
         )
@@ -1043,6 +1046,9 @@ mod command_completion_tests {
                 client: Client::new(options),
                 tag_counter: 0,
                 command_timeout: Duration::from_secs(1),
+                idle_drain_timeout: Duration::from_secs(1),
+                idle_inactivity_timeout: Duration::from_secs(1800),
+                fetch_drain_timeout: Duration::from_millis(200),
             },
             BufReader::new(peer),
         )
@@ -1164,6 +1170,9 @@ mod typed_error_tests {
                 client: Client::new(options),
                 tag_counter: 0,
                 command_timeout: Duration::from_millis(50),
+                idle_drain_timeout: Duration::from_secs(1),
+                idle_inactivity_timeout: Duration::from_secs(1800),
+                fetch_drain_timeout: Duration::from_millis(200),
             },
             BufReader::new(server),
         )

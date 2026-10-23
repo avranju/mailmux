@@ -587,6 +587,11 @@ impl MailboxWatcher {
 }
 
 #[cfg(test)]
+use governor::{Quota, RateLimiter};
+#[cfg(test)]
+use nonzero_ext::nonzero;
+
+#[cfg(test)]
 mod account_limit_tests {
     use super::*;
     #[tokio::test]
@@ -837,6 +842,7 @@ mod rotation_tests {
                 pool.clone(),
                 Arc::new(MessageStore::new(dir.path().to_str().unwrap())),
                 token,
+                Arc::new(RateLimiter::direct(Quota::per_second(nonzero!(1000u32)))),
             );
             tokio::time::timeout(Duration::from_secs(10), watcher.run()).await??;
             server.await?;
@@ -899,6 +905,7 @@ mod header_limit_tests {
             pool.clone(),
             store,
             CancellationToken::new(),
+            Arc::new(RateLimiter::direct(Quota::per_second(nonzero!(1000u32)))),
         );
         let raw = format!(
             "From: {}@example.com\r\nSubject: {}\r\n\r\nBody",
@@ -914,7 +921,7 @@ mod header_limit_tests {
         };
         assert_eq!(
             watcher
-                .ingest_message(&msg, &MessageParser::default())
+                .ingest_message(&msg, 123, &MessageParser::default())
                 .await?,
             1
         );
@@ -1022,6 +1029,7 @@ mod tests {
                 pool.clone(),
                 store.clone(),
                 CancellationToken::new(),
+                Arc::new(RateLimiter::direct(Quota::per_second(nonzero!(1000u32)))),
             );
             let count = watcher
                 .do_incremental_sync(&mut conn, generation, &limiter)
@@ -1144,6 +1152,7 @@ mod checkpoint_persistence_tests {
                 pool.clone(),
                 store.clone(),
                 CancellationToken::new(),
+                Arc::new(RateLimiter::direct(Quota::per_second(nonzero!(1000u32)))),
             );
             let result = watcher.do_incremental_sync(&mut conn, 123, &limiter).await;
             server.await?;
@@ -1260,6 +1269,7 @@ mod polling_tests {
             pool.clone(),
             Arc::new(MessageStore::new(dir.path().to_str().unwrap())),
             token,
+            Arc::new(RateLimiter::direct(Quota::per_second(nonzero!(1000u32)))),
         );
         let limiter = Arc::new(RateLimiter::direct(Quota::per_second(nonzero!(1000u32))));
         tokio::time::timeout(
@@ -1361,6 +1371,7 @@ mod initial_sync_tests {
                 pool.clone(),
                 Arc::new(MessageStore::new(dir.path().to_str().unwrap())),
                 CancellationToken::new(),
+                Arc::new(RateLimiter::direct(Quota::per_second(nonzero!(1000u32)))),
             );
             let limiter = Arc::new(RateLimiter::direct(Quota::per_second(nonzero!(1000u32))));
             for (cycle, expected_uid) in [3, 4].into_iter().enumerate() {

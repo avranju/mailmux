@@ -68,8 +68,15 @@ mod tests {
     fn llm_body_limit_applies_to_plain_and_html_email() {
         for content_type in ["text/plain", "text/html"] {
             let mut file = tempfile::NamedTempFile::new().unwrap();
-            write!(file, "From: bank@example.com\r\nMIME-Version: 1.0\r\nContent-Type: {content_type}; charset=utf-8\r\n\r\n{}", "x".repeat(MAX_BODY_BYTES * 2)).unwrap();
-            let body = extract_body(file.path().to_str().unwrap()).unwrap();
+            write!(file, "Authentication-Results: mx.receiver.test; dmarc=pass header.from=example.com\r\nFrom: bank@example.com\r\nMIME-Version: 1.0\r\nContent-Type: {content_type}; charset=utf-8\r\n\r\n{}", "x".repeat(MAX_BODY_BYTES * 2)).unwrap();
+            let body = extract_authenticated(
+                file.path().to_str().unwrap(),
+                "bank@example.com",
+                &["mx.receiver.test".into()],
+            )
+            .unwrap()
+            .unwrap()
+            .body;
             assert!(body.len() <= MAX_BODY_BYTES);
             assert!(body.ends_with("[body truncated]"));
         }

@@ -201,7 +201,10 @@ mod auth_privacy_tests {
                         Ok(_) => panic!("authentication unexpectedly succeeded"),
                         Err(error) => error,
                     };
-                    assert!(error.is::<connection::AuthenticationFailure>());
+                    assert_eq!(
+                        crate::imap::error::kind(&error),
+                        crate::imap::error::FailureKind::Authentication
+                    );
                     assert_eq!(format!("{error:#}"), "IMAP authentication failed");
                     let pool = sqlx::postgres::PgPoolOptions::new()
                         .connect_lazy("postgres://unused@localhost/unused")
@@ -214,12 +217,27 @@ mod auth_privacy_tests {
                     );
                     let mut watchers = JoinSet::new();
                     manager.spawn_watcher(&mut watchers, "PRIVATE-MAILBOX".into());
+                    server.await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            if String::from_utf8_lossy(&captured.0.lock().unwrap())
+                                .contains("authentication failed")
+                            {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    // Supervision now keeps the task alive after a redacted auth
+                    // failure; cancellation ends its restart delay promptly.
+                    manager.token.cancel();
                     tokio::time::timeout(Duration::from_secs(2), watchers.join_next())
                         .await
                         .unwrap()
                         .unwrap()
                         .unwrap();
-                    server.await.unwrap();
                 });
         });
         let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
